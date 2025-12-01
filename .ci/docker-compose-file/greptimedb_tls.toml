@@ -1,0 +1,20 @@
+[http]
+addr = "0.0.0.0:4000"
+timeout = "30s"
+
+[grpc]
+bind_addr = "0.0.0.0:4001"
+runtime_size = 8
+tls.mode = "require"
+tls.cert_path = "/etc/greptimedb/certs/server.crt"
+tls.key_path = "/etc/greptimedb/certs/server.key"
+
+[mysql]
+enable = true
+addr = "0.0.0.0:4002"
+runtime_size = 2
+
+[postgres]
+enable = true
+addr = "0.0.0.0:4003"
+runtime_size = 2

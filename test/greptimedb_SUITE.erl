@@ -18,6 +18,7 @@ groups() ->
     TCs = [
         t_connect_tcp,
         t_connect_tls,
+        t_connect_with_auth,
         t_insert_test,
         t_async_insert_query_test
     ],
@@ -52,6 +53,19 @@ end_per_testcase(_TestCase, _Config) ->
 
 t_connect_tcp(Config) ->
     {ok, Client} = greptimedb:start_client(?conn_opts(Config)),
+    ?assert(is_pid(Client)),
+    ?assertMatch({ok, [_ | _]}, greptimedb:query(Client, <<"SELECT 1">>)),
+    ok = greptimedb:stop_client(Client).
+
+t_connect_with_auth(_Config) ->
+    Host = get_host_addr("GREPTIMEDB_AUTH_ADDR"),
+    ConnOpts = #{
+        endpoints => [<<Host/binary, ":4001">>],
+        dbname => <<"public">>,
+        username => <<"greptime_user">>,
+        password => <<"greptime_pwd">>
+    },
+    {ok, Client} = greptimedb:start_client(ConnOpts),
     ?assert(is_pid(Client)),
     ?assertMatch({ok, [_ | _]}, greptimedb:query(Client, <<"SELECT 1">>)),
     ok = greptimedb:stop_client(Client).

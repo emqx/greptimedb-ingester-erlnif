@@ -1,0 +1,17 @@
+[http]
+addr = "0.0.0.0:4000"
+timeout = "30s"
+
+[grpc]
+bind_addr = "0.0.0.0:4001"
+runtime_size = 8
+
+[mysql]
+enable = true
+addr = "0.0.0.0:4002"
+runtime_size = 2
+
+[postgres]
+enable = true
+addr = "0.0.0.0:4003"
+runtime_size = 2

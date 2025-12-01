@@ -1,0 +1,79 @@
+services:
+  greptimedb_tcp:
+    container_name: greptimedb_tcp
+    image: greptime/greptimedb:${GREPTIMEDB_TAG}
+    command:
+      - "standalone"
+      - "start"
+      - "-c"
+      - "/etc/greptimedb/greptime.toml"
+    environment:
+      - GREPTIMEDB_STANDALONE__DATA_HOME=/data/greptimedb
+    volumes:
+      - greptimedb-data-tcp:/data/greptimedb
+      - ./greptimedb.toml:/etc/greptimedb/greptime.toml
+    env_file:
+      - .env
+    networks:
+      greptimedb_bridge:
+        ipv4_address: 172.100.100.10
+    restart: always
+
+  greptimedb_tls:
+    container_name: greptimedb_tls
+    image: greptime/greptimedb:${GREPTIMEDB_TAG}
+    command:
+      - "standalone"
+      - "start"
+      - "-c"
+      - "/etc/greptimedb/greptime.toml"
+    environment:
+      - GREPTIMEDB_STANDALONE__DATA_HOME=/data/greptimedb
+    volumes:
+      - greptimedb-data-tls:/data/greptimedb
+      - ./greptimedb_tls.toml:/etc/greptimedb/greptime.toml
+      - ./certs/ca.crt:/etc/greptimedb/certs/ca.crt
+      - ./certs/server.crt:/etc/greptimedb/certs/server.crt
+      - ./certs/server.key:/etc/greptimedb/certs/server.key
+    env_file:
+      - .env
+    networks:
+      greptimedb_bridge:
+        ipv4_address: 172.100.100.20
+    restart: always
+
+  greptimedb_auth:
+    container_name: greptimedb_auth
+    image: greptime/greptimedb:${GREPTIMEDB_TAG}
+    command:
+      - "standalone"
+      - "start"
+      - "-c"
+      - "/etc/greptimedb/greptime.toml"
+      - "--user-provider=static_user_provider:cmd:greptime_user=greptime_pwd"
+    environment:
+      - GREPTIMEDB_STANDALONE__DATA_HOME=/data/greptimedb
+    volumes:
+      - greptimedb-data-auth:/data/greptimedb
+      - ./greptimedb.toml:/etc/greptimedb/greptime.toml
+    env_file:
+      - .env
+    networks:
+      greptimedb_bridge:
+        ipv4_address: 172.100.100.30
+    restart: always
+
+networks:
+  greptimedb_bridge:
+    driver: bridge
+    name: greptimedb_bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.100.100.0/24
+          gateway: 172.100.100.1
+
+volumes:
+  greptimedb-data-tcp:
+  greptimedb-data-tls:
+  greptimedb-data-auth:
