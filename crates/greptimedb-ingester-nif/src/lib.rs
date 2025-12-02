@@ -1,18 +1,16 @@
 use greptime_proto::v1::auth_header::AuthScheme;
 use greptime_proto::v1::Basic;
-use greptimedb_ingester::api::v1::{ColumnDataType, SemanticType};
 use greptimedb_ingester::client::Client;
 use greptimedb_ingester::database::Database;
-use greptimedb_ingester::{
-    BulkInserter, BulkWriteOptions, CompressionType, Row, Rows, TableSchema, Value,
-};
+use greptimedb_ingester::{BulkInserter, BulkWriteOptions, CompressionType};
 use lazy_static::lazy_static;
-use rustler::{Encoder, Env, NifResult, ResourceArc, Term, TermType};
+use rustler::{Encoder, Env, NifResult, ResourceArc, Term};
 use std::collections::HashMap;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
 mod atoms;
+mod util;
 
 lazy_static! {
     static ref RUNTIME: Runtime = Runtime::new().unwrap();
@@ -132,98 +130,13 @@ fn insert<'a>(
     }
 
     // 1. Infer Schema from the first row
-    let first_row = rows_term[0];
-    let map: HashMap<String, Term> = first_row.decode()?;
+    let first_row_term = rows_term[0];
+    let first_row_map: HashMap<String, Term> = first_row_term.decode()?;
 
-    let mut column_names = Vec::new();
-    let mut table_template = TableSchema::builder()
-        .name(&table)
-        .build()
-        .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
-
-    // We need a stable order for columns
-    let mut sorted_keys: Vec<String> = map.keys().cloned().collect();
-    sorted_keys.sort();
-
-    for key in &sorted_keys {
-        let val = map.get(key).unwrap();
-        let (dtype, semantic_type) = match val.get_type() {
-            TermType::Integer => (ColumnDataType::Int64, SemanticType::Field),
-            TermType::Float => (ColumnDataType::Float64, SemanticType::Field),
-            TermType::Binary => (ColumnDataType::String, SemanticType::Tag), // Default string to Tag for now, naive inference
-            TermType::Atom => {
-                if let Ok(_b) = val.decode::<bool>() {
-                    (ColumnDataType::Boolean, SemanticType::Field)
-                } else {
-                    (ColumnDataType::String, SemanticType::Tag)
-                }
-            }
-            _ => (ColumnDataType::String, SemanticType::Field), // Fallback
-        };
-
-        // Special case: 'ts' or 'timestamp' is Timestamp
-        let (final_dtype, final_semantic) = if key == "ts" || key == "timestamp" {
-            (
-                ColumnDataType::TimestampMillisecond,
-                SemanticType::Timestamp,
-            )
-        } else {
-            (dtype, semantic_type)
-        };
-
-        column_names.push(key.clone());
-
-        match final_semantic {
-            SemanticType::Timestamp => {
-                table_template = table_template.add_timestamp(key, final_dtype);
-            }
-            SemanticType::Tag => {
-                table_template = table_template.add_tag(key, final_dtype);
-            }
-            SemanticType::Field => {
-                table_template = table_template.add_field(key, final_dtype);
-            }
-        }
-    }
+    let table_template = util::terms_to_table_schema(&table, &first_row_map)?;
 
     // 2. Construct Rows
-    let column_schemas = table_template.columns();
-    let mut greptime_rows = Rows::new(column_schemas, rows_term.len(), 1024)
-        .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
-
-    for row_term in rows_term {
-        let row_map: HashMap<String, Term> = row_term.decode()?;
-        let mut values = Vec::new();
-
-        for col_name in &column_names {
-            if let Some(val_term) = row_map.get(col_name) {
-                let val = if let Ok(i) = val_term.decode::<i64>() {
-                    // Check if it's the timestamp column
-                    if col_name == "ts" || col_name == "timestamp" {
-                        Value::TimestampMillisecond(i)
-                    } else {
-                        Value::Int64(i)
-                    }
-                } else if let Ok(f) = val_term.decode::<f64>() {
-                    Value::Float64(f)
-                } else if let Ok(s) = val_term.decode::<String>() {
-                    Value::String(s)
-                } else if let Ok(b) = val_term.decode::<bool>() {
-                    Value::Boolean(b)
-                } else {
-                    Value::Null
-                };
-
-                values.push(val);
-            } else {
-                // Missing value, push null
-                values.push(Value::Null);
-            }
-        }
-        greptime_rows
-            .add_row(Row::from_values(values))
-            .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
-    }
+    let greptime_rows = util::terms_to_rows(&table_template, rows_term)?;
 
     let result: Result<u32, String> = RUNTIME.block_on(async {
         let mut bulk_inserter = BulkInserter::new(resource.client.clone(), resource.db.dbname());
