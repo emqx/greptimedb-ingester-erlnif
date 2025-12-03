@@ -5,11 +5,10 @@ use greptimedb_ingester::database::Database;
 use greptimedb_ingester::{BulkInserter, BulkWriteOptions, CompressionType};
 use lazy_static::lazy_static;
 use rustler::{Encoder, Env, NifResult, ResourceArc, Term};
-use std::collections::HashMap;
 use std::time::Duration;
 use tokio::runtime::Runtime;
 
-mod atoms;
+pub mod atoms;
 mod util;
 
 lazy_static! {
@@ -131,9 +130,8 @@ fn insert<'a>(
 
     // 1. Infer Schema from the first row
     let first_row_term = rows_term[0];
-    let first_row_map: HashMap<String, Term> = first_row_term.decode()?;
 
-    let table_template = util::terms_to_table_schema(&table, &first_row_map)?;
+    let table_template = util::terms_to_table_schema(&table, first_row_term)?;
 
     // 2. Construct Rows
     let greptime_rows = util::terms_to_rows(&table_template, rows_term)?;
