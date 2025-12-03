@@ -2,52 +2,195 @@
 
 -include("greptimedb_rs.hrl").
 
-%% Connection APIs
+%% Connection and Disconnection
 -export([
     start_client/1,
     stop_client/1
 ]).
 
-%% Query APIs
+%% Write - Batch Write, onshot streaming write
 -export([
-    query/2,
-    query_async/3,
-
-    insert_bulk/3,
-    insert_bulk_async/4
+    insert/3,
+    insert_async/4
 ]).
 
--spec start_client(opts()) -> {ok, client()} | {error, reason()}.
+%% Write - Execute Query
+-export([
+    query/2,
+    query_async/3
+]).
+
+%% Write - Streaming Write with persistent stream client
+-export([
+    stream_start/3,
+    stream_close/1,
+    stream_write/2,
+    stream_write_async/3
+]).
+
+-define(pool_name(PoolName), #{pool_name := PoolName}).
+
+%% ===================================================================
+%% Connection and Disconnection
+%% ===================================================================
+
+-doc """
+Start the connection pool (using ecpool).
+Returns a Client (logic level) that holds the connection pool.
+""".
+-spec start_client(opts()) -> {ok, client()} | {error, {already_started, client()} | term()}.
 start_client(Opts) ->
-    {ok, Pid} = greptimedb_rs_sock:start(),
-    case greptimedb_rs_sock:sync_command(Pid, connect, [Opts]) of
-        {ok, _Ref} ->
-            {ok, Pid};
-        {error, _} = Err ->
-            stop_client(Pid),
-            Err
+    PoolName = maps:get(pool_name, Opts, greptimedb_rs_pool),
+    PoolSize = maps:get(pool_size, Opts, 8),
+    PoolType = maps:get(pool_type, Opts, random),
+
+    PoolOpts = [{pool_size, PoolSize}, {pool_type, PoolType}, {conn_opts, Opts}],
+
+    Client = #{
+        pool_name => PoolName,
+        pool_size => PoolSize,
+        pool_type => PoolType,
+        conn_opts => Opts
+    },
+
+    case ecpool:start_sup_pool(PoolName, ?SOCK_MODULE, PoolOpts) of
+        {ok, _} ->
+            {ok, Client};
+        {error, {already_started, _}} ->
+            {error, {already_started, Client}};
+        Error ->
+            Error
     end.
 
+-doc """
+Stop the connection pool and release resources.
+""".
 -spec stop_client(client()) -> ok.
-stop_client(Client) ->
-    greptimedb_rs_sock:stop(Client).
+stop_client(?pool_name(PoolName)) ->
+    ecpool:stop_sup_pool(PoolName);
+stop_client(_) ->
+    ok.
 
+%% ===================================================================
+%% Write - Batch Write
+%% ===================================================================
+
+-doc """
+Batch write data (blocking).
+Picks a connection from the pool to do the write operation.
+""".
+-spec insert(client(), binary(), [map()]) -> {ok, integer()} | {error, reason()}.
+insert(Client, Table, Rows) ->
+    call_sync(Client, ?cmd_insert, [Table, Rows]).
+
+-doc """
+Batch write data (asynchronous).
+""".
+-spec insert_async(client(), binary(), [map()], callback()) -> ok.
+insert_async(Client, Table, Rows, ResultCallback) ->
+    call_async(Client, ?cmd_insert, [Table, Rows], ResultCallback).
+
+%% ===================================================================
+%% Write - Execute Query
+%% ===================================================================
+
+-doc """
+Execute SQL query (blocking).
+""".
 -spec query(client(), sql()) -> {ok, result()} | {error, reason()}.
 query(Client, Sql) ->
-    greptimedb_rs_sock:sync_command(Client, execute, [Sql]).
+    call_sync(Client, ?cmd_execute, [Sql]).
 
+-doc """
+Execute SQL query (asynchronous).
+""".
 -spec query_async(client(), sql(), callback()) -> ok.
 query_async(Client, Sql, ResultCallback) ->
-    async(Client, execute, [Sql], ResultCallback).
+    call_async(Client, ?cmd_execute, [Sql], ResultCallback).
 
--spec insert_bulk(client(), binary(), [map()]) -> {ok, integer()} | {error, reason()}.
-insert_bulk(Client, Table, Rows) ->
-    greptimedb_rs_sock:sync_command(Client, insert, [Table, Rows]).
+%% ===================================================================
+%% Write - Streaming Write
+%% ===================================================================
 
--spec insert_bulk_async(client(), binary(), [map()], callback()) -> ok.
-insert_bulk_async(Client, Table, Rows, ResultCallback) ->
-    async(Client, insert, [Table, Rows], ResultCallback).
+-doc """
+Start a stream for a specific table.
+Returns a StreamClient handle that binds the Table context to the Client.
+It attempts to initialize the stream on all workers (best effort).
+""".
+-spec stream_start(client(), binary(), map()) -> {ok, stream_client()}.
+stream_start(?pool_name(PoolName) = Client, Table, FirstRow) ->
+    Workers = ecpool:workers(PoolName),
+    %% Attempt to pre-warm all workers. Ignore errors/ignored returns.
+    lists:foreach(
+        fun({_Name, Worker}) ->
+            try
+                {ok, Conn} = ecpool_worker:client(Worker),
+                greptimedb_rs_sock:sync_command(Conn, ?cmd_stream_start, [Table, FirstRow])
+            catch
+                _:_ -> ok
+            end
+        end,
+        Workers
+    ),
+    {ok, {stream_client, Client, Table}}.
 
-async(Client, Cmd, Args, ResultCallback) ->
-    _ = erlang:send(Client, ?ASYNC_REQ(Cmd, Args, ResultCallback)),
-    ok.
+-doc """
+Stop the stream for a specific table.
+Releases stream resources on all workers in the pool.
+""".
+-spec stream_close(stream_client()) -> ok.
+stream_close({stream_client, ?pool_name(PoolName), Table}) ->
+    Workers = ecpool:workers(PoolName),
+    lists:foreach(
+        fun({_Name, Worker}) ->
+            try
+                {ok, Conn} = ecpool_worker:client(Worker),
+                greptimedb_rs_sock:sync_command(Conn, ?cmd_stream_close, [Table])
+            catch
+                _:_ -> ok
+            end
+        end,
+        Workers
+    ).
+
+-doc """
+Write data to the stream (blocking).
+Uses ecpool to pick a connection from the pool.
+The worker lazily initializes the stream writer if needed.
+""".
+-spec stream_write(stream_client(), [map()]) -> ok | {error, term()}.
+stream_write({stream_client, ?pool_name(PoolName), Table}, Rows) ->
+    ecpool:with_client(PoolName, fun(Conn) ->
+        greptimedb_rs_sock:sync_command(Conn, ?cmd_stream_write, [Table, Rows])
+    end).
+
+-doc """
+Write data to the stream (asynchronous).
+""".
+-spec stream_write_async(stream_client(), [map()], callback()) -> ok.
+stream_write_async({stream_client, ?pool_name(PoolName), Table}, Rows, Callback) ->
+    ecpool:with_client(PoolName, fun(Conn) ->
+        erlang:send(Conn, ?ASYNC_REQ(?cmd_stream_write, [Table, Rows], Callback)),
+        ok
+    end).
+
+%% ===================================================================
+%% Helpers
+%% ===================================================================
+
+call_sync(?pool_name(PoolName), Cmd, Args) ->
+    ecpool:with_client(
+        PoolName,
+        fun(Conn) ->
+            greptimedb_rs_sock:sync_command(Conn, Cmd, Args)
+        end
+    ).
+
+call_async(?pool_name(PoolName), Cmd, Args, Callback) ->
+    ecpool:with_client(
+        PoolName,
+        fun(Conn) ->
+            erlang:send(Conn, ?ASYNC_REQ(Cmd, Args, Callback)),
+            ok
+        end
+    ).

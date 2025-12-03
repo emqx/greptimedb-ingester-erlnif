@@ -30,6 +30,9 @@ groups() ->
     ].
 
 init_per_suite(Config) ->
+    application:ensure_all_started(gproc),
+    application:ensure_all_started(ecpool),
+    application:ensure_all_started(greptimedb_rs),
     Config.
 
 end_per_suite(_Config) ->
@@ -82,7 +85,7 @@ end_per_testcase(_TestCase, _Config) ->
 
 t_connect(Config) ->
     {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
-    ?assert(is_pid(Client)),
+    ?assertMatch(#{pool_name := greptimedb_rs_pool}, Client),
     ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
     ok = greptimedb_rs:stop_client(Client).
 
@@ -95,7 +98,7 @@ t_connect_with_auth(_Config) ->
         password => <<"greptime_pwd">>
     },
     {ok, Client} = greptimedb_rs:start_client(ConnOpts),
-    ?assert(is_pid(Client)),
+    ?assertMatch(#{pool_name := greptimedb_rs_pool}, Client),
     ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
     ok = greptimedb_rs:stop_client(Client).
 
@@ -142,7 +145,7 @@ t_sync_insert(Config) ->
             timestamp => Ts
         }
     ],
-    ?assertMatch({ok, _}, greptimedb_rs:insert_bulk(Client, Table, Rows)),
+    ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
     ok = greptimedb_rs:stop_client(Client).
 
 t_sync_query(Config) ->
@@ -188,7 +191,7 @@ t_sync_query(Config) ->
             <<"timestamp">> => Ts
         }
     ],
-    ?assertMatch({ok, _}, greptimedb_rs:insert_bulk(Client, Table, Rows)),
+    ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
 
     timer:sleep(1000),
     Sql = iolist_to_binary(io_lib:format("SELECT * FROM ~s", [Table])),
@@ -243,7 +246,7 @@ t_async_insert(Config) ->
     CallbackFun = fun(P, R, Res) -> P ! {R, Res} end,
     Callback = {CallbackFun, [Self, Ref]},
 
-    ok = greptimedb_rs:insert_bulk_async(Client, Table, Rows, Callback),
+    ok = greptimedb_rs:insert_async(Client, Table, Rows, Callback),
     receive
         {Ref, {ok, _}} -> ok;
         {Ref, {error, Reason}} -> ct:fail({async_write_failed, Reason})
@@ -296,7 +299,7 @@ t_async_query(Config) ->
             <<"timestamp">> => Ts
         }
     ],
-    {ok, _} = greptimedb_rs:insert_bulk(Client, Table, Rows),
+    {ok, _} = greptimedb_rs:insert(Client, Table, Rows),
     timer:sleep(1000),
 
     Self = self(),

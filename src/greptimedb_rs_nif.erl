@@ -3,7 +3,10 @@
 -export([
     connect/1,
     execute/2,
-    insert/3
+    insert/3,
+    stream_start/3,
+    stream_write/2,
+    stream_close/1
 ]).
 
 -export([init/0]).
@@ -29,6 +32,15 @@ execute(_Client, _Sql) ->
     not_loaded(?LINE).
 
 insert(_Client, _Table, _Rows) ->
+    not_loaded(?LINE).
+
+stream_start(_Client, _Table, _FirstRow) ->
+    not_loaded(?LINE).
+
+stream_write(_Writer, _Rows) ->
+    not_loaded(?LINE).
+
+stream_close(_Writer) ->
     not_loaded(?LINE).
 
 %% =================================================================================================
