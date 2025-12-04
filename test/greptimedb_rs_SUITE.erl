@@ -22,7 +22,9 @@ groups() ->
         t_sync_insert,
         t_sync_query,
         t_async_insert,
-        t_async_query
+        t_async_query,
+        t_stream_insert,
+        t_stream_insert_async
     ],
     [
         {tcp, [], TCs},
@@ -78,6 +80,9 @@ init_per_testcase(TestCase, Config) ->
     [{database, Database}, {table, Table} | Config].
 
 end_per_testcase(_TestCase, _Config) ->
+    %% Ensure client is stopped to prevent 'already_started' in next test
+    ConnOpts = #{pool_name => greptimedb_rs_pool},
+    catch greptimedb_rs:stop_client(ConnOpts),
     ok.
 
 %% ----------------------------------------
@@ -320,6 +325,134 @@ t_async_query(Config) ->
     end,
     ok = greptimedb_rs:stop_client(Client).
 
+t_stream_insert(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+
+    % Drop table if exists
+    DropTableSql = iolist_to_binary(io_lib:format("DROP TABLE IF EXISTS ~s", [Table])),
+    greptimedb_rs:query(Client, DropTableSql),
+
+    % Create table explicitly
+    CreateTableSql = iolist_to_binary(
+        io_lib:format(
+            "CREATE TABLE IF NOT EXISTS ~s ("
+            "ts TIMESTAMP TIME INDEX, "
+            "temperature DOUBLE, "
+            "pressure INT64, "
+            "active BOOLEAN, "
+            "sensor_location STRING, "
+            "sensor_id INT64, "
+            "stream_val INT64, "
+            "PRIMARY KEY (sensor_location, sensor_id)"
+            ") ENGINE=mito",
+            [Table]
+        )
+    ),
+    ?assertMatch({ok, _}, greptimedb_rs:query(Client, CreateTableSql)),
+
+    Ts = erlang:system_time(millisecond),
+    Rows = [
+        #{
+            fields => #{
+                <<"temperature">> => 26.0 + I,
+                <<"pressure">> => 1015,
+                <<"active">> => true,
+                <<"stream_val">> => I
+            },
+            tags => #{
+                <<"sensor_location">> => <<"lab">>,
+                <<"sensor_id">> => 5000 + I
+            },
+            timestamp => Ts + (I * 100)
+        }
+     || I <- lists:seq(0, 9)
+    ],
+
+    {ok, StreamClient} = greptimedb_rs:stream_start(Client, Table, hd(Rows)),
+    ok = greptimedb_rs:stream_write(StreamClient, Rows),
+    ok = greptimedb_rs:stream_close(StreamClient),
+
+    %% Wait for data to be visible
+    timer:sleep(1000),
+
+    Sql = iolist_to_binary(io_lib:format("SELECT count(*) FROM ~s", [Table])),
+    {ok, [ResultStr]} = greptimedb_rs:query(Client, Sql),
+    % Verify result contains "10" (row count)
+    ?assertNotEqual(nomatch, string:find(ResultStr, "10")),
+
+    ok = greptimedb_rs:stop_client(Client).
+
+t_stream_insert_async(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+
+    % Drop table if exists
+    DropTableSql = iolist_to_binary(io_lib:format("DROP TABLE IF EXISTS ~s", [Table])),
+    greptimedb_rs:query(Client, DropTableSql),
+
+    % Create table explicitly
+    CreateTableSql = iolist_to_binary(
+        io_lib:format(
+            "CREATE TABLE IF NOT EXISTS ~s ("
+            "ts TIMESTAMP TIME INDEX, "
+            "temperature DOUBLE, "
+            "pressure INT64, "
+            "active BOOLEAN, "
+            "sensor_location STRING, "
+            "sensor_id INT64, "
+            "stream_val_async INT64, "
+            "PRIMARY KEY (sensor_location, sensor_id)"
+            ") ENGINE=mito",
+            [Table]
+        )
+    ),
+    ?assertMatch({ok, _}, greptimedb_rs:query(Client, CreateTableSql)),
+
+    Ts = erlang:system_time(millisecond),
+    Rows = [
+        #{
+            fields => #{
+                <<"temperature">> => 26.0 + I,
+                <<"pressure">> => 1015,
+                <<"active">> => true,
+                <<"stream_val_async">> => I
+            },
+            tags => #{
+                <<"sensor_location">> => <<"lab">>,
+                <<"sensor_id">> => 6000 + I
+            },
+            timestamp => Ts + (I * 100)
+        }
+     || I <- lists:seq(0, 9)
+    ],
+
+    {ok, StreamClient} = greptimedb_rs:stream_start(Client, Table, hd(Rows)),
+
+    Self = self(),
+    Ref = make_ref(),
+    CallbackFun = fun(P, R, Res) -> P ! {R, Res} end,
+    Callback = {CallbackFun, [Self, Ref]},
+
+    ok = greptimedb_rs:stream_write_async(StreamClient, Rows, Callback),
+
+    receive
+        {Ref, ok} -> ok;
+        {Ref, {error, Reason}} -> ct:fail({async_stream_write_failed, Reason})
+    after 5000 ->
+        ct:fail(async_stream_write_timeout)
+    end,
+
+    ok = greptimedb_rs:stream_close(StreamClient),
+
+    %% Wait for data to be visible
+    timer:sleep(1000),
+
+    Sql = iolist_to_binary(io_lib:format("SELECT count(*) FROM ~s", [Table])),
+    {ok, [ResultStr]} = greptimedb_rs:query(Client, Sql),
+    ?assertNotEqual(nomatch, string:find(ResultStr, "10")),
+
+    ok = greptimedb_rs:stop_client(Client).
 %% ================================================================================
 %% Helpers
 %% ================================================================================
