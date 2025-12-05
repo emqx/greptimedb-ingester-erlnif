@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 rustler = "0.37.0"
 tokio = { version = "1.40", features = ["full"] }
 lazy_static = "1.5.0"
-greptimedb-ingester = { path = "../../../greptimedb-ingester-rust" }
+greptimedb-ingester = { git = "https://github.com/JimMoen/greptimedb-ingester-rust ", rev = "a2856ddf8edd9f4a7d13f4721499c3f3c4ddca49" }
 log = "0.4"
 futures = "0.3"
 greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "454c52634c3bac27de10bf0d85d5533eed1cf03f" }
