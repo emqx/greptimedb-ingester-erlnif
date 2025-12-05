@@ -23,3 +23,6 @@ rebar3.crashdump
 libpath
 /target
 /Cargo.lock
+
+.elp.toml
+build_info.json
