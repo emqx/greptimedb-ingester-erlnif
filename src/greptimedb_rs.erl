@@ -84,8 +84,14 @@ start_client(Opts) ->
     PoolName = maps:get(pool_name, Opts, greptimedb_rs_pool),
     PoolSize = maps:get(pool_size, Opts, 8),
     PoolType = maps:get(pool_type, Opts, random),
+    AutoReconnect = maps:get(auto_reconnect, Opts, undefined),
 
-    PoolOpts = [{pool_size, PoolSize}, {pool_type, PoolType}, {conn_opts, Opts}],
+    PoolOpts = lists:flatten([
+        {pool_size, PoolSize},
+        {pool_type, PoolType},
+        {conn_opts, Opts},
+        [{auto_reconnect, AutoReconnect} || is_integer(AutoReconnect)]
+    ]),
 
     Client = #{
         pool_name => PoolName,
