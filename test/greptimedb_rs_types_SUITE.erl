@@ -82,7 +82,7 @@ t_insert_async_all_types(Config) ->
     Ref = make_ref(),
     Callback = {fun(P, R, Res) -> P ! {R, Res} end, [Self, Ref]},
 
-    ok = greptimedb_rs:insert_async(Client, Table, Rows, Callback),
+    {ok, _} = greptimedb_rs:insert_async(Client, Table, Rows, Callback),
 
     receive
         {Ref, {ok, _}} -> ok;

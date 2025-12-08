@@ -30,6 +30,11 @@
     terminate/2
 ]).
 
+-type args() :: term().
+-type conn() :: pid().
+-type opts() :: greptimedb_rs:opts().
+-type client_ref() :: reference().
+
 %% ================================================================================
 %% API
 
@@ -51,23 +56,25 @@ connect(Opts) when is_map(Opts) ->
 
 %% ================================================================================
 
-init([Opts]) ->
+init([Opts0]) ->
+    Opts = unwrap_password(Opts0),
     case apply_nif(?cmd_connect, [Opts]) of
         {ok, ClientRef} ->
-            {ok, #state{client = ClientRef, opts = Opts, writers = #{}}};
+            {ok, #state{client = ClientRef, opts = Opts0, writers = #{}}};
         {error, Reason} ->
             {stop, Reason}
     end.
 
 %% ================================================================================
 handle_call(
-    ?REQ(?cmd_connect, Args = [Opts]),
+    ?REQ(?cmd_connect, Args = [Opts0]),
     _From,
     State = #state{client = undefined}
 ) ->
+    Opts = unwrap_password(Opts0),
     case apply_nif(?cmd_connect, Args) of
         {ok, ClientRef} = Ok when is_reference(ClientRef) ->
-            {reply, Ok, State#state{client = ClientRef, opts = Opts}};
+            {reply, Ok, State#state{client = ClientRef, opts = Opts0}};
         ?is_err = Err ->
             {reply, Err, State}
     end;
@@ -174,3 +181,13 @@ write_with_stream(Table, Rows, _State = #state{writers = Writers}) ->
         _ ->
             {error, no_writer}
     end.
+
+unwrap_password(#{password := Password} = Opts) ->
+    Opts#{password := do_unwrap_password(Password)};
+unwrap_password(Opts) ->
+    Opts.
+
+do_unwrap_password(Password) when is_function(Password, 0) ->
+    do_unwrap_password(Password());
+do_unwrap_password(Password) ->
+    Password.

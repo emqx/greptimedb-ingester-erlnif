@@ -251,7 +251,7 @@ t_async_insert(Config) ->
     CallbackFun = fun(P, R, Res) -> P ! {R, Res} end,
     Callback = {CallbackFun, [Self, Ref]},
 
-    ok = greptimedb_rs:insert_async(Client, Table, Rows, Callback),
+    {ok, _WorkerPid} = greptimedb_rs:insert_async(Client, Table, Rows, Callback),
     receive
         {Ref, {ok, _}} -> ok;
         {Ref, {error, Reason}} -> ct:fail({async_write_failed, Reason})
@@ -313,7 +313,7 @@ t_async_query(Config) ->
     Callback = {CallbackFun, [Self, Ref]},
 
     Sql = iolist_to_binary(io_lib:format("SELECT * FROM ~s", [Table])),
-    ok = greptimedb_rs:query_async(Client, Sql, Callback),
+    {ok, _} = greptimedb_rs:query_async(Client, Sql, Callback),
 
     receive
         {Ref, {ok, Result}} ->
