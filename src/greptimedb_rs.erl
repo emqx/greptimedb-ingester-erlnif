@@ -28,7 +28,48 @@
     stream_write_async/3
 ]).
 
+-export_type([
+    client/0,
+    opts/0
+]).
+
+%% ===================================================================
+%% Type defs
+%% ===================================================================
+
 -define(pool_name(PoolName), #{pool_name := PoolName}).
+
+-type opts() :: #{
+    endpoints := [binary()],
+    dbname := binary(),
+    username => binary(),
+    password => binary(),
+    tls => boolean(),
+    ca_cert => binary(),
+    client_cert => binary(),
+    client_key => binary(),
+    pool_name => pool_name(),
+    pool_size => pool_size(),
+    pool_type => pool_type(),
+    any() => term()
+}.
+-type client() :: #{
+    pool_name := pool_name(),
+    pool_size := pool_size(),
+    pool_type := pool_type(),
+    conn_opts := opts()
+}.
+-type stream_client() :: {stream_client, client(), table()}.
+-type table() :: binary().
+-type sql() :: binary().
+-type result() :: term().
+-type reason() :: term() | binary().
+
+-type pool_name() :: term().
+-type pool_type() :: random | hash.
+-type pool_size() :: pos_integer().
+
+-type callback() :: {function(), list()}.
 
 %% ===================================================================
 %% Connection and Disconnection
@@ -65,11 +106,11 @@ start_client(Opts) ->
 -doc """
 Stop the connection pool and release resources.
 """.
--spec stop_client(client()) -> ok.
+-spec stop_client(client() | pool_name()) -> ok.
 stop_client(?pool_name(PoolName)) ->
     ecpool:stop_sup_pool(PoolName);
-stop_client(_) ->
-    ok.
+stop_client(PoolName) ->
+    ecpool:stop_sup_pool(PoolName).
 
 %% ===================================================================
 %% Write - Batch Write

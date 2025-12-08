@@ -30,6 +30,11 @@
     terminate/2
 ]).
 
+-type args() :: term().
+-type conn() :: pid().
+-type opts() :: greptimedb_rs:opts().
+-type client_ref() :: reference().
+
 %% ================================================================================
 %% API
 
