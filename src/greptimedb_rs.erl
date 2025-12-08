@@ -133,7 +133,7 @@ insert(Client, Table, Rows) ->
 -doc """
 Batch write data (asynchronous).
 """.
--spec insert_async(client(), binary(), [map()], callback()) -> ok.
+-spec insert_async(client(), binary(), [map()], callback()) -> {ok, pid()}.
 insert_async(Client, Table, Rows, ResultCallback) ->
     call_async(Client, ?cmd_insert, [Table, Rows], ResultCallback).
 
@@ -151,7 +151,7 @@ query(Client, Sql) ->
 -doc """
 Execute SQL query (asynchronous).
 """.
--spec query_async(client(), sql(), callback()) -> ok.
+-spec query_async(client(), sql(), callback()) -> {ok, pid()}.
 query_async(Client, Sql, ResultCallback) ->
     call_async(Client, ?cmd_execute, [Sql], ResultCallback).
 
@@ -238,6 +238,6 @@ call_async(?pool_name(PoolName), Cmd, Args, Callback) ->
         PoolName,
         fun(Conn) ->
             erlang:send(Conn, ?ASYNC_REQ(Cmd, Args, Callback)),
-            ok
+            {ok, Conn}
         end
     ).
