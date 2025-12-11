@@ -219,12 +219,8 @@ generate_full_row(Id) ->
 verify_data(Client, Table, ExpectedCount) ->
     timer:sleep(2000),
     Sql = iolist_to_binary(io_lib:format("SELECT count(*) FROM ~s", [Table])),
-    {ok, [ResultStr]} = greptimedb_rs:query(Client, Sql),
-    ExpectedStr = integer_to_list(ExpectedCount),
-    case string:find(ResultStr, ExpectedStr) of
-        nomatch -> ct:fail({verification_failed, ResultStr, ExpectedStr});
-        _ -> ok
-    end.
+    {ok, [[Count]]} = greptimedb_rs:query(Client, Sql),
+    ?assertEqual(ExpectedCount, Count).
 
 get_host_addr(Env) ->
     case os:getenv(Env) of

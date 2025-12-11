@@ -185,7 +185,7 @@ pub fn terms_to_schema_and_rows<'a>(
         keys.sort();
 
         for key in keys {
-            let val = map.map_get(key).unwrap();
+            let val = map.map_get(key)?;
             let dtype = infer_dtype(val);
             let name = term_to_string(key)?;
             schema.push(tag(&name, dtype));
@@ -201,7 +201,7 @@ pub fn terms_to_schema_and_rows<'a>(
         keys.sort();
 
         for key in keys {
-            let val = map.map_get(key).unwrap();
+            let val = map.map_get(key)?;
             let dtype = infer_dtype(val);
             let name = term_to_string(key)?;
             schema.push(field(&name, dtype));

@@ -106,27 +106,35 @@ fn connect(opts: Term) -> NifResult<Term> {
 fn execute(env: Env, resource: ResourceArc<GreptimeResource>, sql: String) -> NifResult<Term> {
     let db = &resource.db;
 
+    // Collect RecordBatches first (Env is not Send)
     let result = RUNTIME.block_on(async {
         use futures::StreamExt;
         match db.query(&sql).await {
             Ok(mut stream) => {
-                let mut rows = Vec::new();
+                let mut batches = Vec::new();
                 while let Some(batch_res) = stream.next().await {
                     match batch_res {
                         Ok(batch) => {
-                            rows.push(format!("{batch:?}"));
+                            batches.push(batch);
                         }
                         Err(e) => return Err(e),
                     }
                 }
-                Ok(rows)
+                Ok(batches)
             }
             Err(e) => Err(e),
         }
     });
 
     match result {
-        Ok(rows) => Ok((atoms::ok(), rows).encode(env)),
+        Ok(batches) => {
+            let mut all_rows = Vec::new();
+            for batch in batches {
+                let rows = types::record_batch_to_terms(env, &batch);
+                all_rows.extend(rows);
+            }
+            Ok((atoms::ok(), all_rows).encode(env))
+        }
         Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
     }
 }

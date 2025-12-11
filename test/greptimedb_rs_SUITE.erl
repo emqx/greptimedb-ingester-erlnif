@@ -19,6 +19,7 @@ all() ->
 groups() ->
     TCs = [
         t_connect,
+        t_metadata_queries,
         t_insert_sync,
         t_insert_sync_existing_table,
         t_query_sync,
@@ -113,6 +114,61 @@ t_connect(Config) ->
     ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
     ok = greptimedb_rs:stop_client(Client).
 
+t_metadata_queries(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+
+    %% 1. Show Databases
+    {ok, Dbs} = greptimedb_rs:query(Client, <<"SHOW DATABASES">>),
+    %% Result is [[<<"db1">>], [<<"db2">>], ...], check if "public" is in one of the rows
+    ?assert(lists:any(fun([DbName]) -> DbName =:= <<"public">> end, Dbs)),
+
+    %% 2. Setup Table
+    DropTableSql = iolist_to_binary(io_lib:format("DROP TABLE IF EXISTS ~s", [Table])),
+    greptimedb_rs:query(Client, DropTableSql),
+
+    CreateSql = iolist_to_binary(
+        io_lib:format(
+            "CREATE TABLE ~s ("
+            "ts TIMESTAMP TIME INDEX, "
+            "val INT32, "
+            "PRIMARY KEY (val)"
+            ") ENGINE=mito",
+            [Table]
+        )
+    ),
+    {ok, _} = greptimedb_rs:query(Client, CreateSql),
+
+    %% 3. Show Tables
+    {ok, Tables} = greptimedb_rs:query(Client, <<"SHOW TABLES">>),
+    %% Check if our table is in the list
+    ?assert(lists:any(fun([TableName]) -> TableName =:= Table end, Tables)),
+
+    %% 4. Insert Data
+    Ts = erlang:system_time(millisecond),
+    Rows = [
+        #{
+            fields => #{<<"foo">> => <<"bar">>},
+            tags => #{<<"val">> => 10},
+            timestamp => Ts
+        },
+        #{
+            fields => #{<<"baz">> => <<"qux">>},
+            tags => #{<<"val">> => 20},
+            timestamp => Ts + 1000
+        }
+    ],
+    {ok, _} = greptimedb_rs:insert(Client, Table, Rows),
+    timer:sleep(1000),
+
+    %% 5. Select *
+    %% Select specific column to match specific values
+    SelectSql = iolist_to_binary(io_lib:format("SELECT val FROM ~s ORDER BY val", [Table])),
+    {ok, Result} = greptimedb_rs:query(Client, SelectSql),
+    ?assertEqual([[10], [20]], Result),
+
+    ok = greptimedb_rs:stop_client(Client).
+
 t_connect_with_auth(_Config) ->
     Host = get_host_addr("GREPTIMEDB_AUTH_ADDR"),
     ConnOpts = #{
@@ -152,6 +208,12 @@ t_insert_sync(Config) ->
         }
     ],
     ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
+
+    timer:sleep(1000),
+    Sql = iolist_to_binary(io_lib:format("SELECT count(*) FROM ~s", [Table])),
+    {ok, [[Count]]} = greptimedb_rs:query(Client, Sql),
+    ?assertEqual(1, Count),
+
     ok = greptimedb_rs:stop_client(Client).
 
 t_insert_sync_existing_table(Config) ->
@@ -200,6 +262,12 @@ t_insert_sync_existing_table(Config) ->
     ],
     % Should succeed by using the existing schema
     ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
+
+    timer:sleep(1000),
+    Sql = iolist_to_binary(io_lib:format("SELECT count(*) FROM ~s", [Table])),
+    {ok, [[Count]]} = greptimedb_rs:query(Client, Sql),
+    ?assertEqual(1, Count),
+
     ok = greptimedb_rs:stop_client(Client).
 
 t_insert_async(Config) ->
@@ -241,7 +309,8 @@ t_insert_async(Config) ->
 
     timer:sleep(1000),
     Sql = iolist_to_binary(io_lib:format("SELECT count(*) FROM ~s", [Table])),
-    ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, Sql)),
+    {ok, [[Count]]} = greptimedb_rs:query(Client, Sql),
+    ?assertEqual(1, Count),
 
     ok = greptimedb_rs:stop_client(Client).
 
@@ -303,7 +372,8 @@ t_insert_async_existing_table(Config) ->
 
     timer:sleep(1000),
     Sql = iolist_to_binary(io_lib:format("SELECT count(*) FROM ~s", [Table])),
-    ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, Sql)),
+    {ok, [[Count]]} = greptimedb_rs:query(Client, Sql),
+    ?assertEqual(1, Count),
 
     ok = greptimedb_rs:stop_client(Client).
 
@@ -436,9 +506,9 @@ t_stream_write(Config) ->
     timer:sleep(1000),
 
     Sql = iolist_to_binary(io_lib:format("SELECT count(*) FROM ~s", [Table])),
-    {ok, [ResultStr]} = greptimedb_rs:query(Client, Sql),
+    {ok, [[Count]]} = greptimedb_rs:query(Client, Sql),
     % Verify result contains "10" (row count)
-    ?assertNotEqual(nomatch, string:find(ResultStr, "10")),
+    ?assertEqual(10, Count),
 
     ok = greptimedb_rs:stop_client(Client).
 
@@ -508,8 +578,8 @@ t_stream_write_async(Config) ->
     timer:sleep(1000),
 
     Sql = iolist_to_binary(io_lib:format("SELECT count(*) FROM ~s", [Table])),
-    {ok, [ResultStr]} = greptimedb_rs:query(Client, Sql),
-    ?assertNotEqual(nomatch, string:find(ResultStr, "10")),
+    {ok, [[Count]]} = greptimedb_rs:query(Client, Sql),
+    ?assertEqual(10, Count),
 
     ok = greptimedb_rs:stop_client(Client).
 %% ================================================================================
