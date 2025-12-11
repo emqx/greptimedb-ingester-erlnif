@@ -73,7 +73,7 @@ do_benchmark(insert_async, Client, Table) ->
         fun(BatchId) ->
             Rows = generate_rows(BatchId, ?ROWS_PER_BATCH),
             Callback = {fun(_Res) -> Parent ! {Ref, done} end, []},
-            ok = greptimedb_rs:insert_async(Client, Table, Rows, Callback),
+            {ok, _} = greptimedb_rs:insert_async(Client, Table, Rows, Callback),
             progress_bar(BatchId, ?BATCH_COUNT)
         end,
         lists:seq(1, ?BATCH_COUNT)
@@ -108,7 +108,7 @@ do_benchmark(stream_write_async, Client, Table) ->
         fun(BatchId) ->
             Rows = generate_rows(BatchId, ?ROWS_PER_BATCH),
             Callback = {fun(_Res) -> Parent ! {Ref, done} end, []},
-            ok = greptimedb_rs:stream_write_async(Stream, Rows, Callback),
+            {ok, _} = greptimedb_rs:stream_write_async(Stream, Rows, Callback),
             progress_bar(BatchId, ?BATCH_COUNT)
         end,
         lists:seq(1, ?BATCH_COUNT)

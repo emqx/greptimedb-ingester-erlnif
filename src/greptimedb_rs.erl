@@ -206,20 +206,15 @@ Uses ecpool to pick a connection from the pool.
 The worker lazily initializes the stream writer if needed.
 """.
 -spec stream_write(stream_client(), [map()]) -> ok | {error, term()}.
-stream_write({stream_client, ?pool_name(PoolName), Table}, Rows) ->
-    ecpool:with_client(PoolName, fun(Conn) ->
-        greptimedb_rs_sock:sync_command(Conn, ?cmd_stream_write, [Table, Rows])
-    end).
+stream_write({stream_client, Client, Table}, Rows) ->
+    call_sync(Client, ?cmd_stream_write, [Table, Rows]).
 
 -doc """
 Write data to the stream (asynchronous).
 """.
--spec stream_write_async(stream_client(), [map()], callback()) -> ok.
-stream_write_async({stream_client, ?pool_name(PoolName), Table}, Rows, Callback) ->
-    ecpool:with_client(PoolName, fun(Conn) ->
-        erlang:send(Conn, ?ASYNC_REQ(?cmd_stream_write, [Table, Rows], Callback)),
-        ok
-    end).
+-spec stream_write_async(stream_client(), [map()], callback()) -> {ok, pid()}.
+stream_write_async({stream_client, Client, Table}, Rows, Callback) ->
+    call_async(Client, ?cmd_stream_write, [Table, Rows], Callback).
 
 %% ===================================================================
 %% Helpers
