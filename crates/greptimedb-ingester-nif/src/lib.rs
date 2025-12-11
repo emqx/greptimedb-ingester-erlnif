@@ -216,11 +216,38 @@ fn insert<'a>(
         return Ok((atoms::ok(), 0).encode(env));
     }
 
-    // 1. Infer Schema and Construct Rows (Schema-less)
-    let (schema, rows) = util::terms_to_schema_and_rows(rows_term)?;
+    use greptimedb_ingester::api::v1::{RowInsertRequest, RowInsertRequests, Rows};
+
+    // 1. Try Fetch Schema from Server
+    let table_schema_res: Result<TableSchema, String> =
+        RUNTIME.block_on(fetch_table_schema(&resource.db, &table));
+
+    let (schema, rows) = match table_schema_res {
+        Ok(s) => {
+            // Table exists, use server schema
+            let proto_rows = util::terms_to_proto_rows_using_schema(&s, rows_term)?;
+
+            use greptimedb_ingester::api::v1::ColumnSchema;
+            let schema_cols: Vec<ColumnSchema> = s
+                .columns()
+                .iter()
+                .map(|c| ColumnSchema {
+                    column_name: c.name.clone(),
+                    datatype: c.data_type as i32,
+                    semantic_type: c.semantic_type as i32,
+                    ..Default::default()
+                })
+                .collect();
+
+            (schema_cols, proto_rows)
+        }
+        Err(_) => {
+            // Table might not exist, infer schema locally
+            util::terms_to_schema_and_rows(rows_term)?
+        }
+    };
 
     // 2. Construct Request
-    use greptimedb_ingester::api::v1::{RowInsertRequest, RowInsertRequests, Rows};
     let insert_request = RowInsertRequests {
         inserts: vec![RowInsertRequest {
             table_name: table,
@@ -228,7 +255,7 @@ fn insert<'a>(
         }],
     };
 
-    // 3. Insert using Database (low latency API)
+    // 3. Insert using Database
     let result: Result<u32, String> = RUNTIME.block_on(async {
         resource
             .db

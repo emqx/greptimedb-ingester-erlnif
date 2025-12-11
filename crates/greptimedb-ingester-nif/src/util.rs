@@ -2,6 +2,7 @@ use crate::atoms;
 use crate::types;
 use greptimedb_ingester::api::v1::{ColumnDataType, ColumnSchema, Row as ProtoRow, SemanticType};
 use greptimedb_ingester::helpers::schema::{field, tag, timestamp};
+use greptimedb_ingester::helpers::values::none_value;
 use greptimedb_ingester::{Row, Rows, TableSchema, Value};
 use rustler::{Encoder, Term, TermType};
 
@@ -78,6 +79,71 @@ pub fn terms_to_rows<'a>(
     Ok(greptime_rows)
 }
 
+pub fn terms_to_proto_rows_using_schema<'a>(
+    table_schema: &TableSchema,
+    rows_term: Vec<Term<'a>>,
+) -> rustler::NifResult<Vec<ProtoRow>> {
+    if rows_term.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let env = rows_term[0].get_env();
+    let column_schemas = table_schema.columns();
+
+    // Pre-compute keys and metadata for columns
+    let col_meta: Vec<(SemanticType, Term<'a>, ColumnDataType)> = column_schemas
+        .iter()
+        .map(|c| (c.semantic_type, c.name.encode(env), c.data_type))
+        .collect();
+
+    let atom_fields = atoms::fields().to_term(env);
+    let bin_fields = "fields".encode(env);
+    let atom_tags = atoms::tags().to_term(env);
+    let bin_tags = "tags".encode(env);
+    let atom_timestamp = atoms::timestamp().to_term(env);
+    let bin_timestamp = "timestamp".encode(env);
+    let atom_ts = atoms::ts().to_term(env);
+    let bin_ts = "ts".encode(env);
+
+    let mut rows = Vec::with_capacity(rows_term.len());
+
+    for row_term in rows_term {
+        let fields_term = row_term
+            .map_get(atom_fields)
+            .ok()
+            .or_else(|| row_term.map_get(bin_fields).ok());
+        let tags_term = row_term
+            .map_get(atom_tags)
+            .ok()
+            .or_else(|| row_term.map_get(bin_tags).ok());
+        let ts_term = row_term
+            .map_get(atom_timestamp)
+            .ok()
+            .or_else(|| row_term.map_get(bin_timestamp).ok())
+            .or_else(|| row_term.map_get(atom_ts).ok())
+            .or_else(|| row_term.map_get(bin_ts).ok());
+
+        let mut values = Vec::with_capacity(col_meta.len());
+
+        for (semantic, key_term, dtype) in &col_meta {
+            let val_term = match semantic {
+                SemanticType::Field => fields_term.and_then(|map| map.map_get(*key_term).ok()),
+                SemanticType::Tag => tags_term.and_then(|map| map.map_get(*key_term).ok()),
+                SemanticType::Timestamp => ts_term,
+            };
+
+            let val = if let Some(t) = val_term {
+                types::term_to_proto_value(&t, *dtype)?
+            } else {
+                none_value()
+            };
+            values.push(val);
+        }
+        rows.push(ProtoRow { values });
+    }
+    Ok(rows)
+}
+
 pub fn terms_to_schema_and_rows<'a>(
     rows_term: Vec<Term<'a>>,
 ) -> rustler::NifResult<(Vec<ColumnSchema>, Vec<ProtoRow>)> {
@@ -112,7 +178,6 @@ pub fn terms_to_schema_and_rows<'a>(
 
     // 1. Tags
     if let Some(map) = tags_term {
-        // Collect and sort keys for deterministic order
         let mut keys: Vec<Term> = match map.decode::<rustler::MapIterator>() {
             Ok(iter) => iter.map(|(k, _)| k).collect(),
             Err(_) => return Err(rustler::Error::BadArg),
@@ -120,7 +185,7 @@ pub fn terms_to_schema_and_rows<'a>(
         keys.sort();
 
         for key in keys {
-            let val = map.map_get(key).unwrap(); // Key exists
+            let val = map.map_get(key).unwrap();
             let dtype = infer_dtype(val);
             let name = term_to_string(key)?;
             schema.push(tag(&name, dtype));
@@ -229,20 +294,13 @@ fn infer_dtype(term: Term) -> ColumnDataType {
         }
         TermType::Binary => ColumnDataType::String,
         TermType::Integer => {
-            if let Ok(i) = term.decode::<i64>() {
-                if i >= i8::MIN as i64 && i <= i8::MAX as i64 {
-                    ColumnDataType::Int8
-                } else if i >= i16::MIN as i64 && i <= i16::MAX as i64 {
-                    ColumnDataType::Int16
-                } else if i >= i32::MIN as i64 && i <= i32::MAX as i64 {
-                    ColumnDataType::Int32
-                } else {
-                    ColumnDataType::Int64
-                }
+            // Aggressively default to Int64 to avoid overflow issues with schema inference
+            // unless it fits in i64. If it's too big for i64 (u64), use Uint64.
+            if term.decode::<i64>().is_ok() {
+                ColumnDataType::Int64
             } else if term.decode::<u64>().is_ok() {
                 ColumnDataType::Uint64
             } else {
-                // Fallback for very large integers or unexpected cases
                 ColumnDataType::Float64
             }
         }
