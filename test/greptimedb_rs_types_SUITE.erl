@@ -48,9 +48,20 @@ init_per_testcase(TestCase, Config) ->
     Table = <<(atom_to_binary(TestCase))/binary, "_table_", UniqueSuffix/binary>>,
     [{table, Table} | Config].
 
-end_per_testcase(_TestCase, _Config) ->
-    ConnOpts = #{pool_name => greptimedb_rs_pool},
-    catch greptimedb_rs:stop_client(ConnOpts),
+end_per_testcase(_TestCase, Config) ->
+    ConnOpts = ?conn_opts(Config),
+    Table = ?table(Config),
+
+    Client =
+        case greptimedb_rs:start_client(ConnOpts) of
+            {ok, C} -> C;
+            {error, {already_started, C}} -> C
+        end,
+
+    DropTableSql = iolist_to_binary(io_lib:format("DROP TABLE IF EXISTS ~s", [Table])),
+    greptimedb_rs:query(Client, DropTableSql),
+
+    catch greptimedb_rs:stop_client(Client),
     ok.
 
 %% ----------------------------------------
@@ -60,8 +71,10 @@ t_insert_all_types(Config) ->
     {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
     Table = ?table(Config),
 
-    setup_table(Client, Table),
-
+    %% insert api use schema auto-create feature
+    %% no need to setup table explicitly
+    %% but we need to drop table first to ensure clean state
+    drop_table_if_exists(Client, Table),
     Rows = [generate_full_row(1)],
 
     ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
@@ -74,8 +87,10 @@ t_insert_async_all_types(Config) ->
     {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
     Table = ?table(Config),
 
-    setup_table(Client, Table),
-
+    %% insert api use schema auto-create feature
+    %% no need to setup table explicitly
+    %% but we need to drop table first to ensure clean state
+    drop_table_if_exists(Client, Table),
     Rows = [generate_full_row(2)],
 
     Self = self(),
@@ -123,7 +138,7 @@ t_stream_async_all_types(Config) ->
     Ref = make_ref(),
     Callback = {fun(P, R, Res) -> P ! {R, Res} end, [Self, Ref]},
 
-    ok = greptimedb_rs:stream_write_async(Stream, Rows, Callback),
+    {ok, _} = greptimedb_rs:stream_write_async(Stream, Rows, Callback),
 
     receive
         {Ref, ok} -> ok;
@@ -141,8 +156,7 @@ t_stream_async_all_types(Config) ->
 %% Helpers
 
 setup_table(Client, Table) ->
-    DropSql = iolist_to_binary(io_lib:format("DROP TABLE IF EXISTS ~s", [Table])),
-    greptimedb_rs:query(Client, DropSql),
+    drop_table_if_exists(Client, Table),
 
     CreateSql = iolist_to_binary(
         io_lib:format(
@@ -170,6 +184,10 @@ setup_table(Client, Table) ->
         )
     ),
     {ok, _} = greptimedb_rs:query(Client, CreateSql).
+
+drop_table_if_exists(Client, Table) ->
+    DropSql = iolist_to_binary(io_lib:format("DROP TABLE IF EXISTS ~s", [Table])),
+    greptimedb_rs:query(Client, DropSql).
 
 generate_full_row(Id) ->
     Ts = os:system_time(millisecond),
@@ -201,12 +219,8 @@ generate_full_row(Id) ->
 verify_data(Client, Table, ExpectedCount) ->
     timer:sleep(2000),
     Sql = iolist_to_binary(io_lib:format("SELECT count(*) FROM ~s", [Table])),
-    {ok, [ResultStr]} = greptimedb_rs:query(Client, Sql),
-    ExpectedStr = integer_to_list(ExpectedCount),
-    case string:find(ResultStr, ExpectedStr) of
-        nomatch -> ct:fail({verification_failed, ResultStr, ExpectedStr});
-        _ -> ok
-    end.
+    {ok, [[Count]]} = greptimedb_rs:query(Client, Sql),
+    ?assertEqual(ExpectedCount, Count).
 
 get_host_addr(Env) ->
     case os:getenv(Env) of

@@ -67,7 +67,7 @@ init([Opts0]) ->
 
 %% ================================================================================
 handle_call(
-    ?REQ(?cmd_connect, Args = [Opts0]),
+    ?REQ(?cmd_connect, _Args = [Opts0]),
     _From,
     State = #state{client = undefined}
 ) ->
