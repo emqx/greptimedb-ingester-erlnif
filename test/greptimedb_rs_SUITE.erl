@@ -543,17 +543,17 @@ t_query_sync(Config) ->
     Ts = erlang:system_time(millisecond),
     Rows = [
         #{
-            <<"fields">> => #{
+            fields => #{
                 <<"temperature">> => 25.5,
                 <<"pressure">> => 1013,
                 <<"active">> => true,
                 <<"query_val">> => 123
             },
-            <<"tags">> => #{
+            tags => #{
                 <<"sensor_location">> => <<"room1">>,
                 <<"sensor_id">> => 12345
             },
-            <<"timestamp">> => Ts
+            timestamp => Ts
         }
     ],
     ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
@@ -575,17 +575,17 @@ t_query_async(Config) ->
 
     Rows = [
         #{
-            <<"fields">> => #{
+            fields => #{
                 <<"temperature">> => 25.5,
                 <<"pressure">> => 1013,
                 <<"active">> => true,
                 <<"async_query">> => 200
             },
-            <<"tags">> => #{
+            tags => #{
                 <<"sensor_location">> => <<"room1">>,
                 <<"sensor_id">> => 12345
             },
-            <<"timestamp">> => Ts
+            timestamp => Ts
         }
     ],
     {ok, _} = greptimedb_rs:insert(Client, Table, Rows),

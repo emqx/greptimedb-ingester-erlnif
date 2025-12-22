@@ -1,7 +1,6 @@
 -module(greptimedb_rs_nif).
 
 -export([
-    init_runtime/0,
     connect/1,
     execute/2,
     insert/3,
@@ -16,24 +15,10 @@
 init() ->
     NifName = "libgreptimedb_nif",
     Niflib = filename:join(priv_dir(), NifName),
-    case erlang:load_nif(Niflib, none) of
-        ok ->
-            %% Initialize the Rust runtime immediately after loading
-            case init_runtime() of
-                true -> ok;
-                %% already initialized
-                false -> ok;
-                Error -> Error
-            end;
-        {error, _Reason} = Res ->
-            Res
-    end.
+    erlang:load_nif(Niflib, none).
 
 %% =================================================================================================
 %% NIFs
-
-init_runtime() ->
-    not_loaded(?LINE).
 
 connect(_Opts) ->
     not_loaded(?LINE).

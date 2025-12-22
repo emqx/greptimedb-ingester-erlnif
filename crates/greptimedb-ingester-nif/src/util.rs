@@ -26,34 +26,22 @@ pub fn terms_to_rows<'a>(
         .map(|c| (c.semantic_type, c.name.encode(env), c.data_type))
         .collect();
 
-    // Pre-compute static atoms and binary keys
+    // Pre-compute static atom keys only
     let atom_fields = atoms::fields().to_term(env);
-    let bin_fields = "fields".encode(env);
     let atom_tags = atoms::tags().to_term(env);
-    let bin_tags = "tags".encode(env);
     let atom_timestamp = atoms::timestamp().to_term(env);
-    let bin_timestamp = "timestamp".encode(env);
     let atom_ts = atoms::ts().to_term(env);
-    let bin_ts = "ts".encode(env);
 
     for row_term in rows_term {
-        // Retrieve sub-maps directly from the row term (atom or binary key)
-        let fields_term = row_term
-            .map_get(atom_fields)
-            .ok()
-            .or_else(|| row_term.map_get(bin_fields).ok());
-        let tags_term = row_term
-            .map_get(atom_tags)
-            .ok()
-            .or_else(|| row_term.map_get(bin_tags).ok());
+        // Retrieve sub-maps directly from the row term (atom keys only)
+        let fields_term = row_term.map_get(atom_fields).ok();
+        let tags_term = row_term.map_get(atom_tags).ok();
 
-        // Timestamp can be under "timestamp" or "ts" (atom or binary)
+        // Timestamp can be under "timestamp" or "ts" (atom keys only)
         let ts_term = row_term
             .map_get(atom_timestamp)
             .ok()
-            .or_else(|| row_term.map_get(bin_timestamp).ok())
-            .or_else(|| row_term.map_get(atom_ts).ok())
-            .or_else(|| row_term.map_get(bin_ts).ok());
+            .or_else(|| row_term.map_get(atom_ts).ok());
 
         let mut values = Vec::with_capacity(col_meta.len());
 
@@ -96,32 +84,21 @@ pub fn terms_to_proto_rows_using_schema<'a>(
         .map(|c| (c.semantic_type, c.name.encode(env), c.data_type))
         .collect();
 
+    // Pre-compute static atom keys only
     let atom_fields = atoms::fields().to_term(env);
-    let bin_fields = "fields".encode(env);
     let atom_tags = atoms::tags().to_term(env);
-    let bin_tags = "tags".encode(env);
     let atom_timestamp = atoms::timestamp().to_term(env);
-    let bin_timestamp = "timestamp".encode(env);
     let atom_ts = atoms::ts().to_term(env);
-    let bin_ts = "ts".encode(env);
 
     let mut rows = Vec::with_capacity(rows_term.len());
 
     for row_term in rows_term {
-        let fields_term = row_term
-            .map_get(atom_fields)
-            .ok()
-            .or_else(|| row_term.map_get(bin_fields).ok());
-        let tags_term = row_term
-            .map_get(atom_tags)
-            .ok()
-            .or_else(|| row_term.map_get(bin_tags).ok());
+        let fields_term = row_term.map_get(atom_fields).ok();
+        let tags_term = row_term.map_get(atom_tags).ok();
         let ts_term = row_term
             .map_get(atom_timestamp)
             .ok()
-            .or_else(|| row_term.map_get(bin_timestamp).ok())
-            .or_else(|| row_term.map_get(atom_ts).ok())
-            .or_else(|| row_term.map_get(bin_ts).ok());
+            .or_else(|| row_term.map_get(atom_ts).ok());
 
         let mut values = Vec::with_capacity(col_meta.len());
 
@@ -154,24 +131,14 @@ pub fn terms_to_schema_and_rows<'a>(
     let env = rows_term[0].get_env();
     let first_row = rows_term[0];
 
-    // Pre-compute static atoms and binary keys
+    // Pre-compute static atom keys only
     let atom_fields = atoms::fields().to_term(env);
-    let bin_fields = "fields".encode(env);
     let atom_tags = atoms::tags().to_term(env);
-    let bin_tags = "tags".encode(env);
     let atom_timestamp = atoms::timestamp().to_term(env);
-    let bin_timestamp = "timestamp".encode(env);
     let atom_ts = atoms::ts().to_term(env);
-    let bin_ts = "ts".encode(env);
 
-    let fields_term = first_row
-        .map_get(atom_fields)
-        .ok()
-        .or_else(|| first_row.map_get(bin_fields).ok());
-    let tags_term = first_row
-        .map_get(atom_tags)
-        .ok()
-        .or_else(|| first_row.map_get(bin_tags).ok());
+    let fields_term = first_row.map_get(atom_fields).ok();
+    let tags_term = first_row.map_get(atom_tags).ok();
 
     // --- Infer Schema ---
     let mut schema = Vec::new();
@@ -212,9 +179,7 @@ pub fn terms_to_schema_and_rows<'a>(
     let ts_term = first_row
         .map_get(atom_timestamp)
         .ok()
-        .or_else(|| first_row.map_get(bin_timestamp).ok())
-        .or_else(|| first_row.map_get(atom_ts).ok())
-        .or_else(|| first_row.map_get(bin_ts).ok());
+        .or_else(|| first_row.map_get(atom_ts).ok());
 
     if ts_term.is_some() {
         schema.push(timestamp("ts", ColumnDataType::TimestampMillisecond));
@@ -245,21 +210,13 @@ pub fn terms_to_schema_and_rows<'a>(
     use greptimedb_ingester::helpers::values::none_value;
 
     for row_term in rows_term {
-        let fields_map = row_term
-            .map_get(atom_fields)
-            .ok()
-            .or_else(|| row_term.map_get(bin_fields).ok());
-        let tags_map = row_term
-            .map_get(atom_tags)
-            .ok()
-            .or_else(|| row_term.map_get(bin_tags).ok());
+        let fields_map = row_term.map_get(atom_fields).ok();
+        let tags_map = row_term.map_get(atom_tags).ok();
 
         let row_ts_term = row_term
             .map_get(atom_timestamp)
             .ok()
-            .or_else(|| row_term.map_get(bin_timestamp).ok())
-            .or_else(|| row_term.map_get(atom_ts).ok())
-            .or_else(|| row_term.map_get(bin_ts).ok());
+            .or_else(|| row_term.map_get(atom_ts).ok());
 
         let mut values = Vec::with_capacity(schema.len());
 
@@ -320,17 +277,5 @@ fn term_to_string(term: Term) -> rustler::NifResult<String> {
 }
 
 fn find_value_in_map<'a>(map: Option<Term<'a>>, key_str_term: Term<'a>) -> Option<Term<'a>> {
-    if let Some(m) = map {
-        if let Ok(v) = m.map_get(key_str_term) {
-            return Some(v);
-        }
-        if let Ok(s) = key_str_term.decode::<String>() {
-            if let Ok(atom) = rustler::types::Atom::from_str(m.get_env(), &s) {
-                if let Ok(v) = m.map_get(atom.to_term(m.get_env())) {
-                    return Some(v);
-                }
-            }
-        }
-    }
-    None
+    map.and_then(|m| m.map_get(key_str_term).ok())
 }
