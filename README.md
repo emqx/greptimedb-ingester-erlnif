@@ -4,10 +4,10 @@ High-performance Erlang client for [GreptimeDB](https://greptime.com/), built on
 
 ## Features
 
-- **High Performance**: Direct binding to the Rust Ingester SDK.
+- **High Performance**: Direct binding to the Rust Ingester SDK with per-connection Tokio runtime for optimal isolation and throughput.
 - **Async & Sync API**: Flexible API supporting both blocking calls and non-blocking async callbacks.
-- **Stream Ingestion**: efficient streaming support for high-throughput data ingestion.
-- **Connection Pooling**: Robust connection management handled by the underlying Rust implementation.
+- **Stream Ingestion**: Efficient streaming support for high-throughput data ingestion.
+- **Connection Pooling**: Robust connection management implemented in Erlang using ecpool.
 - **SQL Execution**: Execute DDL and SQL queries directly.
 - **Full Type Support**: Supports all GreptimeDB data types including Int8-64, Float32/64, Boolean, String, Binary, Date, Datetime, and Timestamps with various precisions.
 
@@ -76,11 +76,16 @@ Opts = #{
 
 ### 3. Prepare Data
 
-Rows are represented as maps containing `timestamp`, `tags` (optional), and `fields`. Keys can be atoms or binaries.
+Rows are represented as maps with specific atom keys:
+- **Required**: `timestamp` (or `ts`) - timestamp value
+- **Optional**: `tags` - map of tag columns
+- **Required**: `fields` - map of field columns
+
+**Important**: The top-level keys (`:timestamp` or `:ts`, `:tags`, `:fields`) must be atoms for optimal performance. Column names within `:tags` and `:fields` should be binaries.
 
 ```erlang
 Row = #{
-    timestamp => os:system_time(millisecond),
+    timestamp => os:system_time(millisecond),  % or use 'ts' instead
     tags => #{
         <<"host">> => <<"server-01">>,
         <<"region">> => <<"us-west">>
@@ -105,17 +110,28 @@ Rows = [Row], % Insert a list of rows
 ```
 
 #### Asynchronous Insert
-Returns immediately. The provided callback is executed upon completion.
+Returns immediately with the connection pid. The provided callback is executed upon completion.
 
 ```erlang
 % Define a callback function
-% Callback signature: fun(CallbackArgs, Result)
+% Callback signature: fun(CallbackArgs..., Result)
 Callback = {fun(Ref, Result) ->
     io:format("Insert finished for ~p: ~p~n", [Ref, Result])
 end, [make_ref()]},
 
-ok = greptimedb_rs:insert_async(Client, Table, Rows, Callback).
+% Returns {ok, ConnPid} where ConnPid is the connection process handling the request
+{ok, ConnPid} = greptimedb_rs:insert_async(Client, Table, Rows, Callback).
 ```
+
+### 5. Schema-less Insertion & Safety
+
+The library leverages the schema-less API of the Rust SDK to simplify data writing while ensuring data integrity.
+
+-   **Automatic Schema Inference**: If the target table does not exist, the SDK automatically infers the schema from the provided data and creates the table.
+-   **Strict Type Validation**: If the table exists, the provided data is strictly validated against the server's schema.
+-   **Conflict Handling**:
+    -   **Type Mismatch**: Inserting incompatible types (e.g., a String into an Integer column) will return an explicit error.
+    -   **Integer Overflow**: Values exceeding the range of the target column (e.g., inserting `1000` into an `Int8` column) will strictly return an error `{error, {nif_error, Reason}}`, preventing silent data corruption or `nil` insertion.
 
 ## Streaming Usage
 
@@ -131,11 +147,11 @@ Initialize a stream. The schema is automatically inferred from the `FirstRow` pr
 ### 2. Write to Stream
 
 ```erlang
-% Synchronous Write
+% Synchronous Write - blocks until complete
 ok = greptimedb_rs:stream_write(Stream, Rows).
 
-% Asynchronous Write
-ok = greptimedb_rs:stream_write_async(Stream, Rows, Callback).
+% Asynchronous Write - returns immediately with connection pid
+{ok, ConnPid} = greptimedb_rs:stream_write_async(Stream, Rows, Callback).
 ```
 
 ### 3. Close Stream
@@ -147,7 +163,9 @@ greptimedb_rs:stream_close(Stream).
 
 ## Executing SQL
 
-You can execute SQL statements (like `CREATE TABLE`, `DROP TABLE`, or `SELECT`) using the `query/2` function.
+You can execute SQL statements (like `CREATE TABLE`, `DROP TABLE`, or `SELECT`) using the `query/2` function. The API ensures that the returned result set is formatted into correct Erlang terms (e.g., integers, floats, binaries) that strictly match the database column types.
+
+### Synchronous Query
 
 **DDL (Data Definition Language):**
 
@@ -169,6 +187,18 @@ Query = <<"SELECT * FROM system_metrics LIMIT 10">>,
 {ok, Result} = greptimedb_rs:query(Client, Query).
 ```
 
+### Asynchronous Query
+
+Returns immediately with the connection pid. The provided callback is executed upon completion.
+
+```erlang
+Callback = {fun(Ref, Result) ->
+    io:format("Query finished for ~p: ~p~n", [Ref, Result])
+end, [make_ref()]},
+
+{ok, ConnPid} = greptimedb_rs:query_async(Client, Sql, Callback).
+```
+
 ## Supported Data Types
 
 The library supports automatic mapping from Erlang terms to GreptimeDB types based on the table schema.
@@ -184,6 +214,32 @@ The library supports automatic mapping from Erlang terms to GreptimeDB types bas
 | `Date`           | Integer (Days since epoch)                  | `19700`                   |
 | `Datetime`       | Integer (Milliseconds since epoch)          | `1678888888000`           |
 | `Timestamp`      | Integer (Units depend on column definition) | `1678888888000`           |
+
+## Performance Tips
+
+For optimal performance, consider these best practices:
+
+1. **Use Large Batches**: Batch 5,000-10,000 rows per insert for best throughput. Larger batches reduce NIF boundary crossing overhead.
+
+2. **Use Async Operations**: For high-throughput scenarios, use `insert_async/4` or `stream_write_async/3` with connection pooling to achieve maximum parallelism.
+
+3. **Use Atom Keys**: Always use atom keys (`:timestamp`, `:ts`, `:tags`, `:fields`) in row maps. Binary keys are no longer supported and atom keys provide ~50% faster map lookups.
+
+4. **Connection Pooling**: Each connection has its own Tokio runtime for better isolation and resource management. Use `pool_size` to match your concurrency needs (default: 8).
+
+5. **Stream for Bulk Ingestion**: For continuous high-volume writes, use streaming API (`stream_start/3`, `stream_write/2`) which maintains persistent connections and reduces connection overhead.
+
+### Benchmark Results
+
+Typical performance on a modern system (using 1M rows total):
+
+| Operation                      | Throughput (rows/s) |
+|:-------------------------------|--------------------:|
+| `insert` (pool=1)              |            260,000+ |
+| `insert_async` (pool=16)       |            935,000+ |
+| `stream_write_async` (pool=16) |            818,000+ |
+
+**Note**: Performance varies based on network latency, server capacity, data complexity, and batch size.
 
 ## Cleanup
 
