@@ -18,7 +18,7 @@ pub struct GreptimeResource {
     pub db: Database,
     pub client: Client,
     pub auth: Option<AuthScheme>,
-    pub runtime: Arc<Runtime>,  // Per-connection runtime
+    pub runtime: Arc<Runtime>, // Per-connection runtime
 }
 
 // Wrapper to force Send/Sync on BulkStreamWriter
@@ -29,7 +29,7 @@ unsafe impl Sync for SendableBulkStreamWriter {}
 pub struct StreamWriterResource {
     pub writer: tokio::sync::Mutex<Option<SendableBulkStreamWriter>>,
     pub schema: TableSchema,
-    pub runtime: Arc<Runtime>,  // Need runtime for async operations
+    pub runtime: Arc<Runtime>, // Need runtime for async operations
 }
 
 #[allow(non_local_definitions)]
@@ -100,7 +100,12 @@ fn connect(opts: Term) -> NifResult<Term> {
         }
     }
 
-    let resource = ResourceArc::new(GreptimeResource { db, client, auth, runtime });
+    let resource = ResourceArc::new(GreptimeResource {
+        db,
+        client,
+        auth,
+        runtime,
+    });
     Ok((atoms::ok(), resource).encode(env))
 }
 
@@ -312,10 +317,7 @@ fn stream_start<'a>(
         let writer = bulk_inserter
             .create_bulk_stream_writer(
                 &table_template,
-                Some(
-                    BulkWriteOptions::default()
-                        .with_timeout(Duration::from_secs(30)),
-                ),
+                Some(BulkWriteOptions::default().with_timeout(Duration::from_secs(30))),
             )
             .await
             .map_err(|e| e.to_string())?;
