@@ -167,7 +167,8 @@ handle_info(?ASYNC_REQ(Func, Args, {CallbackFun, CallBackArgs}), State = ?client
 handle_info(_, State) ->
     {noreply, State}.
 
-terminate(_Reason, #state{writers = Writers}) ->
+terminate(_Reason, #state{client = ClientRef, writers = Writers}) ->
+    %% Close all stream writers first
     maps:fold(
         fun(_Table, WriterRef, _) ->
             apply_nif(?cmd_stream_close, [WriterRef])
@@ -175,6 +176,11 @@ terminate(_Reason, #state{writers = Writers}) ->
         ok,
         Writers
     ),
+    %% Disconnect the client to explicitly release resources
+    case ClientRef of
+        undefined -> ok;
+        _ -> apply_nif(?cmd_disconnect, [ClientRef])
+    end,
     ok;
 terminate(_Reason, _Pid) ->
     ok.

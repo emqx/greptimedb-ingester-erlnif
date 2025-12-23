@@ -1,5 +1,6 @@
 %% The commands are also the names of the NIF functions.
 -define(cmd_connect, connect).
+-define(cmd_disconnect, disconnect).
 -define(cmd_execute, execute).
 -define(cmd_insert, insert).
 -define(cmd_stream_start, stream_start).
@@ -8,6 +9,7 @@
 
 -type command() ::
     ?cmd_connect
+    | ?cmd_disconnect
     | ?cmd_execute
     | ?cmd_insert
     | ?cmd_stream_start

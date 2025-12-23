@@ -110,6 +110,14 @@ fn connect(opts: Term) -> NifResult<Term> {
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
+fn disconnect(env: Env, _resource: ResourceArc<GreptimeResource>) -> NifResult<Term> {
+    // The resource will be automatically dropped when this function returns
+    // and all Arc references are released. The Tokio runtime will be shut down
+    // gracefully when the last Arc<Runtime> is dropped.
+    Ok(atoms::ok().encode(env))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
 fn execute(env: Env, resource: ResourceArc<GreptimeResource>, sql: String) -> NifResult<Term> {
     let db = &resource.db;
     let runtime = &resource.runtime;

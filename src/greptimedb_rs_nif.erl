@@ -18,6 +18,7 @@
 
 -export([
     connect/1,
+    disconnect/1,
     execute/2,
     insert/3,
     stream_start/3,
@@ -37,6 +38,9 @@ init() ->
 %% NIFs
 
 connect(_Opts) ->
+    not_loaded(?LINE).
+
+disconnect(_Client) ->
     not_loaded(?LINE).
 
 execute(_Client, _Sql) ->
