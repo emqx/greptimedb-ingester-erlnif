@@ -3,7 +3,7 @@ use greptime_proto::v1::Basic;
 use greptimedb_ingester::client::Client;
 use greptimedb_ingester::database::Database;
 use greptimedb_ingester::{
-    BulkInserter, BulkStreamWriter, BulkWriteOptions, ColumnDataType, CompressionType, TableSchema,
+    BulkInserter, BulkStreamWriter, BulkWriteOptions, ColumnDataType, TableSchema,
 };
 use rustler::{Encoder, Env, NifResult, ResourceArc, Term};
 use std::sync::Arc;
@@ -308,16 +308,23 @@ fn stream_start<'a>(
             bulk_inserter.set_auth(auth.clone());
         }
 
+        // Create writer without compression for better CPU efficiency
         let writer = bulk_inserter
             .create_bulk_stream_writer(
                 &table_template,
                 Some(
                     BulkWriteOptions::default()
-                        .with_compression(CompressionType::Zstd)
                         .with_timeout(Duration::from_secs(30)),
                 ),
             )
             .await
+            .map_err(|e| e.to_string())?;
+
+        // Pre-allocate buffer for optimal performance
+        // capacity: 10000 rows (good for 5K-10K batch sizes)
+        // row_buffer_size: 1024 (recommended for row-to-column transformation)
+        writer
+            .alloc_rows_buffer(5000, 1024)
             .map_err(|e| e.to_string())?;
 
         Ok(ResourceArc::new(StreamWriterResource {
