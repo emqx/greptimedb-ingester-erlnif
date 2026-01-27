@@ -91,10 +91,8 @@
 %% Connection and Disconnection
 %% ===================================================================
 
--doc """
-Start the connection pool (using ecpool).
-Returns a Client (logic level) that holds the connection pool.
-""".
+%% @doc Start the connection pool (using ecpool).
+%% Returns a Client (logic level) that holds the connection pool.
 -spec start_client(opts()) -> {ok, client()} | {error, {already_started, client()} | term()}.
 start_client(Opts) ->
     PoolName = maps:get(pool_name, Opts, greptimedb_rs_pool),
@@ -125,9 +123,7 @@ start_client(Opts) ->
             Error
     end.
 
--doc """
-Stop the connection pool and release resources.
-""".
+%% @doc Stop the connection pool and release resources.
 -spec stop_client(client() | pool_name()) -> ok.
 stop_client(?pool_name(PoolName)) ->
     ecpool:stop_sup_pool(PoolName);
@@ -138,17 +134,13 @@ stop_client(PoolName) ->
 %% Write - Batch Write
 %% ===================================================================
 
--doc """
-Batch write data (blocking).
-Picks a connection from the pool to do the write operation.
-""".
+%% @doc Batch write data (blocking).
+%% Picks a connection from the pool to do the write operation.
 -spec insert(client(), binary(), [map()]) -> {ok, integer()} | {error, reason()}.
 insert(Client, Table, Rows) ->
     call_sync(Client, ?cmd_insert, [Table, Rows]).
 
--doc """
-Batch write data (asynchronous).
-""".
+%% @doc Batch write data (asynchronous).
 -spec insert_async(client(), binary(), [map()], callback()) -> {ok, pid()}.
 insert_async(Client, Table, Rows, ResultCallback) ->
     call_async(Client, ?cmd_insert, [Table, Rows], ResultCallback).
@@ -157,16 +149,12 @@ insert_async(Client, Table, Rows, ResultCallback) ->
 %% Write - Execute Query
 %% ===================================================================
 
--doc """
-Execute SQL query (blocking).
-""".
+%% @doc Execute SQL query (blocking).
 -spec query(client(), sql()) -> {ok, result()} | {error, reason()}.
 query(Client, Sql) ->
     call_sync(Client, ?cmd_execute, [Sql]).
 
--doc """
-Execute SQL query (asynchronous).
-""".
+%% @doc Execute SQL query (asynchronous).
 -spec query_async(client(), sql(), callback()) -> {ok, pid()}.
 query_async(Client, Sql, ResultCallback) ->
     call_async(Client, ?cmd_execute, [Sql], ResultCallback).
@@ -175,11 +163,9 @@ query_async(Client, Sql, ResultCallback) ->
 %% Write - Streaming Write
 %% ===================================================================
 
--doc """
-Start a stream for a specific table.
-Returns a StreamClient handle that binds the Table context to the Client.
-It attempts to initialize the stream on all workers (best effort).
-""".
+%% @doc Start a stream for a specific table.
+%% Returns a StreamClient handle that binds the Table context to the Client.
+%% It attempts to initialize the stream on all workers (best effort).
 -spec stream_start(client(), binary(), map()) -> {ok, stream_client()}.
 stream_start(?pool_name(PoolName) = Client, Table, FirstRow) ->
     Workers = ecpool:workers(PoolName),
@@ -197,10 +183,8 @@ stream_start(?pool_name(PoolName) = Client, Table, FirstRow) ->
     ),
     {ok, {stream_client, Client, Table}}.
 
--doc """
-Stop the stream for a specific table.
-Releases stream resources on all workers in the pool.
-""".
+%% @doc Stop the stream for a specific table.
+%% Releases stream resources on all workers in the pool.
 -spec stream_close(stream_client()) -> ok.
 stream_close({stream_client, ?pool_name(PoolName), Table}) ->
     Workers = ecpool:workers(PoolName),
@@ -216,18 +200,14 @@ stream_close({stream_client, ?pool_name(PoolName), Table}) ->
         Workers
     ).
 
--doc """
-Write data to the stream (blocking).
-Uses ecpool to pick a connection from the pool.
-The worker lazily initializes the stream writer if needed.
-""".
+%% @doc Write data to the stream (blocking).
+%% Uses ecpool to pick a connection from the pool.
+%% The worker lazily initializes the stream writer if needed.
 -spec stream_write(stream_client(), [map()]) -> ok | {error, term()}.
 stream_write({stream_client, Client, Table}, Rows) ->
     call_sync(Client, ?cmd_stream_write, [Table, Rows]).
 
--doc """
-Write data to the stream (asynchronous).
-""".
+%% @doc Write data to the stream (asynchronous).
 -spec stream_write_async(stream_client(), [map()], callback()) -> {ok, pid()}.
 stream_write_async({stream_client, Client, Table}, Rows, Callback) ->
     call_async(Client, ?cmd_stream_write, [Table, Rows], Callback).
