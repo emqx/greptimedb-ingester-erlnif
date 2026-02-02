@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 
+set -euo pipefail
+
 BUILD_SCRIPT="crates/greptimedb-ingester-nif/build.rs"
 NIF_PATH="priv/libgreptimedb_nif.so"
 
