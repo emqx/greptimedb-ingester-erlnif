@@ -43,6 +43,10 @@ jobs:
         with:
           ref: ${{ github.event.inputs.build_from }}
 
+      - name: install dependencies
+        run: |
+          brew install protobuf
+
       - name: build
         run: env BUILD_RELEASE=1 make
 
