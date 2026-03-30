@@ -47,6 +47,13 @@ Opts = #{
 {ok, Client} = greptimedb_rs:start_client(Opts).
 ```
 
+**Additional Insert Options:**
+
+`start_client/1` also accepts:
+
+- `ts_column` (optional): Timestamp column name used when auto-creating tables. Default is `<<"ts">>`.
+- `ttl` (optional): TTL hint for auto-created tables. Example: `<<"3 days">>`.
+
 **Connection with Authentication:**
 
 ```erlang

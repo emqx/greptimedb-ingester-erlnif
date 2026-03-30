@@ -6,6 +6,8 @@ rustler::atoms! {
     dbname,
     username,
     password,
+    ts_column,
+    ttl,
     tls,
     ca_cert,
     client_cert,

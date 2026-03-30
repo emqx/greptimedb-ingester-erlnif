@@ -18,6 +18,8 @@ pub struct GreptimeResource {
     pub db: Database,
     pub client: Client,
     pub auth: Option<AuthScheme>,
+    pub ts_column: Option<String>,
+    pub ttl: Option<String>,
     pub runtime: Arc<Runtime>, // Per-connection runtime
 }
 
@@ -89,6 +91,14 @@ fn connect(opts: Term) -> NifResult<Term> {
 
     let mut db = Database::new_with_dbname(dbname, client.clone());
     let mut auth = None;
+    let ts_column = opts
+        .map_get(atoms::ts_column().to_term(env))
+        .ok()
+        .and_then(|term| term.decode().ok());
+    let ttl = opts
+        .map_get(atoms::ttl().to_term(env))
+        .ok()
+        .and_then(|term| term.decode().ok());
 
     if let Ok(username_term) = opts.map_get(atoms::username().to_term(env)) {
         if let Ok(password_term) = opts.map_get(atoms::password().to_term(env)) {
@@ -104,6 +114,8 @@ fn connect(opts: Term) -> NifResult<Term> {
         db,
         client,
         auth,
+        ts_column,
+        ttl,
         runtime,
     });
     Ok((atoms::ok(), resource).encode(env))
@@ -269,7 +281,10 @@ fn insert<'a>(
         }
         Err(_) => {
             // Table might not exist, infer schema locally
-            util::terms_to_schema_and_rows(rows_term)?
+            util::terms_to_schema_and_rows(
+                rows_term,
+                resource.ts_column.as_deref().unwrap_or("ts"),
+            )?
         }
     };
 
@@ -283,11 +298,19 @@ fn insert<'a>(
 
     // 3. Insert using Database
     let result: Result<u32, String> = runtime.block_on(async {
-        resource
-            .db
-            .insert(insert_request)
-            .await
-            .map_err(|e| e.to_string())
+        if let Some(ttl) = &resource.ttl {
+            resource
+                .db
+                .insert_with_hints(insert_request, &[("ttl", ttl.as_str())])
+                .await
+                .map_err(|e| e.to_string())
+        } else {
+            resource
+                .db
+                .insert(insert_request)
+                .await
+                .map_err(|e| e.to_string())
+        }
     });
 
     match result {

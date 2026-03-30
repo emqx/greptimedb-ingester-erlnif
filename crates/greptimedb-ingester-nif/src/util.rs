@@ -123,6 +123,7 @@ pub fn terms_to_proto_rows_using_schema<'a>(
 
 pub fn terms_to_schema_and_rows<'a>(
     rows_term: Vec<Term<'a>>,
+    ts_column: &str,
 ) -> rustler::NifResult<(Vec<ColumnSchema>, Vec<ProtoRow>)> {
     if rows_term.is_empty() {
         return Ok((vec![], vec![]));
@@ -182,7 +183,8 @@ pub fn terms_to_schema_and_rows<'a>(
         .or_else(|| first_row.map_get(atom_ts).ok());
 
     if ts_term.is_some() {
-        schema.push(timestamp("ts", ColumnDataType::TimestampMillisecond));
+        let ts_name = if ts_column.is_empty() { "ts" } else { ts_column };
+        schema.push(timestamp(ts_name, ColumnDataType::TimestampMillisecond));
     }
 
     // --- Build Rows ---
