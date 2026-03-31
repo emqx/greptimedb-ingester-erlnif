@@ -60,6 +60,8 @@
     dbname := binary(),
     username => binary(),
     password => binary(),
+    ts_column => binary(),
+    ttl => binary(),
     tls => boolean(),
     ca_cert => binary(),
     client_cert => binary(),

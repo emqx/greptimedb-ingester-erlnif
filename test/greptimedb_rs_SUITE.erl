@@ -21,6 +21,8 @@ groups() ->
         t_connect,
         t_metadata_queries,
         t_insert_sync,
+        t_insert_sync_custom_ts_column,
+        t_insert_sync_ttl_hint,
         t_insert_sync_existing_table,
         t_insert_sync_schema_conflict,
         t_query_sync,
@@ -213,6 +215,74 @@ t_insert_sync(Config) ->
     Sql = iolist_to_binary(io_lib:format("SELECT count(*) FROM ~s", [Table])),
     {ok, [[Count]]} = greptimedb_rs:query(Client, Sql),
     ?assertEqual(1, Count),
+
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_sync_custom_ts_column(Config) ->
+    ConnOpts = ?conn_opts(Config),
+    ConnOpts1 = ConnOpts#{ts_column => <<"event_time">>},
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts1),
+    Table = ?table(Config),
+
+    %% Drop table if exists
+    DropTableSql = iolist_to_binary(io_lib:format("DROP TABLE IF EXISTS ~s", [Table])),
+    greptimedb_rs:query(Client, DropTableSql),
+
+    Ts = erlang:system_time(millisecond),
+    Rows = [
+        #{
+            fields => #{
+                <<"temperature">> => 25.5
+            },
+            tags => #{
+                <<"sensor_id">> => 12345
+            },
+            timestamp => Ts
+        }
+    ],
+    ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
+    timer:sleep(1000),
+
+    %% If ts_column works for auto-created tables, this query should succeed.
+    SelectSql = iolist_to_binary(io_lib:format("SELECT event_time FROM ~s LIMIT 1", [Table])),
+    ?assertMatch({ok, [[_]]}, greptimedb_rs:query(Client, SelectSql)),
+
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_sync_ttl_hint(Config) ->
+    ConnOpts = ?conn_opts(Config),
+    ConnOpts1 = ConnOpts#{ttl => <<"3 days">>},
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts1),
+    Table = ?table(Config),
+
+    %% Drop table if exists
+    DropTableSql = iolist_to_binary(io_lib:format("DROP TABLE IF EXISTS ~s", [Table])),
+    greptimedb_rs:query(Client, DropTableSql),
+
+    Ts = erlang:system_time(millisecond),
+    Rows = [
+        #{
+            fields => #{
+                <<"temperature">> => 25.5
+            },
+            tags => #{
+                <<"sensor_id">> => 12345
+            },
+            timestamp => Ts
+        }
+    ],
+    ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
+    timer:sleep(1000),
+
+    CreateOptionsSql = iolist_to_binary(
+        io_lib:format(
+            "SELECT create_options FROM information_schema.tables WHERE table_name='~s'",
+            [Table]
+        )
+    ),
+    {ok, [[CreateOptions]]} = greptimedb_rs:query(Client, CreateOptionsSql),
+    ?assert(is_binary(CreateOptions)),
+    ?assertNotEqual(nomatch, binary:match(string:lowercase(CreateOptions), <<"ttl=">>)),
 
     ok = greptimedb_rs:stop_client(Client).
 
