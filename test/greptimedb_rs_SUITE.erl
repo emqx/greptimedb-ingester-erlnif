@@ -20,6 +20,7 @@ groups() ->
     TCs = [
         t_connect,
         t_connect_tls_without_client_certfiles,
+        t_connect_tls_without_any_certfiles,
         t_metadata_queries,
         t_insert_sync,
         t_insert_sync_custom_ts_column,
@@ -136,6 +137,38 @@ t_connect_tls_without_client_certfiles(_Config) ->
     {ok, Client} = greptimedb_rs:start_client(ConnOpts),
     ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
     ok = greptimedb_rs:stop_client(Client).
+
+t_connect_tls_without_any_certfiles(_Config) ->
+    Host = get_host_addr("GREPTIMEDB_TLS_ADDR"),
+    ConnOpts = #{
+        endpoints => [<<Host/binary, ":4001">>],
+        dbname => <<"public">>,
+        tls => true,
+        username => <<"greptime_user">>,
+        password => <<"greptime_pwd">>
+    },
+    case greptimedb_rs:start_client(ConnOpts) of
+        {ok, Client} ->
+            case greptimedb_rs:query(Client, <<"SELECT 1">>) of
+                {ok, [_ | _]} ->
+                    ok;
+                {error, QueryReason} ->
+                    QueryReasonBin = reason_to_binary(QueryReason),
+                    ?assertEqual(
+                        nomatch,
+                        binary:match(QueryReasonBin, <<"Invalid config file path">>)
+                    ),
+                    ?assertEqual(
+                        nomatch,
+                        binary:match(QueryReasonBin, <<"No such file or directory">>)
+                    )
+            end,
+            ok = greptimedb_rs:stop_client(Client);
+        {error, Reason} ->
+            ReasonBin = reason_to_binary(Reason),
+            ?assertEqual(nomatch, binary:match(ReasonBin, <<"Invalid config file path">>)),
+            ?assertEqual(nomatch, binary:match(ReasonBin, <<"No such file or directory">>))
+    end.
 
 t_metadata_queries(Config) ->
     {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
@@ -836,3 +869,10 @@ get_host_addr(Env) ->
         false -> <<"127.0.0.1">>;
         Host -> iolist_to_binary(Host)
     end.
+
+reason_to_binary(Reason) when is_binary(Reason) ->
+    Reason;
+reason_to_binary(Reason) when is_list(Reason) ->
+    iolist_to_binary(Reason);
+reason_to_binary(Reason) ->
+    iolist_to_binary(io_lib:format("~0p", [Reason])).
