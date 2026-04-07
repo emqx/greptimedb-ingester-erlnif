@@ -1,0 +1,46 @@
+// Copyright 2023 Greptime Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#![doc = include_str!("../README.md")]
+
+pub mod api;
+pub mod bulk;
+pub mod channel_manager;
+pub mod client;
+pub mod database;
+mod error;
+pub mod flight;
+pub mod helpers;
+pub mod load_balance;
+pub mod table;
+
+pub use self::channel_manager::{ChannelConfig, ChannelManager, ClientTlsOption};
+pub use self::error::{Error, Result};
+
+// Re-export bulk module components for easier access
+pub use self::bulk::{
+    BulkInserter, BulkStreamWriter, BulkWriteOptions, ColumnType, CompressionType, RowBuilder, Rows,
+};
+
+// Re-export arrow types for easier access
+pub use arrow_array;
+pub use arrow_schema;
+
+// Re-export table module components for easier access
+pub use self::table::{Column, DataTypeExtension, Row, TableSchema, TableSchemaBuilder, Value};
+
+// Re-export API types for direct access
+pub use self::api::v1::{ColumnDataType, SemanticType};
+
+pub const DEFAULT_SCHEMA_NAME: &str = "public";

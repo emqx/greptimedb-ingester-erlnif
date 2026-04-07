@@ -81,6 +81,10 @@ Opts = #{
 {ok, Client} = greptimedb_rs:start_client(Opts).
 ```
 
+Notes:
+- `ca_cert`, `client_cert`, `client_key` are optional.
+- `client_cert` and `client_key` must be provided together when enabling mTLS.
+
 ### 3. Prepare Data
 
 Rows are represented as maps with specific atom keys:
