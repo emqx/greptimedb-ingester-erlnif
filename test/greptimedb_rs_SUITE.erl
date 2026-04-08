@@ -17,10 +17,8 @@ all() ->
     ].
 
 groups() ->
-    TCs = [
+    CommonTCs = [
         t_connect,
-        t_connect_tls_without_client_certfiles,
-        t_connect_tls_without_any_certfiles,
         t_metadata_queries,
         t_insert_sync,
         t_insert_sync_custom_ts_column,
@@ -35,9 +33,13 @@ groups() ->
         t_stream_write,
         t_stream_write_async
     ],
+    TlsOnlyTCs = [
+        t_connect_tls_without_client_certfiles,
+        t_connect_tls_without_any_certfiles
+    ],
     [
-        {tcp, [], TCs},
-        {tls, [], TCs}
+        {tcp, [], CommonTCs},
+        {tls, [], CommonTCs ++ TlsOnlyTCs}
     ].
 
 init_per_suite(Config) ->
