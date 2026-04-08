@@ -82,7 +82,8 @@ Opts = #{
 ```
 
 Notes:
-- `ca_cert`, `client_cert`, `client_key` are optional.
+- `ca_cert`, `client_cert`, and `client_key` are optional configuration fields.
+- `ca_cert` may still be required to verify the server certificate when the server uses a self-signed certificate or a private CA. If the server certificate chains to a CA already trusted by the system, `ca_cert` can usually be omitted.
 - `client_cert` and `client_key` must be provided together when enabling mTLS.
 
 ### 3. Prepare Data
