@@ -17,7 +17,7 @@ all() ->
     ].
 
 groups() ->
-    TCs = [
+    CommonTCs = [
         t_connect,
         t_metadata_queries,
         t_insert_sync,
@@ -33,9 +33,13 @@ groups() ->
         t_stream_write,
         t_stream_write_async
     ],
+    TlsOnlyTCs = [
+        t_connect_tls_without_client_certfiles,
+        t_connect_tls_without_any_certfiles
+    ],
     [
-        {tcp, [], TCs},
-        {tls, [], TCs}
+        {tcp, [], CommonTCs},
+        {tls, [], CommonTCs ++ TlsOnlyTCs}
     ].
 
 init_per_suite(Config) ->
@@ -117,6 +121,56 @@ t_connect(Config) ->
     ?assertMatch(#{pool_name := greptimedb_rs_pool}, Client),
     ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
     ok = greptimedb_rs:stop_client(Client).
+
+t_connect_tls_without_client_certfiles(_Config) ->
+    Host = get_host_addr("GREPTIMEDB_TLS_ADDR"),
+    Dir = code:lib_dir(greptimedb_rs),
+    DataDir = filename:join(Dir, "test/data/certs"),
+    CaCert = filename:join(DataDir, "ca.crt"),
+    ?assert(filelib:is_file(CaCert)),
+    ConnOpts = #{
+        endpoints => [<<Host/binary, ":4001">>],
+        dbname => <<"public">>,
+        tls => true,
+        ca_cert => list_to_binary(CaCert),
+        username => <<"greptime_user">>,
+        password => <<"greptime_pwd">>
+    },
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts),
+    ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+t_connect_tls_without_any_certfiles(_Config) ->
+    Host = get_host_addr("GREPTIMEDB_TLS_ADDR"),
+    ConnOpts = #{
+        endpoints => [<<Host/binary, ":4001">>],
+        dbname => <<"public">>,
+        tls => true,
+        username => <<"greptime_user">>,
+        password => <<"greptime_pwd">>
+    },
+    case greptimedb_rs:start_client(ConnOpts) of
+        {ok, Client} ->
+            case greptimedb_rs:query(Client, <<"SELECT 1">>) of
+                {ok, [_ | _]} ->
+                    ok;
+                {error, QueryReason} ->
+                    QueryReasonBin = reason_to_binary(QueryReason),
+                    ?assertEqual(
+                        nomatch,
+                        binary:match(QueryReasonBin, <<"Invalid config file path">>)
+                    ),
+                    ?assertEqual(
+                        nomatch,
+                        binary:match(QueryReasonBin, <<"No such file or directory">>)
+                    )
+            end,
+            ok = greptimedb_rs:stop_client(Client);
+        {error, Reason} ->
+            ReasonBin = reason_to_binary(Reason),
+            ?assertEqual(nomatch, binary:match(ReasonBin, <<"Invalid config file path">>)),
+            ?assertEqual(nomatch, binary:match(ReasonBin, <<"No such file or directory">>))
+    end.
 
 t_metadata_queries(Config) ->
     {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
@@ -817,3 +871,10 @@ get_host_addr(Env) ->
         false -> <<"127.0.0.1">>;
         Host -> iolist_to_binary(Host)
     end.
+
+reason_to_binary(Reason) when is_binary(Reason) ->
+    Reason;
+reason_to_binary(Reason) when is_list(Reason) ->
+    iolist_to_binary(Reason);
+reason_to_binary(Reason) ->
+    iolist_to_binary(io_lib:format("~0p", [Reason])).

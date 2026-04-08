@@ -13,7 +13,7 @@ crate-type = ["cdylib"]
 arrow = { version = "54.2", features = ["prettyprint"] }
 futures = "0.3"
 greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "454c52634c3bac27de10bf0d85d5533eed1cf03f" }
-greptimedb-ingester = { git = "https://github.com/JimMoen/greptimedb-ingester-rust ", rev = "a2856ddf8edd9f4a7d13f4721499c3f3c4ddca49" }
+greptimedb-ingester = { git = "https://github.com/JimMoen/greptimedb-ingester-rust", rev = "6f1b4e8e9996a7ed74ebf8b7b341d180956043c3" }
 log = "0.4"
 rustler = "0.37.0"
 tokio = { version = "1.40", features = ["full"] }
