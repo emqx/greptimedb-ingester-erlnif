@@ -35,7 +35,8 @@ groups() ->
     ],
     TlsOnlyTCs = [
         t_connect_tls_without_client_certfiles,
-        t_connect_tls_without_any_certfiles
+        t_connect_tls_without_any_certfiles,
+        t_connect_tls_verify_none_without_any_certfiles
     ],
     [
         {tcp, [], CommonTCs},
@@ -171,6 +172,20 @@ t_connect_tls_without_any_certfiles(_Config) ->
             ?assertEqual(nomatch, binary:match(ReasonBin, <<"Invalid config file path">>)),
             ?assertEqual(nomatch, binary:match(ReasonBin, <<"No such file or directory">>))
     end.
+
+t_connect_tls_verify_none_without_any_certfiles(_Config) ->
+    Host = get_host_addr("GREPTIMEDB_TLS_ADDR"),
+    ConnOpts = #{
+        endpoints => [<<Host/binary, ":4001">>],
+        dbname => <<"public">>,
+        tls => true,
+        verify => verify_none,
+        username => <<"greptime_user">>,
+        password => <<"greptime_pwd">>
+    },
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts),
+    ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
+    ok = greptimedb_rs:stop_client(Client).
 
 t_metadata_queries(Config) ->
     {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),

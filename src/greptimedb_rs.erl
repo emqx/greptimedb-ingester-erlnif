@@ -63,6 +63,7 @@
     ts_column => binary(),
     ttl => binary(),
     tls => boolean(),
+    verify => verify_peer | verify_none | binary(),
     ca_cert => binary(),
     client_cert => binary(),
     client_key => binary(),

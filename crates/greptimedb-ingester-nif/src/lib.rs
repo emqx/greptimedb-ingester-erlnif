@@ -5,7 +5,7 @@ use greptimedb_ingester::database::Database;
 use greptimedb_ingester::{
     BulkInserter, BulkStreamWriter, BulkWriteOptions, ColumnDataType, TableSchema,
 };
-use rustler::{Encoder, Env, NifResult, ResourceArc, Term};
+use rustler::{Atom, Encoder, Env, NifResult, ResourceArc, Term};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Runtime;
@@ -41,7 +41,32 @@ fn load(env: Env, _info: Term) -> bool {
     true
 }
 
-use greptimedb_ingester::channel_manager::ClientTlsOption;
+use greptimedb_ingester::channel_manager::{ClientTlsOption, TlsVerify};
+
+fn decode_tls_verify(verify_term: Term) -> NifResult<TlsVerify> {
+    if let Ok(verify_atom) = verify_term.decode::<Atom>() {
+        if verify_atom == atoms::verify_none() {
+            return Ok(TlsVerify::VerifyNone);
+        }
+        if verify_atom == atoms::verify_peer() {
+            return Ok(TlsVerify::VerifyPeer);
+        }
+    }
+
+    if let Ok(verify_str) = verify_term.decode::<String>() {
+        return match verify_str.as_str() {
+            "verify_none" => Ok(TlsVerify::VerifyNone),
+            "verify_peer" => Ok(TlsVerify::VerifyPeer),
+            _ => Err(rustler::Error::Term(Box::new(format!(
+                "invalid verify option `{verify_str}`"
+            )))),
+        };
+    }
+
+    Err(rustler::Error::Term(Box::new(
+        "invalid verify option".to_string(),
+    )))
+}
 
 #[rustler::nif(schedule = "DirtyIo")]
 fn connect(opts: Term) -> NifResult<Term> {
@@ -59,6 +84,10 @@ fn connect(opts: Term) -> NifResult<Term> {
 
     let client = if let Ok(tls_term) = opts.map_get(atoms::tls().to_term(env)) {
         if tls_term.decode::<bool>()? {
+            let tls_verify = match opts.map_get(atoms::verify().to_term(env)) {
+                Ok(verify_term) => decode_tls_verify(verify_term)?,
+                Err(_) => TlsVerify::VerifyPeer,
+            };
             let server_ca_cert_path = opts
                 .map_get(atoms::ca_cert().to_term(env))
                 .and_then(|t| t.decode())
@@ -78,7 +107,7 @@ fn connect(opts: Term) -> NifResult<Term> {
                 client_key_path,
             };
 
-            match Client::with_tls_and_urls(endpoints, tls_option) {
+            match Client::with_tls_and_urls_with_verify(endpoints, tls_option, tls_verify) {
                 Ok(c) => c,
                 Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
             }
