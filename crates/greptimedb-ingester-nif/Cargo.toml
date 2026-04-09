@@ -13,9 +13,8 @@ crate-type = ["cdylib"]
 arrow = { version = "54.2", features = ["prettyprint"] }
 futures = "0.3"
 greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "454c52634c3bac27de10bf0d85d5533eed1cf03f" }
-# Temporarily pinned to a fork revision that contains required TLS verify_none fixes.
-# Replace with upstream repository/release after the upstream PR is merged and released.
-greptimedb-ingester = { git = "https://github.com/HJianBo/greptimedb-ingester-rust", rev = "fdecb973de18bba9b9414822c80af2e583143193" }
+# Pinned to upstream commit that includes TLS verify mode support/fixes.
+greptimedb-ingester = { git = "https://github.com/JimMoen/greptimedb-ingester-rust", rev = "9cd799a0a4b941327cc03a7c77dce12880201822" }
 log = "0.4"
 rustler = "0.37.0"
 tokio = { version = "1.40", features = ["full"] }
