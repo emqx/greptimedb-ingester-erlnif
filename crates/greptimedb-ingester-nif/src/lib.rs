@@ -43,12 +43,17 @@ fn load(env: Env, _info: Term) -> bool {
 
 use greptimedb_ingester::channel_manager::{ClientTlsOption, TlsVerify};
 
-fn decode_tls_verify(verify_term: Term) -> NifResult<TlsVerify> {
+fn decode_tls_verify(verify_term: Term) -> Result<TlsVerify, String> {
     if let Ok(verify_atom) = verify_term.decode::<Atom>() {
         if verify_atom == atoms::verify_none() {
             return Ok(TlsVerify::VerifyNone);
         }
         if verify_atom == atoms::verify_peer() {
+            return Ok(TlsVerify::VerifyPeer);
+        }
+        if verify_atom == rustler::types::atom::undefined()
+            || verify_atom == rustler::types::atom::nil()
+        {
             return Ok(TlsVerify::VerifyPeer);
         }
     }
@@ -57,15 +62,12 @@ fn decode_tls_verify(verify_term: Term) -> NifResult<TlsVerify> {
         return match verify_str.as_str() {
             "verify_none" => Ok(TlsVerify::VerifyNone),
             "verify_peer" => Ok(TlsVerify::VerifyPeer),
-            _ => Err(rustler::Error::Term(Box::new(format!(
-                "invalid verify option `{verify_str}`"
-            )))),
+            "undefined" | "nil" => Ok(TlsVerify::VerifyPeer),
+            _ => Err(format!("invalid verify option `{verify_str}`")),
         };
     }
 
-    Err(rustler::Error::Term(Box::new(
-        "invalid verify option".to_string(),
-    )))
+    Err("invalid verify option".to_string())
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -85,7 +87,10 @@ fn connect(opts: Term) -> NifResult<Term> {
     let client = if let Ok(tls_term) = opts.map_get(atoms::tls().to_term(env)) {
         if tls_term.decode::<bool>()? {
             let tls_verify = match opts.map_get(atoms::verify().to_term(env)) {
-                Ok(verify_term) => decode_tls_verify(verify_term)?,
+                Ok(verify_term) => match decode_tls_verify(verify_term) {
+                    Ok(verify) => verify,
+                    Err(err) => return Ok((atoms::error(), err).encode(env)),
+                },
                 Err(_) => TlsVerify::VerifyPeer,
             };
             let server_ca_cert_path = opts
