@@ -35,7 +35,10 @@ groups() ->
     ],
     TlsOnlyTCs = [
         t_connect_tls_without_client_certfiles,
-        t_connect_tls_without_any_certfiles
+        t_connect_tls_without_any_certfiles,
+        t_connect_tls_verify_none_without_any_certfiles,
+        t_connect_tls_verify_undefined_fallback_to_peer,
+        t_connect_tls_invalid_verify_returns_error
     ],
     [
         {tcp, [], CommonTCs},
@@ -170,6 +173,57 @@ t_connect_tls_without_any_certfiles(_Config) ->
             ReasonBin = reason_to_binary(Reason),
             ?assertEqual(nomatch, binary:match(ReasonBin, <<"Invalid config file path">>)),
             ?assertEqual(nomatch, binary:match(ReasonBin, <<"No such file or directory">>))
+    end.
+
+t_connect_tls_verify_none_without_any_certfiles(_Config) ->
+    Host = get_host_addr("GREPTIMEDB_TLS_ADDR"),
+    ConnOpts = #{
+        endpoints => [<<Host/binary, ":4001">>],
+        dbname => <<"public">>,
+        tls => true,
+        verify => verify_none,
+        username => <<"greptime_user">>,
+        password => <<"greptime_pwd">>
+    },
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts),
+    ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+t_connect_tls_verify_undefined_fallback_to_peer(_Config) ->
+    Host = get_host_addr("GREPTIMEDB_TLS_ADDR"),
+    Dir = code:lib_dir(greptimedb_rs),
+    DataDir = filename:join(Dir, "test/data/certs"),
+    CaCert = filename:join(DataDir, "ca.crt"),
+    ?assert(filelib:is_file(CaCert)),
+    ConnOpts = #{
+        endpoints => [<<Host/binary, ":4001">>],
+        dbname => <<"public">>,
+        tls => true,
+        verify => undefined,
+        ca_cert => list_to_binary(CaCert),
+        username => <<"greptime_user">>,
+        password => <<"greptime_pwd">>
+    },
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts),
+    ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+t_connect_tls_invalid_verify_returns_error(_Config) ->
+    Host = get_host_addr("GREPTIMEDB_TLS_ADDR"),
+    ConnOpts = #{
+        endpoints => [<<Host/binary, ":4001">>],
+        dbname => <<"public">>,
+        tls => true,
+        verify => bad_verify
+    },
+    case greptimedb_rs:start_client(ConnOpts) of
+        {error, Reason} ->
+            ReasonBin = reason_to_binary(Reason),
+            ?assertNotEqual(nomatch, binary:match(ReasonBin, <<"invalid verify option">>)),
+            ?assertEqual(nomatch, binary:match(ReasonBin, <<"nif_error">>));
+        {ok, Client} ->
+            ok = greptimedb_rs:stop_client(Client),
+            ct:fail(expected_invalid_verify_error)
     end.
 
 t_metadata_queries(Config) ->
