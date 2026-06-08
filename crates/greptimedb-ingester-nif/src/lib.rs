@@ -1,3 +1,7 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
 use greptime_proto::v1::auth_header::AuthScheme;
 use greptime_proto::v1::Basic;
 use greptimedb_ingester::client::Client;
@@ -6,9 +10,9 @@ use greptimedb_ingester::{
     BulkInserter, BulkStreamWriter, BulkWriteOptions, ColumnDataType, TableSchema,
 };
 use rustler::{Atom, Encoder, Env, NifResult, ResourceArc, Term};
-use std::sync::Arc;
-use std::time::Duration;
 use tokio::runtime::Runtime;
+
+static FIPS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub mod atoms;
 mod types;
@@ -36,9 +40,24 @@ pub struct StreamWriterResource {
 
 #[allow(non_local_definitions)]
 fn load(env: Env, _info: Term) -> bool {
+    FIPS_ENABLED.store(
+        check_fips_enabled(),
+        Ordering::Relaxed,
+    );
     _ = rustler::resource!(GreptimeResource, env);
     _ = rustler::resource!(StreamWriterResource, env);
     true
+}
+
+fn check_fips_enabled() -> bool {
+    std::fs::read_to_string("/proc/sys/crypto/fips_enabled")
+        .map(|s| s.trim() == "1")
+        .unwrap_or(false)
+}
+
+#[rustler::nif]
+fn fips_status() -> bool {
+    FIPS_ENABLED.load(Ordering::Relaxed)
 }
 
 use greptimedb_ingester::channel_manager::{ClientTlsOption, TlsVerify};
@@ -110,6 +129,10 @@ fn connect(opts: Term) -> NifResult<Term> {
                 server_ca_cert_path,
                 client_cert_path,
                 client_key_path,
+                cipher_suites: opts
+                    .map_get(atoms::cipher_suites().to_term(env))
+                    .and_then(|t| t.decode())
+                    .unwrap_or_default(),
             };
 
             match Client::with_tls_and_urls_with_verify(endpoints, tls_option, tls_verify) {

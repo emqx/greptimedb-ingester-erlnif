@@ -15,6 +15,10 @@ rustler::atoms! {
     ca_cert,
     client_cert,
     client_key,
+    cipher_suites,
+
+    // FIPS status
+    fips_enabled,
 
     // Rows
     fields,

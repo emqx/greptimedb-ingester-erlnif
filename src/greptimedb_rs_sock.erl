@@ -76,6 +76,7 @@ init([Opts0]) ->
     Opts = unwrap_password(Opts0),
     case apply_nif(?cmd_connect, [Opts]) of
         {ok, ClientRef} ->
+            log_connect_info(Opts0),
             {ok, #state{client = ClientRef, opts = Opts0, writers = #{}}};
         {error, Reason} ->
             {stop, Reason}
@@ -213,3 +214,19 @@ do_unwrap_password(Password) when is_function(Password, 0) ->
     do_unwrap_password(Password());
 do_unwrap_password(Password) ->
     Password.
+
+log_connect_info(#{endpoints := Endpoints} = Opts) ->
+    TlsEnabled = maps:get(tls, Opts, false),
+    CipherInfo = case maps:find(cipher_suites, Opts) of
+        {ok, Ciphers} when Ciphers =/= [] ->
+            [" ciphers=", string:join([binary_to_list(C) || C <- Ciphers], ":")];
+        _ ->
+            ""
+    end,
+    EndpointStr = string:join([binary_to_list(E) || E <- Endpoints], ","),
+    logger:info(
+        "greptimedb_rs_sock connecting to [~s] tls=~s~s",
+        [EndpointStr, atom_to_list(TlsEnabled), CipherInfo]
+    );
+log_connect_info(_Opts) ->
+    ok.

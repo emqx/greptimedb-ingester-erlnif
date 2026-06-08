@@ -23,7 +23,8 @@
     insert/3,
     stream_start/3,
     stream_write/2,
-    stream_close/1
+    stream_close/1,
+    fips_status/0
 ]).
 
 -export([init/0]).
@@ -32,7 +33,13 @@
 init() ->
     NifName = "libgreptimedb_nif",
     Niflib = filename:join(priv_dir(), NifName),
-    erlang:load_nif(Niflib, none).
+    erlang:load_nif(Niflib, none),
+    case fips_status() of
+        true ->
+            logger:info("greptimedb_rs_nif FIPS mode enabled");
+        false ->
+            logger:info("greptimedb_rs_nif FIPS mode disabled")
+    end.
 
 %% =================================================================================================
 %% NIFs
@@ -56,6 +63,9 @@ stream_write(_Writer, _Rows) ->
     not_loaded(?LINE).
 
 stream_close(_Writer) ->
+    not_loaded(?LINE).
+
+fips_status() ->
     not_loaded(?LINE).
 
 %% =================================================================================================
