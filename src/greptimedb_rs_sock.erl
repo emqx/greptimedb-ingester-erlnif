@@ -223,10 +223,19 @@ log_connect_info(#{endpoints := Endpoints} = Opts) ->
         _ ->
             ""
     end,
+    FipsInfo = case TlsEnabled of
+        true ->
+            case greptimedb_rs_nif:fips_status() of
+                true -> " fips=enabled";
+                false -> " fips=disabled"
+            end;
+        _ ->
+            ""
+    end,
     EndpointStr = string:join([binary_to_list(E) || E <- Endpoints], ","),
-    logger:info(
-        "greptimedb_rs_sock connecting to [~s] tls=~s~s",
-        [EndpointStr, atom_to_list(TlsEnabled), CipherInfo]
+    logger:notice(
+        "greptimedb_rs_sock connecting to [~s] tls=~s~s~s",
+        [EndpointStr, atom_to_list(TlsEnabled), CipherInfo, FipsInfo]
     );
 log_connect_info(_Opts) ->
     ok.
