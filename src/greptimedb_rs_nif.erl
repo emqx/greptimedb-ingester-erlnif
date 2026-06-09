@@ -24,7 +24,8 @@
     stream_start/3,
     stream_write/2,
     stream_close/1,
-    fips_status/0
+    fips_status/0,
+    cached_fips_status/0
 ]).
 
 -export([init/0]).
@@ -67,6 +68,20 @@ fips_status() ->
 
 %% =================================================================================================
 %% Helpers
+
+-define(FIPS_CACHE_KEY, {?MODULE, fips_status}).
+-define(FIPS_CACHE_TTL_MS, 3600000). %% 1 hour
+
+cached_fips_status() ->
+    Now = erlang:system_time(millisecond),
+    case persistent_term:get(?FIPS_CACHE_KEY, undefined) of
+        {Value, Timestamp} when Now - Timestamp < ?FIPS_CACHE_TTL_MS ->
+            Value;
+        _ ->
+            Value = fips_status(),
+            persistent_term:put(?FIPS_CACHE_KEY, {Value, Now}),
+            Value
+    end.
 
 not_loaded(Line) ->
     erlang:nif_error({error, {not_loaded, [{module, ?MODULE}, {line, Line}]}}).

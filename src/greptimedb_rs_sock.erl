@@ -225,7 +225,7 @@ log_connect_info(#{endpoints := Endpoints} = Opts) ->
     end,
     FipsInfo = case TlsEnabled of
         true ->
-            case greptimedb_rs_nif:fips_status() of
+            case greptimedb_rs_nif:cached_fips_status() of
                 true -> " fips=enabled";
                 false -> " fips=disabled"
             end;
