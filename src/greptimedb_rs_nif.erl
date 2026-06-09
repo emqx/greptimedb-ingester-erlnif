@@ -33,12 +33,15 @@
 init() ->
     NifName = "libgreptimedb_nif",
     Niflib = filename:join(priv_dir(), NifName),
-    erlang:load_nif(Niflib, none),
-    case fips_status() of
-        true ->
-            logger:info("greptimedb_rs_nif FIPS mode enabled");
-        false ->
-            logger:info("greptimedb_rs_nif FIPS mode disabled")
+    case erlang:load_nif(Niflib, none) of
+        ok ->
+            Msg = case fips_status() of
+                true -> "greptimedb_rs_nif FIPS mode enabled";
+                false -> "greptimedb_rs_nif FIPS mode disabled"
+            end,
+            io:format(user, "~s~n", [Msg]);
+        {error, {already_loaded, _}} ->
+            ok
     end.
 
 %% =================================================================================================
