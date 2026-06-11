@@ -13,8 +13,7 @@ crate-type = ["cdylib"]
 arrow = { version = "54.2", features = ["prettyprint"] }
 futures = "0.3"
 greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "454c52634c3bac27de10bf0d85d5533eed1cf03f" }
-# Pinned to upstream commit that includes TLS cipher suite filtering support.
-greptimedb-ingester = { git = "https://github.com/JimMoen/greptimedb-ingester-rust", rev = "5d1f7d2521ae56705bae8a905dc41a77198fa7bc" }
+greptimedb-ingester = { git = "https://github.com/emqx/greptimedb-ingester-rust", rev = "43697c6aa29df5709c9cdc4337e08e043f4708d5" }
 log = "0.4"
 rustler = "0.37.0"
 tokio = { version = "1.40", features = ["full"] }
