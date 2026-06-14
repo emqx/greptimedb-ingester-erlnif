@@ -13,6 +13,7 @@ all() ->
     [
         {group, tcp},
         {group, tls},
+        {group, tls_ciphers},
         t_connect_with_auth
     ].
 
@@ -40,9 +41,22 @@ groups() ->
         t_connect_tls_verify_undefined_fallback_to_peer,
         t_connect_tls_invalid_verify_returns_error
     ],
+    CipherTCs = [
+        t_cipher_tls13_aes256_gcm,
+        t_cipher_tls13_aes128_gcm,
+        t_cipher_tls12_ecdhe_rsa_aes256,
+        t_cipher_tls12_ecdhe_rsa_aes128,
+        t_cipher_mixed_tls12_tls13,
+        t_cipher_single_suite,
+        t_cipher_empty_list_uses_defaults,
+        t_cipher_all_invalid_returns_error,
+        t_cipher_partial_invalid_skips_bad,
+        t_fips_status_returns_boolean
+    ],
     [
         {tcp, [], CommonTCs},
-        {tls, [], CommonTCs ++ TlsOnlyTCs}
+        {tls, [], CommonTCs ++ TlsOnlyTCs},
+        {tls_ciphers, [], CipherTCs}
     ].
 
 init_per_suite(Config) ->
@@ -74,6 +88,28 @@ init_per_group(tls, Config) ->
     ?assert(filelib:is_file(ClientCert)),
     ?assert(filelib:is_file(ClientKey)),
 
+    ConnOpts = #{
+        endpoints => [<<Host/binary, ":4001">>],
+        dbname => <<"public">>,
+        tls => true,
+        ca_cert => list_to_binary(CaCert),
+        client_cert => list_to_binary(ClientCert),
+        client_key => list_to_binary(ClientKey)
+    },
+    [{conn_opts, ConnOpts} | Config];
+init_per_group(tls_ciphers, Config) ->
+    Host = get_host_addr("GREPTIMEDB_TLS_ADDR"),
+    Dir = code:lib_dir(greptimedb_rs),
+    DataDir = filename:join(Dir, "test/data/certs"),
+    CaCert = filename:join(DataDir, "ca.crt"),
+    ClientCert = filename:join(DataDir, "server.crt"),
+    ClientKey = filename:join(DataDir, "server.key"),
+
+    ?assert(filelib:is_file(CaCert)),
+    ?assert(filelib:is_file(ClientCert)),
+    ?assert(filelib:is_file(ClientKey)),
+
+    %% Base TLS opts without cipher_suites; each TC adds its own
     ConnOpts = #{
         endpoints => [<<Host/binary, ":4001">>],
         dbname => <<"public">>,
@@ -915,6 +951,116 @@ t_stream_write_async(Config) ->
     ?assertEqual(10, Count),
 
     ok = greptimedb_rs:stop_client(Client).
+
+%% ================================================================================
+%% TLS Cipher Suite Test Cases
+%% ================================================================================
+
+%% TLS 1.3 cipher: AES-256-GCM
+t_cipher_tls13_aes256_gcm(Config) ->
+    ConnOpts = (?conn_opts(Config))#{
+        cipher_suites => [<<"TLS_AES_256_GCM_SHA384">>]
+    },
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts),
+    ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+%% TLS 1.3 cipher: AES-128-GCM
+t_cipher_tls13_aes128_gcm(Config) ->
+    ConnOpts = (?conn_opts(Config))#{
+        cipher_suites => [<<"TLS_AES_128_GCM_SHA256">>]
+    },
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts),
+    ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+%% TLS 1.2 cipher: ECDHE-RSA-AES256
+t_cipher_tls12_ecdhe_rsa_aes256(Config) ->
+    ConnOpts = (?conn_opts(Config))#{
+        cipher_suites => [<<"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384">>]
+    },
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts),
+    ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+%% TLS 1.2 cipher: ECDHE-RSA-AES128
+t_cipher_tls12_ecdhe_rsa_aes128(Config) ->
+    ConnOpts = (?conn_opts(Config))#{
+        cipher_suites => [<<"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256">>]
+    },
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts),
+    ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+%% Mixed TLS 1.2 + 1.3 ciphers
+t_cipher_mixed_tls12_tls13(Config) ->
+    ConnOpts = (?conn_opts(Config))#{
+        cipher_suites => [
+            <<"TLS_AES_256_GCM_SHA384">>,
+            <<"TLS_AES_128_GCM_SHA256">>,
+            <<"TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384">>,
+            <<"TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256">>
+        ]
+    },
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts),
+    ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+%% Single cipher suite
+t_cipher_single_suite(Config) ->
+    ConnOpts = (?conn_opts(Config))#{
+        cipher_suites => [<<"TLS_AES_128_GCM_SHA256">>]
+    },
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts),
+    ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+%% Empty cipher list should behave the same as no cipher_suites key (default)
+t_cipher_empty_list_uses_defaults(Config) ->
+    ConnOpts = (?conn_opts(Config))#{
+        cipher_suites => []
+    },
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts),
+    ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+%% All invalid cipher names should cause a connection error
+t_cipher_all_invalid_returns_error(Config) ->
+    ConnOpts = (?conn_opts(Config))#{
+        cipher_suites => [<<"INVALID_CIPHER_1">>, <<"NONSENSE_CIPHER">>]
+    },
+    case greptimedb_rs:start_client(ConnOpts) of
+        {error, _Reason} ->
+            ok;
+        {ok, Client} ->
+            %% Connection might succeed lazily; query should fail
+            case greptimedb_rs:query(Client, <<"SELECT 1">>) of
+                {error, _} -> ok;
+                {ok, _} -> ct:fail(expected_cipher_error)
+            end,
+            ok = greptimedb_rs:stop_client(Client)
+    end.
+
+%% Mix of valid + invalid cipher names: invalid ones are skipped, valid ones work
+t_cipher_partial_invalid_skips_bad(Config) ->
+    ConnOpts = (?conn_opts(Config))#{
+        cipher_suites => [
+            <<"INVALID_CIPHER">>,
+            <<"TLS_AES_256_GCM_SHA384">>,
+            <<"ANOTHER_BAD_ONE">>
+        ]
+    },
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts),
+    ?assertMatch({ok, [_ | _]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+%% FIPS status should return a boolean
+t_fips_status_returns_boolean(_Config) ->
+    FipsStatus = greptimedb_rs_nif:fips_status(),
+    ?assert(is_boolean(FipsStatus)),
+    %% cached version should return the same value
+    CachedStatus = greptimedb_rs_nif:cached_fips_status(),
+    ?assertEqual(FipsStatus, CachedStatus).
 
 %% ================================================================================
 %% Helpers
