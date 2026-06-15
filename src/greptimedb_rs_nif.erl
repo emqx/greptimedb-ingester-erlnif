@@ -23,7 +23,9 @@
     insert/3,
     stream_start/3,
     stream_write/2,
-    stream_close/1
+    stream_close/1,
+    fips_status/0,
+    cached_fips_status/0
 ]).
 
 -export([init/0]).
@@ -32,7 +34,10 @@
 init() ->
     NifName = "libgreptimedb_nif",
     Niflib = filename:join(priv_dir(), NifName),
-    erlang:load_nif(Niflib, none).
+    case erlang:load_nif(Niflib, none) of
+        ok -> ok;
+        {error, {already_loaded, _}} -> ok
+    end.
 
 %% =================================================================================================
 %% NIFs
@@ -58,8 +63,26 @@ stream_write(_Writer, _Rows) ->
 stream_close(_Writer) ->
     not_loaded(?LINE).
 
+fips_status() ->
+    not_loaded(?LINE).
+
 %% =================================================================================================
 %% Helpers
+
+-define(FIPS_CACHE_KEY, {?MODULE, fips_status}).
+%% 1 hour
+-define(FIPS_CACHE_TTL_MS, 3600000).
+
+cached_fips_status() ->
+    Now = erlang:system_time(millisecond),
+    case persistent_term:get(?FIPS_CACHE_KEY, undefined) of
+        {Value, Timestamp} when Now - Timestamp < ?FIPS_CACHE_TTL_MS ->
+            Value;
+        _ ->
+            Value = fips_status(),
+            persistent_term:put(?FIPS_CACHE_KEY, {Value, Now}),
+            Value
+    end.
 
 not_loaded(Line) ->
     erlang:nif_error({error, {not_loaded, [{module, ?MODULE}, {line, Line}]}}).

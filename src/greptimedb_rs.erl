@@ -67,6 +67,7 @@
     ca_cert => binary(),
     client_cert => binary(),
     client_key => binary(),
+    cipher_suites => [binary()],
     pool_name => pool_name(),
     pool_size => pool_size(),
     pool_type => pool_type(),
