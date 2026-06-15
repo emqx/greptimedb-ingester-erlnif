@@ -217,21 +217,23 @@ do_unwrap_password(Password) ->
 
 log_connect_info(#{endpoints := Endpoints} = Opts) ->
     TlsEnabled = maps:get(tls, Opts, false),
-    CipherInfo = case maps:find(cipher_suites, Opts) of
-        {ok, Ciphers} when Ciphers =/= [] ->
-            [" ciphers=", string:join([binary_to_list(C) || C <- Ciphers], ":")];
-        _ ->
-            ""
-    end,
-    FipsInfo = case TlsEnabled of
-        true ->
-            case greptimedb_rs_nif:cached_fips_status() of
-                true -> " fips=enabled";
-                false -> " fips=disabled"
-            end;
-        _ ->
-            ""
-    end,
+    CipherInfo =
+        case maps:find(cipher_suites, Opts) of
+            {ok, Ciphers} when Ciphers =/= [] ->
+                [" ciphers=", string:join([binary_to_list(C) || C <- Ciphers], ":")];
+            _ ->
+                ""
+        end,
+    FipsInfo =
+        case TlsEnabled of
+            true ->
+                case greptimedb_rs_nif:cached_fips_status() of
+                    true -> " fips=enabled";
+                    false -> " fips=disabled"
+                end;
+            _ ->
+                ""
+        end,
     EndpointStr = string:join([binary_to_list(E) || E <- Endpoints], ","),
     logger:notice(
         "greptimedb_rs_sock connecting to [~s] tls=~s~s~s",

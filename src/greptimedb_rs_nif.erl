@@ -70,7 +70,8 @@ fips_status() ->
 %% Helpers
 
 -define(FIPS_CACHE_KEY, {?MODULE, fips_status}).
--define(FIPS_CACHE_TTL_MS, 3600000). %% 1 hour
+%% 1 hour
+-define(FIPS_CACHE_TTL_MS, 3600000).
 
 cached_fips_status() ->
     Now = erlang:system_time(millisecond),

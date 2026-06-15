@@ -40,10 +40,7 @@ pub struct StreamWriterResource {
 
 #[allow(non_local_definitions)]
 fn load(env: Env, _info: Term) -> bool {
-    FIPS_ENABLED.store(
-        check_fips_enabled(),
-        Ordering::Relaxed,
-    );
+    FIPS_ENABLED.store(check_fips_enabled(), Ordering::Relaxed);
     _ = rustler::resource!(GreptimeResource, env);
     _ = rustler::resource!(StreamWriterResource, env);
     true
