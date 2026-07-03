@@ -14,6 +14,17 @@ fi
 # touch the build.rs to force cargo to rerun build script and generate libpath file
 touch "${BUILD_SCRIPT}"
 
+# `aws-lc-sys` (pulled in transitively via the gRPC/TLS stack) refuses to build
+# with the GCC 9 shipped on Ubuntu 20.04 (focal), guarding against
+# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=95189. Build with clang there
+# instead: it is unaffected by the bug and still links against glibc 2.31, so
+# the produced NIF stays compatible with Ubuntu 20.04. Only applied on focal,
+# only when the caller has not already chosen a compiler, and only if clang is
+# available.
+if [ -z "${CC:-}" ] && grep -qi focal /etc/os-release 2>/dev/null && command -v clang >/dev/null 2>&1; then
+  export CC=clang CXX=clang++
+fi
+
 cargo build --release
 
 # Should always be `.so`, OTP on macos won't load `.dylib` files.
