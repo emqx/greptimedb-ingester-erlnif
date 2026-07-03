@@ -14,15 +14,30 @@ fi
 # touch the build.rs to force cargo to rerun build script and generate libpath file
 touch "${BUILD_SCRIPT}"
 
-# `aws-lc-sys` (pulled in transitively via the gRPC/TLS stack) refuses to build
-# with the GCC 9 shipped on Ubuntu 20.04 (focal), guarding against
-# https://gcc.gnu.org/bugzilla/show_bug.cgi?id=95189. Build with clang there
-# instead: it is unaffected by the bug and still links against glibc 2.31, so
-# the produced NIF stays compatible with Ubuntu 20.04. Only applied on focal,
-# only when the caller has not already chosen a compiler, and only if clang is
-# available.
-if [ -z "${CC:-}" ] && grep -qi focal /etc/os-release 2>/dev/null && command -v clang >/dev/null 2>&1; then
-  export CC=clang CXX=clang++
+# The Ubuntu 20.04 (focal) builder image needs two things newer images already
+# provide. This block is scoped to focal only, so all other targets (ubuntu22/24,
+# debian, el, amzn) are untouched.
+#   1. protoc: greptime-proto's build script needs it, but the focal image does
+#      not ship protobuf-compiler (ubuntu22/24 images do).
+#   2. A compiler aws-lc-sys accepts: the gRPC/TLS stack pulls in aws-lc-sys,
+#      which refuses to build with the GCC 9 focal ships, guarding against
+#      https://gcc.gnu.org/bugzilla/show_bug.cgi?id=95189. GCC 10 fixes that bug
+#      and still links against glibc 2.31, keeping the NIF compatible with focal.
+#      The image has neither clang nor gcc-10, so install gcc-10. Honour a
+#      caller-set CC.
+if grep -qi focal /etc/os-release 2>/dev/null; then
+  need_install=""
+  command -v protoc >/dev/null 2>&1 || need_install="protobuf-compiler"
+  if [ -z "${CC:-}" ] && ! command -v gcc-10 >/dev/null 2>&1; then
+    need_install="${need_install} gcc-10 g++-10"
+  fi
+  if [ -n "${need_install}" ]; then
+    apt-get update
+    apt-get install -y --no-install-recommends ${need_install}
+  fi
+  if [ -z "${CC:-}" ]; then
+    export CC=gcc-10 CXX=g++-10
+  fi
 fi
 
 cargo build --release
