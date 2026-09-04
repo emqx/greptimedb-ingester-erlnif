@@ -15,6 +15,18 @@ on:
           Publish release under this tag, or update release assets if such release exists.
           If empty, release publishing will be skipped.
         required: false
+      mac_otp_versions:
+        description: |
+          JSON array of macOS OTP versions to build. Defaults to the current release OTP.
+          OTP 29 can be added here after the matching OTP-29.* tag exists in emqx/otp.
+        required: false
+        default: '["28.2-2"]'
+      linux_erlang_matrix:
+        description: |
+          JSON array of Linux Erlang matrix objects. Defaults to the current release OTP.
+          OTP 29 can be added here after matching emqx-builder images are published.
+        required: false
+        default: '[{"otp":"28.2-2","elixir":"1.19.1","builder":"6.0-9"}]'
 
 env:
   package_name: "greptimedb-ingester-erlnif"
@@ -25,19 +37,25 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        otp:
-          - "28.2-2"
+        # Set RELEASE_MAC_OTP_VERSIONS to include OTP 29 after the matching
+        # OTP-29.* tag exists in https://github.com/emqx/otp.git.
+        otp: ${{ fromJSON(github.event.inputs.mac_otp_versions || vars.RELEASE_MAC_OTP_VERSIONS || '["28.2-2"]') }}
         rebar3:
           - "3.24.0"
         os:
           - macos-14
           - macos-15
+          - macos-26
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: emqx/macos-erlang@f744c98139c0db83a10619587d4bae4fc49765a8 # v1.0.0
+      - uses: emqx/macos-erlang@1e65a0125f99969fd5623999fe52e49f4fa542d5 # v1.2.0
         with:
           otp-version: ${{ matrix.otp }}
+          rebar3-base-url: https://github.com/erlang/rebar3
           rebar3-version: ${{ matrix.rebar3 }}
+
+      - name: add rebar3 to PATH
+        run: echo "$HOME/.kerl/installations/${{ matrix.otp }}/.cache/rebar3/bin" >> "$GITHUB_PATH"
 
       - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29 # v4.1.6
         with:
@@ -62,10 +80,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        erlang:
-          - otp: "28.2-2"
-            elixir: "1.19.1"
-            builder: "6.0-9"
+        # Set RELEASE_LINUX_ERLANG_MATRIX to include OTP 29 after matching
+        # ghcr.io/emqx/emqx-builder/<builder>:<elixir>-<otp>-<os> images
+        # are published for the Linux OS matrix below.
+        erlang: ${{ fromJSON(github.event.inputs.linux_erlang_matrix || vars.RELEASE_LINUX_ERLANG_MATRIX || '[{"otp":"28.2-2","elixir":"1.19.1","builder":"6.0-9"}]') }}
         arch:
           - amd64
           - arm64
