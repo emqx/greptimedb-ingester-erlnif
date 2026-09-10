@@ -26,10 +26,15 @@ groups() ->
         t_insert_sync_ttl_hint,
         t_insert_sync_existing_table,
         t_insert_sync_schema_conflict,
+        t_insert_sync_new_field_existing_table,
+        t_insert_sync_new_tag_existing_table,
+        t_insert_sync_new_field_mixed_batch,
+        t_insert_sync_new_duplicate_key_prefers_field,
         t_query_sync,
         t_insert_async,
         t_insert_async_existing_table,
         t_insert_async_schema_conflict,
+        t_insert_async_new_field_existing_table,
         t_query_async,
         t_stream_write,
         t_stream_write_async
@@ -746,6 +751,147 @@ t_insert_async_schema_conflict(Config) ->
     ?assertEqual(0, Count),
     ok = greptimedb_rs:stop_client(Client).
 
+%%------------------------------------------------------------------------------
+%% New-column regression tests for emqx/emqx#18499
+%%
+%% Inserting a record with fields/tags that are not present in the existing
+%% table schema must not silently drop them: the inferred columns must be merged
+%% into the outgoing request schema so that GreptimeDB can add them.
+%%------------------------------------------------------------------------------
+
+t_insert_sync_new_field_existing_table(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ok = create_existing_table(Client, Table),
+    Ts = erlang:system_time(millisecond),
+    Rows = [
+        #{
+            fields => #{
+                <<"temperature">> => 26.0,
+                %% New field: absent from the existing table schema.
+                <<"humidity">> => 60.0
+            },
+            tags => #{
+                <<"sensor_location">> => <<"room1">>,
+                <<"sensor_id">> => 12345
+            },
+            timestamp => Ts
+        }
+    ],
+    ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
+    timer:sleep(1000),
+    ok = assert_column(Client, Table, <<"humidity">>, <<"Float64">>, <<"FIELD">>),
+    ?assertEqual([60.0], select_column(Client, Table, <<"humidity">>)),
+    %% Existing columns keep being written.
+    ?assertEqual([26.0], select_column(Client, Table, <<"temperature">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_sync_new_tag_existing_table(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ok = create_existing_table(Client, Table),
+    Ts = erlang:system_time(millisecond),
+    Rows = [
+        #{
+            fields => #{<<"temperature">> => 26.0},
+            tags => #{
+                <<"sensor_id">> => 12345,
+                %% New tag: absent from the existing table schema.
+                <<"room">> => <<"room1">>
+            },
+            timestamp => Ts
+        }
+    ],
+    ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
+    timer:sleep(1000),
+    ok = assert_column(Client, Table, <<"room">>, <<"String">>, <<"TAG">>),
+    ?assertEqual([<<"room1">>], select_column(Client, Table, <<"room">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_sync_new_field_mixed_batch(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ok = create_existing_table(Client, Table),
+    Ts = erlang:system_time(millisecond),
+    %% Only the second row carries the new field: inference must consider all
+    %% rows in the batch, not just the first one.
+    Rows = [
+        #{
+            fields => #{<<"temperature">> => 25.0},
+            tags => #{<<"sensor_location">> => <<"room1">>, <<"sensor_id">> => 12345},
+            timestamp => Ts
+        },
+        #{
+            fields => #{<<"temperature">> => 26.0, <<"humidity">> => 60.0},
+            tags => #{<<"sensor_location">> => <<"room1">>, <<"sensor_id">> => 12345},
+            timestamp => Ts + 1
+        }
+    ],
+    ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
+    timer:sleep(1000),
+    ok = assert_column(Client, Table, <<"humidity">>, <<"Float64">>, <<"FIELD">>),
+    ?assertEqual([nil, 60.0], select_column(Client, Table, <<"humidity">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_sync_new_duplicate_key_prefers_field(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ok = create_existing_table(Client, Table),
+    Ts = erlang:system_time(millisecond),
+    %% The same unknown key shows up in both maps. Sending two columns with the
+    %% same name is rejected by GreptimeDB ("Duplicated column name in gRPC
+    %% requests"), so one of them must win: fields take precedence.
+    Rows = [
+        #{
+            fields => #{<<"temperature">> => 26.0, <<"dup">> => 9.0},
+            tags => #{
+                <<"sensor_location">> => <<"room1">>,
+                <<"sensor_id">> => 12345,
+                <<"dup">> => <<"as-tag">>
+            },
+            timestamp => Ts
+        }
+    ],
+    ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
+    timer:sleep(1000),
+    ok = assert_column(Client, Table, <<"dup">>, <<"Float64">>, <<"FIELD">>),
+    ?assertEqual([9.0], select_column(Client, Table, <<"dup">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_async_new_field_existing_table(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ok = create_existing_table(Client, Table),
+    Ts = erlang:system_time(millisecond),
+    Rows = [
+        #{
+            fields => #{
+                <<"temperature">> => 26.0,
+                <<"humidity">> => 60.0
+            },
+            tags => #{
+                <<"sensor_location">> => <<"room1">>,
+                <<"sensor_id">> => 12345
+            },
+            timestamp => Ts
+        }
+    ],
+    Self = self(),
+    Ref = make_ref(),
+    CallbackFun = fun(P, R, Res) -> P ! {R, Res} end,
+    Callback = {CallbackFun, [Self, Ref]},
+    {ok, _WorkerPid} = greptimedb_rs:insert_async(Client, Table, Rows, Callback),
+    receive
+        {Ref, {ok, _}} -> ok;
+        {Ref, {error, Reason}} -> ct:fail({async_write_failed, Reason})
+    after 5000 ->
+        ct:fail(async_write_timeout)
+    end,
+    timer:sleep(1000),
+    ok = assert_column(Client, Table, <<"humidity">>, <<"Float64">>, <<"FIELD">>),
+    ?assertEqual([60.0], select_column(Client, Table, <<"humidity">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
 t_query_sync(Config) ->
     {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
     Table = ?table(Config),
@@ -1065,6 +1211,64 @@ t_fips_status_returns_boolean(_Config) ->
 %% ================================================================================
 %% Helpers
 %% ================================================================================
+
+%%------------------------------------------------------------------------------
+%% Helpers for the new-column regression tests
+%%------------------------------------------------------------------------------
+
+%% Pre-creates a table whose schema intentionally differs from what the driver
+%% would infer (e.g. sensor_id is INT64, temperature is DOUBLE).
+create_existing_table(Client, Table) ->
+    DropSql = iolist_to_binary(io_lib:format("DROP TABLE IF EXISTS ~s", [Table])),
+    _ = greptimedb_rs:query(Client, DropSql),
+    CreateSql = iolist_to_binary(
+        io_lib:format(
+            "CREATE TABLE ~s ("
+            "ts TIMESTAMP TIME INDEX, "
+            "temperature DOUBLE, "
+            "sensor_location STRING, "
+            "sensor_id INT64, "
+            "PRIMARY KEY (sensor_location, sensor_id)"
+            ") ENGINE=mito",
+            [Table]
+        )
+    ),
+    case greptimedb_rs:query(Client, CreateSql) of
+        {ok, _} -> ok;
+        Error -> ct:fail({create_table_failed, Table, Error})
+    end.
+
+assert_column(Client, Table, Column, Type, SemanticType) ->
+    case describe_column(Client, Table, Column) of
+        not_found ->
+            ct:fail({column_missing_from_table, Table, Column});
+        {Type, SemanticType} ->
+            ok;
+        {OtherType, OtherSemanticType} ->
+            ct:fail({
+                unexpected_column_definition,
+                Table,
+                Column,
+                {expected, Type, SemanticType},
+                {got, OtherType, OtherSemanticType}
+            })
+    end.
+
+describe_column(Client, Table, Column) ->
+    Sql = iolist_to_binary(io_lib:format("DESCRIBE ~s", [Table])),
+    {ok, Rows} = greptimedb_rs:query(Client, Sql),
+    %% DESCRIBE columns: Field, Type, Null, Key, Default, Semantic Type
+    case [Row || [Name | _] = Row <- Rows, Name =:= Column] of
+        [[_, Type, _Null, _Key, _Default, SemanticType] | _] -> {Type, SemanticType};
+        [] -> not_found
+    end.
+
+select_column(Client, Table, Column) ->
+    Sql = iolist_to_binary(
+        io_lib:format("SELECT ~s FROM ~s ORDER BY ts", [Column, Table])
+    ),
+    {ok, Rows} = greptimedb_rs:query(Client, Sql),
+    [Value || [Value] <- Rows].
 
 get_host_addr(Env) ->
     case os:getenv(Env) of
