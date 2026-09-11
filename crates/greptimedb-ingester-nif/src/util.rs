@@ -149,9 +149,11 @@ pub fn terms_to_proto_rows_with_columns<'a>(
 /// (`Duplicated column name in gRPC requests`), so exactly one column may be
 /// produced per key.
 ///
-/// Inference looks at every row in the batch. The first occurrence of an
-/// unknown key determines its data type; a later value that does not fit that
-/// type is rejected when the rows are encoded, instead of being dropped.
+/// Inference looks at every row in the batch. The first non-null occurrence of
+/// an unknown key determines its data type; a later value that does not fit
+/// that type is rejected when the rows are encoded, instead of being dropped.
+/// NULL values never decide a type, and a key whose values are all NULL does not
+/// produce a column at all.
 pub fn merge_inferred_columns<'a>(
     server_columns: Vec<ColumnSchema>,
     rows_term: &[Term<'a>],
@@ -198,8 +200,9 @@ pub fn merge_inferred_columns<'a>(
 /// Collects the keys of `map` that are neither in `known` nor already in `out`.
 ///
 /// Keys are visited in sorted order so the resulting column order is
-/// deterministic. The first occurrence of a key wins, so entries already
-/// collected from an earlier row are never overwritten.
+/// deterministic. The first *non-null* occurrence of a key wins, so entries
+/// already collected from an earlier row are never overwritten, and a key whose
+/// values are all NULL is not collected at all.
 fn collect_unknown_columns(
     map: Term,
     known: &HashSet<String>,
@@ -218,9 +221,26 @@ fn collect_unknown_columns(
             continue;
         }
         let val = map.map_get(key)?;
+        if is_null(val) {
+            // NULL must not decide the type of an inferred column: defer the
+            // inference to the first non-null occurrence, which may be in a
+            // later row. If every value is NULL the key is left out entirely,
+            // rather than creating an arbitrarily typed column for it.
+            continue;
+        }
         out.insert(name, infer_dtype(val));
     }
     Ok(())
+}
+
+/// Whether `term` stands for a SQL NULL (`nil` or `undefined`).
+fn is_null(term: Term) -> bool {
+    match term.decode::<rustler::types::atom::Atom>() {
+        Ok(atom) => {
+            atom == rustler::types::atom::nil() || atom == rustler::types::atom::undefined()
+        }
+        Err(_) => false,
+    }
 }
 
 pub fn terms_to_schema_and_rows<'a>(

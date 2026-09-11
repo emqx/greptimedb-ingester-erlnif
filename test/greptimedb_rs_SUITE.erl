@@ -29,6 +29,8 @@ groups() ->
         t_insert_sync_new_field_existing_table,
         t_insert_sync_new_tag_existing_table,
         t_insert_sync_new_field_mixed_batch,
+        t_insert_sync_new_field_null_first,
+        t_insert_sync_new_field_all_null,
         t_insert_sync_new_duplicate_key_prefers_field,
         t_query_sync,
         t_insert_async,
@@ -856,6 +858,51 @@ t_insert_sync_new_duplicate_key_prefers_field(Config) ->
     timer:sleep(1000),
     ok = assert_column(Client, Table, <<"dup">>, <<"Float64">>, <<"FIELD">>),
     ?assertEqual([9.0], select_column(Client, Table, <<"dup">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_sync_new_field_null_first(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ok = create_existing_table(Client, Table),
+    Ts = erlang:system_time(millisecond),
+    %% A NULL must not decide the type of a new column: the numeric value in the
+    %% second row has to win, otherwise the second row fails to encode.
+    Rows = [
+        #{
+            fields => #{<<"temperature">> => 25.0, <<"humidity">> => nil},
+            tags => #{<<"sensor_location">> => <<"room1">>, <<"sensor_id">> => 12345},
+            timestamp => Ts
+        },
+        #{
+            fields => #{<<"temperature">> => 26.0, <<"humidity">> => 60.0},
+            tags => #{<<"sensor_location">> => <<"room1">>, <<"sensor_id">> => 12345},
+            timestamp => Ts + 1
+        }
+    ],
+    ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
+    timer:sleep(1000),
+    ok = assert_column(Client, Table, <<"humidity">>, <<"Float64">>, <<"FIELD">>),
+    ?assertEqual([nil, 60.0], select_column(Client, Table, <<"humidity">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_sync_new_field_all_null(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ok = create_existing_table(Client, Table),
+    Ts = erlang:system_time(millisecond),
+    %% Every value of the unknown key is NULL: no column should be created for
+    %% it, so that a later non-null write can pick the right type.
+    Rows = [
+        #{
+            fields => #{<<"temperature">> => 25.0, <<"humidity">> => nil},
+            tags => #{<<"sensor_location">> => <<"room1">>, <<"sensor_id">> => 12345},
+            timestamp => Ts
+        }
+    ],
+    ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
+    timer:sleep(1000),
+    ?assertEqual(not_found, describe_column(Client, Table, <<"humidity">>)),
+    ?assertEqual([25.0], select_column(Client, Table, <<"temperature">>)),
     ok = greptimedb_rs:stop_client(Client).
 
 t_insert_async_new_field_existing_table(Config) ->
