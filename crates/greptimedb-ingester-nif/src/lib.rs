@@ -316,11 +316,11 @@ fn insert<'a>(
 
     let (schema, rows) = match table_schema_res {
         Ok(s) => {
-            // Table exists, use server schema
-            let proto_rows = util::terms_to_proto_rows_using_schema(&s, rows_term)?;
-
+            // Table exists: keep the server's columns and their types, then merge in
+            // the columns inferred from the input rows. GreptimeDB adds unknown
+            // columns automatically, so new input fields are no longer dropped.
             use greptimedb_ingester::api::v1::ColumnSchema;
-            let schema_cols: Vec<ColumnSchema> = s
+            let server_columns: Vec<ColumnSchema> = s
                 .columns()
                 .iter()
                 .map(|c| ColumnSchema {
@@ -331,7 +331,10 @@ fn insert<'a>(
                 })
                 .collect();
 
-            (schema_cols, proto_rows)
+            let schema = util::merge_inferred_columns(server_columns, &rows_term)?;
+            let rows = util::terms_to_proto_rows_with_columns(&schema, rows_term)?;
+
+            (schema, rows)
         }
         Err(_) => {
             // Table might not exist, infer schema locally
