@@ -71,6 +71,8 @@
     pool_name => pool_name(),
     pool_size => pool_size(),
     pool_type => pool_type(),
+    request_timeout => pos_integer(),
+    stream_timeout => pos_integer(),
     any() => term()
 }.
 -type client() :: #{
@@ -172,13 +174,16 @@ query_async(Client, Sql, ResultCallback) ->
 %% It attempts to initialize the stream on all workers (best effort).
 -spec stream_start(client(), binary(), map()) -> {ok, stream_client()}.
 stream_start(?pool_name(PoolName) = Client, Table, FirstRow) ->
+    Deadline = deadline(Client, ?cmd_stream_start),
     Workers = ecpool:workers(PoolName),
     %% Attempt to pre-warm all workers. Ignore errors/ignored returns.
     lists:foreach(
         fun({_Name, Worker}) ->
             try
                 {ok, Conn} = ecpool_worker:client(Worker),
-                greptimedb_rs_sock:sync_command(Conn, ?cmd_stream_start, [Table, FirstRow])
+                greptimedb_rs_sock:sync_command(
+                    Conn, ?cmd_stream_start, [Table, FirstRow], Deadline
+                )
             catch
                 _:_ -> ok
             end
@@ -190,13 +195,14 @@ stream_start(?pool_name(PoolName) = Client, Table, FirstRow) ->
 %% @doc Stop the stream for a specific table.
 %% Releases stream resources on all workers in the pool.
 -spec stream_close(stream_client()) -> ok.
-stream_close({stream_client, ?pool_name(PoolName), Table}) ->
+stream_close({stream_client, ?pool_name(PoolName) = Client, Table}) ->
+    Deadline = deadline(Client, ?cmd_stream_close),
     Workers = ecpool:workers(PoolName),
     lists:foreach(
         fun({_Name, Worker}) ->
             try
                 {ok, Conn} = ecpool_worker:client(Worker),
-                greptimedb_rs_sock:sync_command(Conn, ?cmd_stream_close, [Table])
+                greptimedb_rs_sock:sync_command(Conn, ?cmd_stream_close, [Table], Deadline)
             catch
                 _:_ -> ok
             end
@@ -220,19 +226,32 @@ stream_write_async({stream_client, Client, Table}, Rows, Callback) ->
 %% Helpers
 %% ===================================================================
 
-call_sync(?pool_name(PoolName), Cmd, Args) ->
+call_sync(?pool_name(PoolName) = Client, Cmd, Args) ->
+    Deadline = deadline(Client, Cmd),
     ecpool:with_client(
         PoolName,
         fun(Conn) ->
-            greptimedb_rs_sock:sync_command(Conn, Cmd, Args)
+            greptimedb_rs_sock:sync_command(Conn, Cmd, Args, Deadline)
         end
     ).
 
-call_async(?pool_name(PoolName), Cmd, Args, Callback) ->
+call_async(?pool_name(PoolName) = Client, Cmd, Args, Callback) ->
+    Deadline = deadline(Client, Cmd),
     ecpool:with_client(
         PoolName,
         fun(Conn) ->
-            erlang:send(Conn, ?ASYNC_REQ(Cmd, Args, Callback)),
+            erlang:send(Conn, {async, Cmd, Args, Callback, Deadline}),
             {ok, Conn}
         end
     ).
+
+deadline(Client, Cmd) ->
+    Opts = maps:get(conn_opts, Client, #{}),
+    Timeout =
+        case Cmd of
+            ?cmd_stream_start -> maps:get(stream_timeout, Opts, 30000);
+            ?cmd_stream_write -> maps:get(stream_timeout, Opts, 30000);
+            ?cmd_stream_close -> maps:get(stream_timeout, Opts, 30000);
+            _ -> maps:get(request_timeout, Opts, 10000)
+        end,
+    erlang:monotonic_time(microsecond) + Timeout * 1000.

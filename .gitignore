@@ -27,3 +27,4 @@ libpath
 .elp.toml
 build_info.json
 /_packages/
+__pycache__/

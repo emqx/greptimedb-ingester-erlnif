@@ -3,13 +3,14 @@
 {application, greptimedb_rs, [
     {description, "GreptimeDB Erlang Client lib with RustNif"},
     {vsn, "0.1.0"},
-    {registered, []},
+    {registered, [greptimedb_rs_sup, greptimedb_rs_runtime]},
     {applications, [
         kernel,
         stdlib,
         ecpool
     ]},
-    {env, []},
+    {mod, {greptimedb_rs_app, []}},
+    {env, [{runtime_workers, 2}, {cpu_workers, 2}]},
     {modules, []},
     {licenses, ["Apache-2.0"]},
     {links, []}

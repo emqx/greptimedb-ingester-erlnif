@@ -1,5 +1,3 @@
-SCRIPTS = $(CURDIR)/scripts
-
 .PHONY: all
 all: compile
 
@@ -40,3 +38,12 @@ dialyzer:
 fmt:
 	rebar3 fmt
 	cargo fmt --all -- --check
+
+.PHONY: regression
+regression: compile
+	@test -n "$(GREPTIME_BIN)" || { echo "Set GREPTIME_BIN to the GreptimeDB executable"; exit 1; }
+	mkdir -p _build/regression
+	erlc -Werror -o _build/regression test/support/*.erl
+	python3 test/support/run_io_regression.py --greptime-bin "$(GREPTIME_BIN)" --out _build/regression/io
+	python3 test/support/run_async_lifecycle.py --greptime-bin "$(GREPTIME_BIN)" --out _build/regression/async
+	python3 test/support/run_cpu_lifecycle.py --greptime-bin "$(GREPTIME_BIN)" --out _build/regression/cpu

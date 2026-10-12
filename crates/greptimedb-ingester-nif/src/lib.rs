@@ -1,20 +1,28 @@
+use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+
+use futures::FutureExt;
 use std::time::Duration;
 
 use greptime_proto::v1::auth_header::AuthScheme;
 use greptime_proto::v1::Basic;
 use greptimedb_ingester::client::Client;
 use greptimedb_ingester::database::Database;
-use greptimedb_ingester::{
-    BulkInserter, BulkStreamWriter, BulkWriteOptions, ColumnDataType, TableSchema,
+use greptimedb_ingester::{BulkInserter, BulkWriteOptions, ColumnDataType, TableSchema};
+use rustler::{
+    Atom, Encoder, Env, LocalPid, Monitor, NifResult, OwnedEnv, Resource, ResourceArc, Term,
 };
-use rustler::{Atom, Encoder, Env, NifResult, ResourceArc, Term};
-use tokio::runtime::Runtime;
+
+use operation::{Context, Operation, OperationResource, RuntimeOwner, RuntimeResource};
+use rustler::env::SavedTerm;
+use std::rc::Rc;
 
 static FIPS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub mod atoms;
+mod cpu;
+mod operation;
 mod types;
 mod util;
 
@@ -24,32 +32,73 @@ pub struct GreptimeResource {
     pub auth: Option<AuthScheme>,
     pub ts_column: Option<String>,
     pub ttl: Option<String>,
-    pub runtime: Arc<Runtime>, // Per-connection runtime
+    pub runtime: Arc<RuntimeOwner>,
+    operation: Mutex<Option<Arc<Operation>>>,
+    closed: AtomicBool,
 }
-
-// Wrapper to force Send/Sync on BulkStreamWriter
-pub struct SendableBulkStreamWriter(pub BulkStreamWriter);
-unsafe impl Send for SendableBulkStreamWriter {}
-unsafe impl Sync for SendableBulkStreamWriter {}
 
 pub struct StreamWriterResource {
-    pub writer: tokio::sync::Mutex<Option<SendableBulkStreamWriter>>,
-    pub schema: TableSchema,
-    pub runtime: Arc<Runtime>, // Need runtime for async operations
+    id: usize,
+    schema: TableSchema,
+    runtime: Arc<RuntimeOwner>,
+    closed: AtomicBool,
 }
 
-#[allow(non_local_definitions)]
+impl Drop for StreamWriterResource {
+    fn drop(&mut self) {
+        self.runtime.discard(self.id);
+    }
+}
+
+impl Resource for GreptimeResource {
+    const IMPLEMENTS_DOWN: bool = true;
+
+    fn down(&self, _env: Env, _pid: LocalPid, _monitor: Monitor) {
+        self.close();
+    }
+}
+
+impl GreptimeResource {
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        if let Some(operation) = self.operation.lock().unwrap().as_ref() {
+            operation.cancel();
+        }
+    }
+}
+
+impl Resource for StreamWriterResource {}
+
 fn load(env: Env, _info: Term) -> bool {
     FIPS_ENABLED.store(check_fips_enabled(), Ordering::Relaxed);
-    _ = rustler::resource!(GreptimeResource, env);
-    _ = rustler::resource!(StreamWriterResource, env);
-    true
+    env.register::<GreptimeResource>().is_ok()
+        && env.register::<StreamWriterResource>().is_ok()
+        && env.register::<OperationResource>().is_ok()
+        && env.register::<RuntimeResource>().is_ok()
 }
 
 fn check_fips_enabled() -> bool {
     std::fs::read_to_string("/proc/sys/crypto/fips_enabled")
         .map(|s| s.trim() == "1")
         .unwrap_or(false)
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn runtime_start(env: Env, workers: usize, cpu_workers: usize) -> NifResult<Term> {
+    let runtime =
+        operation::start(workers, cpu_workers).map_err(|e| rustler::Error::Term(Box::new(e)))?;
+    let resource = ResourceArc::new(RuntimeResource(runtime));
+    if resource.monitor(Some(env), &env.pid()).is_none() {
+        operation::stop(&resource);
+        return Err(rustler::Error::BadArg);
+    }
+    Ok(resource.encode(env))
+}
+
+#[rustler::nif(schedule = "DirtyIo")]
+fn runtime_stop(runtime: ResourceArc<RuntimeResource>) -> Atom {
+    operation::stop(&runtime);
+    atoms::ok()
 }
 
 #[rustler::nif]
@@ -90,9 +139,7 @@ fn decode_tls_verify(verify_term: Term) -> Result<TlsVerify, String> {
 fn connect(opts: Term) -> NifResult<Term> {
     let env = opts.get_env();
 
-    // Create a new Tokio runtime for this connection
-    let runtime = Runtime::new().map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
-    let runtime = Arc::new(runtime);
+    let runtime = operation::shared().map_err(|e| rustler::Error::Term(Box::new(e)))?;
 
     let endpoints_term: Term = opts.map_get(atoms::endpoints().to_term(env))?;
     let dbname_term: Term = opts.map_get(atoms::dbname().to_term(env))?;
@@ -171,54 +218,19 @@ fn connect(opts: Term) -> NifResult<Term> {
         ts_column,
         ttl,
         runtime,
+        operation: Mutex::new(None),
+        closed: AtomicBool::new(false),
     });
+    resource
+        .monitor(Some(env), &env.pid())
+        .ok_or(rustler::Error::BadArg)?;
     Ok((atoms::ok(), resource).encode(env))
 }
 
-#[rustler::nif(schedule = "DirtyIo")]
-fn disconnect(env: Env, _resource: ResourceArc<GreptimeResource>) -> NifResult<Term> {
-    // The resource will be automatically dropped when this function returns
-    // and all Arc references are released. The Tokio runtime will be shut down
-    // gracefully when the last Arc<Runtime> is dropped.
-    Ok(atoms::ok().encode(env))
-}
-
-#[rustler::nif(schedule = "DirtyIo")]
-fn execute(env: Env, resource: ResourceArc<GreptimeResource>, sql: String) -> NifResult<Term> {
-    let db = &resource.db;
-    let runtime = &resource.runtime;
-
-    // Collect RecordBatches first (Env is not Send)
-    let result = runtime.block_on(async {
-        use futures::StreamExt;
-        match db.query(&sql).await {
-            Ok(mut stream) => {
-                let mut batches = Vec::new();
-                while let Some(batch_res) = stream.next().await {
-                    match batch_res {
-                        Ok(batch) => {
-                            batches.push(batch);
-                        }
-                        Err(e) => return Err(e),
-                    }
-                }
-                Ok(batches)
-            }
-            Err(e) => Err(e),
-        }
-    });
-
-    match result {
-        Ok(batches) => {
-            let mut all_rows = Vec::new();
-            for batch in batches {
-                let rows = types::record_batch_to_terms(env, &batch);
-                all_rows.extend(rows);
-            }
-            Ok((atoms::ok(), all_rows).encode(env))
-        }
-        Err(e) => Ok((atoms::error(), e.to_string()).encode(env)),
-    }
+#[rustler::nif]
+fn disconnect(resource: ResourceArc<GreptimeResource>) -> Atom {
+    resource.close();
+    atoms::ok()
 }
 
 async fn fetch_table_schema(db: &Database, table_name: &str) -> Result<TableSchema, String> {
@@ -295,187 +307,434 @@ async fn fetch_table_schema(db: &Database, table_name: &str) -> Result<TableSche
     Ok(table_schema)
 }
 
-#[rustler::nif(schedule = "DirtyIo")]
-fn insert<'a>(
-    env: Env<'a>,
-    resource: ResourceArc<GreptimeResource>,
-    table: String,
-    rows_term: Vec<Term<'a>>,
-) -> NifResult<Term<'a>> {
-    if rows_term.is_empty() {
-        return Ok((atoms::ok(), 0).encode(env));
+struct Input {
+    env: OwnedEnv,
+    rows: SavedTerm,
+}
+
+impl Input {
+    fn new(rows: Term) -> Self {
+        let env = OwnedEnv::new();
+        let rows = env.save(rows);
+        Self { env, rows }
     }
 
-    let runtime = &resource.runtime;
+    fn is_empty(&self) -> bool {
+        self.env.run(|env| self.rows.load(env).is_empty_list())
+    }
 
-    use greptimedb_ingester::api::v1::{RowInsertRequest, RowInsertRequests, Rows};
-
-    // 1. Try Fetch Schema from Server
-    let table_schema_res: Result<TableSchema, String> =
-        runtime.block_on(fetch_table_schema(&resource.db, &table));
-
-    let (schema, rows) = match table_schema_res {
-        Ok(s) => {
-            // Table exists: keep the server's columns and their types, then merge in
-            // the columns inferred from the input rows. GreptimeDB adds unknown
-            // columns automatically, so new input fields are no longer dropped.
-            use greptimedb_ingester::api::v1::ColumnSchema;
-            let server_columns: Vec<ColumnSchema> = s
-                .columns()
-                .iter()
-                .map(|c| ColumnSchema {
-                    column_name: c.name.clone(),
-                    datatype: c.data_type as i32,
-                    semantic_type: c.semantic_type as i32,
-                    ..Default::default()
-                })
-                .collect();
-
-            let schema = util::merge_inferred_columns(server_columns, &rows_term)?;
-            let rows = util::terms_to_proto_rows_with_columns(&schema, rows_term)?;
-
-            (schema, rows)
-        }
-        Err(_) => {
-            // Table might not exist, infer schema locally
-            util::terms_to_schema_and_rows(
-                rows_term,
-                resource.ts_column.as_deref().unwrap_or("ts"),
-            )?
-        }
-    };
-
-    // 2. Construct Request
-    let insert_request = RowInsertRequests {
-        inserts: vec![RowInsertRequest {
-            table_name: table,
-            rows: Some(Rows { schema, rows }),
-        }],
-    };
-
-    // 3. Insert using Database
-    let result: Result<u32, String> = runtime.block_on(async {
-        if let Some(ttl) = &resource.ttl {
-            resource
-                .db
-                .insert_with_hints(insert_request, &[("ttl", ttl.as_str())])
-                .await
-                .map_err(|e| e.to_string())
-        } else {
-            resource
-                .db
-                .insert(insert_request)
-                .await
-                .map_err(|e| e.to_string())
-        }
-    });
-
-    match result {
-        Ok(affected) => Ok((atoms::ok(), affected).encode(env)),
-        Err(e) => Ok((atoms::error(), e).encode(env)),
+    fn convert<T>(&self, f: impl FnOnce(Vec<Term>) -> NifResult<T>) -> Result<T, Failure> {
+        self.env.run(|env| {
+            let rows = self
+                .rows
+                .load(env)
+                .decode()
+                .map_err(|e| Failure::from_nif(env, e))?;
+            f(rows).map_err(|e| Failure::from_nif(env, e))
+        })
     }
 }
 
-#[rustler::nif(schedule = "DirtyIo")]
-fn stream_start<'a>(
-    env: Env<'a>,
-    resource: ResourceArc<GreptimeResource>,
-    table: String,
-    _first_row: Term<'a>,
-) -> NifResult<Term<'a>> {
-    let runtime = &resource.runtime;
+enum Request {
+    Execute(String),
+    Insert(String, Input),
+    StreamStart(String),
+    StreamWrite(ResourceArc<StreamWriterResource>, Input),
+    StreamClose(ResourceArc<StreamWriterResource>),
+}
 
-    // 1. Fetch Schema from Server
-    let table_template_res: Result<TableSchema, String> =
-        runtime.block_on(fetch_table_schema(&resource.db, &table));
-    let table_template = match table_template_res {
-        Ok(s) => s,
-        Err(e) => return Ok((atoms::error(), e).encode(env)),
-    };
-
-    let schema_clone = table_template.clone();
-
-    let result: Result<ResourceArc<StreamWriterResource>, String> = runtime.block_on(async {
-        let mut bulk_inserter = BulkInserter::new(resource.client.clone(), resource.db.dbname());
-        if let Some(auth) = &resource.auth {
-            bulk_inserter.set_auth(auth.clone());
+impl Request {
+    fn decode(command: Atom, args: Term) -> NifResult<Self> {
+        let args: Vec<Term> = args.decode()?;
+        match (command, args.as_slice()) {
+            (c, [sql]) if c == atoms::execute() => Ok(Self::Execute(sql.decode()?)),
+            (c, [table, rows]) if c == atoms::insert() => {
+                Ok(Self::Insert(table.decode()?, Input::new(*rows)))
+            }
+            (c, [table, _]) if c == atoms::stream_start() => Ok(Self::StreamStart(table.decode()?)),
+            (c, [writer, rows]) if c == atoms::stream_write() => {
+                Ok(Self::StreamWrite(writer.decode()?, Input::new(*rows)))
+            }
+            (c, [writer]) if c == atoms::stream_close() => Ok(Self::StreamClose(writer.decode()?)),
+            _ => Err(rustler::Error::BadArg),
         }
+    }
 
-        // Create writer without compression for better CPU efficiency
-        let writer = bulk_inserter
-            .create_bulk_stream_writer(
-                &table_template,
-                Some(BulkWriteOptions::default().with_timeout(Duration::from_secs(30))),
+    fn writer(&self) -> Option<ResourceArc<StreamWriterResource>> {
+        match self {
+            Self::StreamWrite(writer, _) | Self::StreamClose(writer) => Some(writer.clone()),
+            _ => None,
+        }
+    }
+}
+
+enum Value {
+    Ok,
+    Count(u32),
+    Batches(Vec<arrow::record_batch::RecordBatch>),
+    Writer(ResourceArc<StreamWriterResource>),
+}
+
+impl Value {
+    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
+        match self {
+            Self::Ok => atoms::ok().encode(env),
+            Self::Count(count) => (atoms::ok(), count).encode(env),
+            Self::Writer(writer) => (atoms::ok(), writer).encode(env),
+            Self::Batches(batches) => {
+                let rows: Vec<_> = batches
+                    .iter()
+                    .flat_map(|batch| types::record_batch_to_terms(env, batch))
+                    .collect();
+                (atoms::ok(), rows).encode(env)
+            }
+        }
+    }
+}
+
+enum Failure {
+    Native(String),
+    BadArg,
+    Timeout,
+    Cancelled,
+    Closed,
+    Panic,
+}
+
+impl Failure {
+    fn from_nif(env: Env, error: rustler::Error) -> Self {
+        match error {
+            rustler::Error::Term(reason) => Self::Native(
+                reason
+                    .encode(env)
+                    .decode()
+                    .unwrap_or_else(|_| "invalid input".into()),
+            ),
+            _ => Self::BadArg,
+        }
+    }
+
+    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
+        match self {
+            Self::Native(reason) => (atoms::error(), reason).encode(env),
+            Self::BadArg => (
+                atoms::error(),
+                (atoms::nif_error(), rustler::types::atom::badarg()),
             )
-            .await
-            .map_err(|e| e.to_string())?;
-
-        // Pre-allocate buffer for optimal performance
-        // capacity: 10000 rows (good for 5K-10K batch sizes)
-        // row_buffer_size: 1024 (recommended for row-to-column transformation)
-        writer
-            .alloc_rows_buffer(5000, 1024)
-            .map_err(|e| e.to_string())?;
-
-        Ok(ResourceArc::new(StreamWriterResource {
-            writer: tokio::sync::Mutex::new(Some(SendableBulkStreamWriter(writer))),
-            schema: schema_clone,
-            runtime: resource.runtime.clone(),
-        }))
-    });
-
-    match result {
-        Ok(res) => Ok((atoms::ok(), res).encode(env)),
-        Err(e) => Ok((atoms::error(), e).encode(env)),
+                .encode(env),
+            Self::Timeout => (atoms::error(), atoms::timeout()).encode(env),
+            Self::Closed => (atoms::error(), atoms::closed()).encode(env),
+            Self::Cancelled => (atoms::error(), atoms::cancelled()).encode(env),
+            Self::Panic => (atoms::error(), (atoms::nif_error(), atoms::task_panic())).encode(env),
+        }
     }
 }
 
-#[rustler::nif(schedule = "DirtyIo")]
-fn stream_write<'a>(
+struct Running {
+    client: ResourceArc<GreptimeResource>,
+    operation: Arc<Operation>,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let mut slot = self.client.operation.lock().unwrap();
+        *slot = None;
+        self.operation.finish();
+    }
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn submit<'a>(
     env: Env<'a>,
-    resource: ResourceArc<StreamWriterResource>,
-    rows_term: Vec<Term<'a>>,
+    client: ResourceArc<GreptimeResource>,
+    command: Atom,
+    arguments: Term<'a>,
+    token: Term<'a>,
+    deadline_us: i64,
 ) -> NifResult<Term<'a>> {
-    let runtime = &resource.runtime;
-    let greptime_rows = util::terms_to_rows(&resource.schema, rows_term)?;
+    let now =
+        unsafe { rustler::sys::enif_monotonic_time(rustler::sys::ErlNifTimeUnit::ERL_NIF_USEC) };
+    let remaining = deadline_us.saturating_sub(now).max(0) as u64;
+    let deadline = tokio::time::Instant::now() + Duration::from_micros(remaining);
+    let request = Request::decode(command, arguments)?;
+    let writer = request.writer();
+    let mut slot = client.operation.lock().unwrap();
+    if client.closed.load(Ordering::Acquire) || client.runtime.is_stopping() {
+        return Ok((atoms::error(), atoms::closed()).encode(env));
+    }
+    if slot.is_some() {
+        return Ok((atoms::error(), atoms::busy()).encode(env));
+    }
+    let (operation, mut cancelled) = Operation::new();
+    let operation_resource = ResourceArc::new(OperationResource(operation.clone()));
+    if operation_resource.monitor(Some(env), &env.pid()).is_none() {
+        operation.finish();
+        return Err(rustler::Error::BadArg);
+    }
+    *slot = Some(operation.clone());
+    drop(slot);
+    let running = Running {
+        client: client.clone(),
+        operation,
+    };
+    let control = running.operation.clone();
+    let pid = env.pid();
+    let output = OwnedEnv::new();
+    let token = output.save(token);
+    let runtime = client.runtime.clone();
+    let mut stopping = runtime.stopping();
+    runtime
+        .spawn(move |context| async move {
+            let mut result = {
+                let future = AssertUnwindSafe(perform(
+                    client,
+                    request,
+                    context.clone(),
+                    deadline,
+                    control.clone(),
+                ))
+                .catch_unwind();
+                tokio::pin!(future);
+                tokio::select! {
+                    biased;
+                    _ = async {
+                        if !*stopping.borrow() { let _ = stopping.changed().await; }
+                    } => Err(Failure::Closed),
+                    _ = cancelled.changed() => Err(Failure::Cancelled),
+                    _ = tokio::time::sleep_until(deadline) => Err(Failure::Timeout),
+                    value = &mut future => value.unwrap_or(Err(Failure::Panic)),
+                }
+            };
+            control.wait_cpu().await;
+            if let Err(error) = check_operation(deadline, &control) {
+                if let Ok(Value::Writer(writer)) = &result {
+                    writer.closed.store(true, Ordering::Release);
+                    context.writers.borrow_mut().remove(&writer.id);
+                }
+                result = Err(error);
+            }
+            // A cancelled stream may have submitted only part of a batch.
+            // Drop it before acknowledging reclamation; never reuse that writer.
+            if result.is_err() {
+                if let Some(writer) = writer {
+                    writer.closed.store(true, Ordering::Release);
+                    context.writers.borrow_mut().remove(&writer.id);
+                }
+            }
+            let large_reply = matches!(&result, Ok(Value::Batches(batches))
+                if batches.iter().map(|batch| batch.num_rows()).sum::<usize>() > 256);
+            let (mut output, token, encoded) = if large_reply {
+                let fallback = OwnedEnv::new();
+                let fallback_token = output.run(|env| fallback.save(token.load(env)));
+                let encoded = running
+                    .client
+                    .runtime
+                    .cpu
+                    .run(control.clone(), deadline, move || {
+                        Ok(encode_reply(output, token, result))
+                    })
+                    .await;
+                control.wait_cpu().await;
+                match encoded {
+                    Ok(reply) => reply,
+                    Err(error) => encode_reply(fallback, fallback_token, Err(error)),
+                }
+            } else {
+                encode_reply(output, token, result)
+            };
+            drop(running);
+            let _ = output.send_and_clear(&pid, |env| {
+                (atoms::greptimedb_nif(), token.load(env), encoded.load(env)).encode(env)
+            });
+        })
+        .map_err(|_| rustler::Error::Term(Box::new("runtime stopped".to_string())))?;
+    Ok((atoms::ok(), operation_resource).encode(env))
+}
 
-    let result: Result<(), String> = runtime.block_on(async {
-        let mut writer_guard = resource.writer.lock().await;
-        if let Some(writer_wrapper) = writer_guard.as_mut() {
-            let writer = &mut writer_wrapper.0;
-            let _request_id = writer
-                .write_rows_async(greptime_rows)
-                .await
-                .map_err(|e| e.to_string())?;
-            Ok(())
-        } else {
-            Err("Writer is closed".to_string())
-        }
-    });
+fn encode_reply(
+    output: OwnedEnv,
+    token: SavedTerm,
+    result: Result<Value, Failure>,
+) -> (OwnedEnv, SavedTerm, SavedTerm) {
+    let encoded = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        output.run(|env| {
+            output.save(match &result {
+                Ok(value) => value.encode(env),
+                Err(error) => error.encode(env),
+            })
+        })
+    }))
+    .unwrap_or_else(|_| output.run(|env| output.save(Failure::Panic.encode(env))));
+    (output, token, encoded)
+}
 
-    match result {
-        Ok(_) => Ok(atoms::ok().encode(env)),
-        Err(e) => Ok((atoms::error(), e).encode(env)),
+#[rustler::nif]
+fn cpu_counts() -> (usize, usize, usize, usize, usize) {
+    cpu::counts()
+}
+
+#[rustler::nif]
+fn cancel(operation: ResourceArc<OperationResource>) -> Atom {
+    operation.0.cancel();
+    atoms::ok()
+}
+
+#[rustler::nif]
+fn operation_active(operation: ResourceArc<OperationResource>) -> bool {
+    operation.0.active.load(Ordering::Acquire)
+}
+
+#[rustler::nif]
+fn discard_writer(writer: ResourceArc<StreamWriterResource>) -> Atom {
+    writer.closed.store(true, Ordering::Release);
+    writer.runtime.discard(writer.id);
+    atoms::ok()
+}
+
+#[rustler::nif]
+fn resource_counts() -> (usize, usize) {
+    operation::counts()
+}
+
+fn check_operation(deadline: tokio::time::Instant, control: &Operation) -> Result<(), Failure> {
+    if *control.cancel.borrow() {
+        Err(Failure::Cancelled)
+    } else if tokio::time::Instant::now() >= deadline {
+        Err(Failure::Timeout)
+    } else {
+        Ok(())
     }
 }
 
-#[rustler::nif(schedule = "DirtyIo")]
-fn stream_close(env: Env, resource: ResourceArc<StreamWriterResource>) -> NifResult<Term> {
-    let runtime = &resource.runtime;
-    let result: Result<(), String> = runtime.block_on(async {
-        let mut writer_guard = resource.writer.lock().await;
-        if let Some(writer_wrapper) = writer_guard.take() {
-            let writer = writer_wrapper.0;
-            writer.finish().await.map_err(|e| e.to_string())?;
-            Ok(())
-        } else {
-            Ok(())
+async fn perform(
+    client: ResourceArc<GreptimeResource>,
+    request: Request,
+    context: Rc<Context>,
+    deadline: tokio::time::Instant,
+    control: Arc<Operation>,
+) -> Result<Value, Failure> {
+    use futures::StreamExt;
+    use greptimedb_ingester::api::v1::{ColumnSchema, RowInsertRequest, RowInsertRequests, Rows};
+    let native = |e: greptimedb_ingester::Error| Failure::Native(e.to_string());
+    let check = || check_operation(deadline, &control);
+    check()?;
+    match request {
+        Request::Execute(sql) => {
+            let mut stream = client.db.query(&sql).await.map_err(native)?;
+            let mut batches = Vec::new();
+            while let Some(batch) = stream.next().await {
+                check()?;
+                batches.push(batch.map_err(native)?);
+            }
+            Ok(Value::Batches(batches))
         }
-    });
-
-    match result {
-        Ok(_) => Ok(atoms::ok().encode(env)),
-        Err(e) => Ok((atoms::error(), e).encode(env)),
+        Request::Insert(table, input) => {
+            if input.is_empty() {
+                return Ok(Value::Count(0));
+            }
+            let server = fetch_table_schema(&client.db, &table).await;
+            check()?;
+            let ts_column = client.ts_column.clone();
+            let (schema, rows) = client
+                .runtime
+                .cpu
+                .run(control.clone(), deadline, move || {
+                    input.convert(|rows| match server {
+                        Ok(schema) => {
+                            let columns: Vec<ColumnSchema> = schema
+                                .columns()
+                                .iter()
+                                .map(|c| ColumnSchema {
+                                    column_name: c.name.clone(),
+                                    datatype: c.data_type as i32,
+                                    semantic_type: c.semantic_type as i32,
+                                    ..Default::default()
+                                })
+                                .collect();
+                            let columns = util::merge_inferred_columns(columns, &rows)?;
+                            let rows = util::terms_to_proto_rows_with_columns(&columns, rows)?;
+                            Ok((columns, rows))
+                        }
+                        Err(_) => util::terms_to_schema_and_rows(
+                            rows,
+                            ts_column.as_deref().unwrap_or("ts"),
+                        ),
+                    })
+                })
+                .await?;
+            let request = RowInsertRequests {
+                inserts: vec![RowInsertRequest {
+                    table_name: table,
+                    rows: Some(Rows { schema, rows }),
+                }],
+            };
+            check()?;
+            let count = if let Some(ttl) = &client.ttl {
+                client
+                    .db
+                    .insert_with_hints(request, &[("ttl", ttl.as_str())])
+                    .await
+                    .map_err(native)?
+            } else {
+                client.db.insert(request).await.map_err(native)?
+            };
+            Ok(Value::Count(count))
+        }
+        Request::StreamStart(table) => {
+            let schema = fetch_table_schema(&client.db, &table)
+                .await
+                .map_err(Failure::Native)?;
+            check()?;
+            let mut inserter = BulkInserter::new(client.client.clone(), client.db.dbname());
+            if let Some(auth) = &client.auth {
+                inserter.set_auth(auth.clone());
+            }
+            let writer = inserter
+                .create_bulk_stream_writer(
+                    &schema,
+                    Some(BulkWriteOptions::default().with_timeout(Duration::from_secs(30))),
+                )
+                .await
+                .map_err(native)?;
+            writer.alloc_rows_buffer(5000, 1024).map_err(native)?;
+            let id = operation::writer_id();
+            context.writers.borrow_mut().insert(id, writer);
+            Ok(Value::Writer(ResourceArc::new(StreamWriterResource {
+                id,
+                schema,
+                runtime: client.runtime.clone(),
+                closed: AtomicBool::new(false),
+            })))
+        }
+        Request::StreamWrite(resource, input) => {
+            let schema = resource.schema.clone();
+            let rows = client
+                .runtime
+                .cpu
+                .run(control.clone(), deadline, move || {
+                    input.convert(|rows| util::terms_to_rows(&schema, rows))
+                })
+                .await?;
+            check()?;
+            let mut writer = context
+                .writers
+                .borrow_mut()
+                .remove(&resource.id)
+                .ok_or_else(|| Failure::Native("Writer is closed".into()))?;
+            writer.write_rows_async(rows).await.map_err(native)?;
+            if !resource.closed.load(Ordering::Acquire) {
+                context.writers.borrow_mut().insert(resource.id, writer);
+            }
+            Ok(Value::Ok)
+        }
+        Request::StreamClose(resource) => {
+            resource.closed.store(true, Ordering::Release);
+            let writer = context.writers.borrow_mut().remove(&resource.id);
+            if let Some(writer) = writer {
+                writer.finish().await.map_err(native)?;
+            }
+            Ok(Value::Ok)
+        }
     }
 }
 

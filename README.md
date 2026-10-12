@@ -4,7 +4,7 @@ High-performance Erlang client for [GreptimeDB](https://greptime.com/), built on
 
 ## Features
 
-- **High Performance**: Direct binding to the Rust Ingester SDK with per-connection Tokio runtime for optimal isolation and throughput.
+- **High Performance**: Direct binding to the Rust Ingester SDK with one shared Tokio runtime and asynchronous network tasks.
 - **Async & Sync API**: Flexible API supporting both blocking calls and non-blocking async callbacks.
 - **Stream Ingestion**: Efficient streaming support for high-throughput data ingestion.
 - **Connection Pooling**: Robust connection management implemented in Erlang using ecpool.
@@ -41,7 +41,7 @@ Initialize the client with your GreptimeDB endpoint configuration.
 Opts = #{
     endpoints => [<<"127.0.0.1:4001">>], % List of gRPC endpoints
     dbname => <<"public">>,
-    pool_size => 8,       % Optional: Number of backend connections
+    pool_size => 8,       % Optional: Number of pooled client instances
     pool_type => random   % Optional: 'random' or 'round_robin'
 },
 {ok, Client} = greptimedb_rs:start_client(Opts).
@@ -53,6 +53,32 @@ Opts = #{
 
 - `ts_column` (optional): Timestamp column name used when auto-creating tables. Default is `<<"ts">>`.
 - `ttl` (optional): TTL hint for auto-created tables. Example: `<<"3 days">>`.
+
+**Operation Timeouts:**
+
+- `request_timeout`: Positive milliseconds for query and insert; default `10000`.
+- `stream_timeout`: Positive milliseconds for stream start, write and close; default `30000`.
+
+The deadline starts when the public API accepts the call and includes library queueing, schema discovery, RPC and response consumption. Query/insert/write timeouts return `{error, timeout}` or invoke the existing asynchronous callback with that result. Stream start and close retain their existing best effort public return semantics.
+
+Timeouts cancel local work and do not undo writes already accepted by the server. Uncertain writes are not automatically retried. After a streaming write timeout or error, establish a new writer using `stream_start/3` before writing again.
+
+### Shared runtime
+
+All pools share one Tokio runtime. Defaults are two Tokio workers, one owner thread for non-`Send` SDK tasks, and two CPU workers for row conversion and large query result encoding.
+
+Configure worker counts before starting the application:
+
+```erlang
+application:load(greptimedb_rs),
+application:set_env(greptimedb_rs, runtime_workers, 2),
+application:set_env(greptimedb_rs, cpu_workers, 2),
+application:ensure_all_started(greptimedb_rs).
+```
+
+Both settings accept 1–64 and take effect on application restart. The CPU pool accepts at most `2 * cpu_workers` queued and running jobs; additional operations wait asynchronously within their deadline. Running CPU work finishes before its client slot is released after cancellation.
+
+Stopping a pool releases its own requests and writers. Stopping the application closes the shared runtime and clients. Clients with `auto_reconnect` can reconnect after a runtime owner restart.
 
 **Connection with Authentication:**
 
@@ -237,7 +263,7 @@ For optimal performance, consider these best practices:
 
 3. **Use Atom Keys**: Always use atom keys (`:timestamp`, `:ts`, `:tags`, `:fields`) in row maps. Binary keys are no longer supported and atom keys provide ~50% faster map lookups.
 
-4. **Connection Pooling**: Each connection has its own Tokio runtime for better isolation and resource management. Use `pool_size` to match your concurrency needs (default: 8).
+4. **Connection Pooling**: Each pool worker owns a client instance; all pools share the library Tokio runtime. `pool_size` controls client concurrency (default: 8); the SDK manages the underlying TCP/gRPC connections.
 
 5. **Stream for Bulk Ingestion**: For continuous high-volume writes, use streaming API (`stream_start/3`, `stream_write/2`) which maintains persistent connections and reduces connection overhead.
 
@@ -260,3 +286,13 @@ Stop the client to close all connections.
 ```erlang
 greptimedb_rs:stop_client(Client).
 ```
+
+## Regression tests
+
+Run the real network fault, runtime lifecycle and CPU cancellation tests using a GreptimeDB executable:
+
+```bash
+make regression GREPTIME_BIN=/path/to/greptime
+```
+
+The tests start and stop their own local services. Existing Common Test suites run with `make ct-docker`.

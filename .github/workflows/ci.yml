@@ -130,3 +130,13 @@ jobs:
         run: |
           source env.sh
           make ct-docker
+
+      - name: Run network and lifecycle regression tests
+        run: |
+          greptime_version=0.17.2
+          greptime_dir="$RUNNER_TEMP/greptime-regression"
+          mkdir -p "$greptime_dir"
+          curl -fL --retry 3 \
+            "https://github.com/GreptimeTeam/greptimedb/releases/download/v${greptime_version}/greptime-linux-amd64-v${greptime_version}.tar.gz" \
+            | tar -xz -C "$greptime_dir"
+          make regression GREPTIME_BIN="$greptime_dir/greptime-linux-amd64-v${greptime_version}/greptime"

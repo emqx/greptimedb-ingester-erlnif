@@ -1,4 +1,4 @@
-%% The commands are also the names of the NIF functions.
+%% Commands handled by the connection process.
 -define(cmd_connect, connect).
 -define(cmd_disconnect, disconnect).
 -define(cmd_execute, execute).

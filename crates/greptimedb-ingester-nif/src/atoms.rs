@@ -1,6 +1,18 @@
 rustler::atoms! {
     ok,
     error,
+    execute,
+    insert,
+    stream_start,
+    stream_write,
+    stream_close,
+    nif_error,
+    timeout,
+    cancelled,
+    closed,
+    busy,
+    task_panic,
+    greptimedb_nif,
     // Options
     endpoints,
     dbname,
