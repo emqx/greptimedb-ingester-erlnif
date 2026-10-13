@@ -61,7 +61,11 @@ end_per_testcase(_TestCase, Config) ->
     DropTableSql = iolist_to_binary(io_lib:format("DROP TABLE IF EXISTS ~s", [Table])),
     greptimedb_rs:query(Client, DropTableSql),
 
-    catch greptimedb_rs:stop_client(Client),
+    try
+        greptimedb_rs:stop_client(Client)
+    catch
+        _:_ -> ok
+    end,
     ok.
 
 %% ----------------------------------------

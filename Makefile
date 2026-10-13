@@ -39,6 +39,10 @@ fmt:
 	rebar3 fmt
 	cargo fmt --all -- --check
 
+.PHONY: lint
+lint:
+	rebar3 lint
+
 .PHONY: regression
 regression:
 	@test -n "$(GREPTIME_BIN)" || { echo "Set GREPTIME_BIN to the GreptimeDB executable"; exit 1; }

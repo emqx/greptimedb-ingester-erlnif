@@ -89,6 +89,9 @@ jobs:
         run: |
           rebar3 compile
 
+      - name: Check Erlang style (Elvis)
+        run: make lint
+
       - name: Package Build Artifacts
         run: |
           zip -ryq build-artifacts.zip . -x "*.git*"

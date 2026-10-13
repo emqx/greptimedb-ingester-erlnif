@@ -287,6 +287,12 @@ Stop the client to close all connections.
 greptimedb_rs:stop_client(Client).
 ```
 
+## Development checks
+
+`make fmt` formats Erlang code and checks Rust formatting. `make lint` runs Elvis
+against Erlang sources, headers, tests and `rebar.config`; rules are in
+`elvis.config`. GitHub CI checks both formatting and Elvis rules.
+
 ## Regression tests
 
 Run the real network fault, runtime lifecycle and CPU cancellation tests using a GreptimeDB executable:

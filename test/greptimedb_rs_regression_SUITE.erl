@@ -3,8 +3,12 @@
 -include_lib("common_test/include/ct.hrl").
 -compile([export_all, nowarn_export_all]).
 
-suite() -> [{timetrap, {seconds, 45}}].
-all() -> [{group, Name} || {Name, _} <- network_cases()] ++ [{group, lifecycle}, {group, cpu}].
+suite() ->
+    [{timetrap, {seconds, 45}}].
+
+all() ->
+    [{group, Name} || {Name, _} <- network_cases()] ++ [{group, lifecycle}, {group, cpu}].
+
 groups() ->
     [{Name, [], [t_network]} || {Name, _} <- network_cases()] ++
         [
@@ -48,7 +52,10 @@ init_per_suite(Config) ->
             {ok, Server} = greptimedb_test_server:start(Binary, ?config(priv_dir, Config)),
             [{server, Server} | Config]
     end.
-end_per_suite(Config) -> greptimedb_test_server:stop(?config(server, Config)).
+
+end_per_suite(Config) ->
+    greptimedb_test_server:stop(?config(server, Config)).
+
 init_per_group(cpu, Config) ->
     [{cpu_workers, 1} | Config];
 init_per_group(Name, Config) ->
@@ -56,7 +63,9 @@ init_per_group(Name, Config) ->
         {Name, Case} -> [{network_case, Case} | Config];
         false -> Config
     end.
-end_per_group(_, _) -> ok.
+
+end_per_group(_, _) ->
+    ok.
 
 init_per_testcase(_, Config) ->
     logger:set_primary_config(level, warning),
@@ -64,9 +73,16 @@ init_per_testcase(_, Config) ->
     application:set_env(greptimedb_rs, cpu_workers, proplists:get_value(cpu_workers, Config, 2)),
     {ok, _} = application:ensure_all_started(greptimedb_rs),
     Config.
+
 end_per_testcase(_, Config) ->
     lists:foreach(
-        fun(Name) -> catch greptimedb_rs:stop_client({regression, Name}) end,
+        fun(Name) ->
+            try
+                greptimedb_rs:stop_client({regression, Name})
+            catch
+                _:_ -> ok
+            end
+        end,
         [1, 2, healthy]
     ),
     application:stop(greptimedb_rs),
@@ -93,7 +109,9 @@ client(Server, Name, Size, Timeout, Direct) ->
     {ok, [[1]]} = greptimedb_rs:query(Client, <<"SELECT 1">>),
     Client.
 
-row() -> #{timestamp => 1700000000000, fields => #{<<"reading">> => 7}}.
+row() ->
+    #{timestamp => 1700000000000, fields => #{<<"reading">> => 7}}.
+
 start_request(Fun) ->
     Parent = self(),
     Ref = make_ref(),
@@ -104,6 +122,7 @@ start_request(Fun) ->
         watch_callbacks(Parent, Monitor, Ref)
     end),
     {Pid, Ref}.
+
 %% Keep callback recipients alive so a second completion is observable.
 watch_callbacks(Parent, Monitor, Ref) ->
     receive
@@ -112,18 +131,26 @@ watch_callbacks(Parent, Monitor, Ref) ->
         {_, Result} ->
             Parent ! {Ref, {duplicate_callback, Result}, 0},
             watch_callbacks(Parent, Monitor, Ref)
+    after 60000 ->
+        erlang:demonitor(Monitor, [flush]),
+        ok
     end.
+
 result({_, Ref}, Timeout) ->
     receive
         {Ref, Result, Elapsed} -> {Result, Elapsed}
     after Timeout -> ct:fail({missing_result, Ref})
     end.
+
 no_result({_, Ref}) ->
     receive
         {Ref, Result, _} -> ct:fail({duplicate_result, Result})
     after 200 -> ok
     end.
-wait(Fun, Timeout) -> wait_until(Fun, erlang:monotonic_time(millisecond) + Timeout).
+
+wait(Fun, Timeout) ->
+    wait_until(Fun, erlang:monotonic_time(millisecond) + Timeout).
+
 wait_until(Fun, Deadline) ->
     Value = Fun(),
     case Value of
@@ -138,10 +165,15 @@ wait_until(Fun, Deadline) ->
                     ct:fail({condition_timeout, Value})
             end
     end.
-counts(Expected) -> wait(fun() -> greptimedb_rs_nif:resource_counts() =:= Expected end, 5000).
-kill_callers(Requests) -> lists:foreach(fun({Pid, _}) -> exit(Pid, kill) end, Requests).
+
+counts(Expected) ->
+    wait(fun() -> greptimedb_rs_nif:resource_counts() =:= Expected end, 5000).
+
+kill_callers(Requests) ->
+    lists:foreach(fun({Pid, _}) -> exit(Pid, kill) end, Requests).
 
 %% Keep all API variants and pool layouts in one table; assertions are shared.
+
 t_network(Config) ->
     Server = ?config(server, Config),
     {Mode, Sizes, Fault} = ?config(network_case, Config),
@@ -161,12 +193,7 @@ t_network(Config) ->
                     <<"CREATE TABLE regression_stream (ts TIMESTAMP TIME INDEX, reading INT64)">>
                 ),
                 [
-                    begin
-                        {ok, Stream} = greptimedb_rs:stream_start(
-                            Client, <<"regression_stream">>, row()
-                        ),
-                        Stream
-                    end
+                    start_stream(Client)
                  || Client <- Clients
                 ];
             _ ->
@@ -215,6 +242,10 @@ t_network(Config) ->
     end,
     lists:foreach(fun no_result/1, Requests).
 
+start_stream(Client) ->
+    {ok, Stream} = greptimedb_rs:stream_start(Client, <<"regression_stream">>, row()),
+    Stream.
+
 invoke(query, Client) ->
     greptimedb_rs:query(Client, <<"SELECT 1">>);
 invoke(query_async, Client) ->
@@ -231,6 +262,7 @@ invoke(stream_write_async, Stream) ->
     async(fun(Cb) ->
         greptimedb_rs:stream_write_async(Stream, [row()], Cb)
     end).
+
 async(Fun) ->
     Parent = self(),
     Ref = make_ref(),
@@ -239,17 +271,29 @@ async(Fun) ->
         {Ref, Result} -> Result
     after 10000 -> ct:fail(callback_timeout)
     end.
+
 recover(Client, Table) ->
     {ok, 1} = greptimedb_rs:insert(Client, Table, [row()]),
     {ok, [[7]]} = greptimedb_rs:query(Client, <<"SELECT reading FROM ", Table/binary>>),
     ok.
 
-t_queued(Config) -> lifecycle(queued, Config).
-t_caller_cancel(Config) -> lifecycle(caller_cancel, Config).
-t_pool_stop(Config) -> lifecycle(pool_stop, Config).
-t_socket_exit(Config) -> lifecycle(socket_exit, Config).
-t_library_stop(Config) -> lifecycle(library_stop, Config).
-t_owner_exit(Config) -> lifecycle(owner_exit, Config).
+t_queued(Config) ->
+    lifecycle(queued, Config).
+
+t_caller_cancel(Config) ->
+    lifecycle(caller_cancel, Config).
+
+t_pool_stop(Config) ->
+    lifecycle(pool_stop, Config).
+
+t_socket_exit(Config) ->
+    lifecycle(socket_exit, Config).
+
+t_library_stop(Config) ->
+    lifecycle(library_stop, Config).
+
+t_owner_exit(Config) ->
+    lifecycle(owner_exit, Config).
 
 lifecycle(Mode, Config) ->
     Server = ?config(server, Config),
@@ -342,6 +386,7 @@ wait_connected(Client) ->
         end,
         5000
     ).
+
 pool_cycles(Server, Client, Healthy) ->
     ok = greptimedb_rs:stop_client(Client),
     ok = greptimedb_rs:stop_client(Healthy),
@@ -360,10 +405,18 @@ pool_cycles(Server, Client, Healthy) ->
     ok = greptimedb_rs:stop_client(C1),
     counts({1, 0}).
 
-t_cpu_cancel(Config) -> cpu(cancel, Config).
-t_cpu_timeout(Config) -> cpu(timeout, Config).
-t_cpu_stop(Config) -> cpu(library_stop, Config).
-t_query_cancel(Config) -> cpu(query_cancel, Config).
+t_cpu_cancel(Config) ->
+    cpu(cancel, Config).
+
+t_cpu_timeout(Config) ->
+    cpu(timeout, Config).
+
+t_cpu_stop(Config) ->
+    cpu(library_stop, Config).
+
+t_query_cancel(Config) ->
+    cpu(query_cancel, Config).
+
 cpu(Mode, Config) ->
     Server = ?config(server, Config),
     Timeout =
@@ -386,7 +439,10 @@ cpu(Mode, Config) ->
                 fun() ->
                     greptimedb_rs:query(
                         Client,
-                        <<"SELECT a.reading FROM regression_cpu a CROSS JOIN regression_cpu b LIMIT 600000">>
+                        <<
+                            "SELECT a.reading FROM regression_cpu a "
+                            "CROSS JOIN regression_cpu b LIMIT 600000"
+                        >>
                     )
                 end;
             _ ->

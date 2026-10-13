@@ -3,17 +3,40 @@
 -export([
     start/2, stop/1, endpoint/1, backend/1, pause/1, release/1, disconnect/1, headers/1, restart/1
 ]).
--export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
+-export([
+    init/1,
+    handle_call/3,
+    handle_cast/2,
+    handle_info/2,
+    terminate/2
+]).
 
-start(Binary, Directory) -> gen_server:start(?MODULE, [Binary, Directory], []).
-stop(Server) -> gen_server:stop(Server, normal, 15000).
-endpoint(Server) -> gen_server:call(Server, endpoint).
-backend(Server) -> gen_server:call(Server, backend).
-pause(Server) -> gen_server:call(Server, pause).
-release(Server) -> gen_server:call(Server, release).
-disconnect(Server) -> gen_server:call(Server, disconnect).
-headers(Server) -> gen_server:call(Server, headers).
-restart(Server) -> gen_server:call(Server, restart, 40000).
+start(Binary, Directory) ->
+    gen_server:start(?MODULE, [Binary, Directory], []).
+
+stop(Server) ->
+    gen_server:stop(Server, normal, 15000).
+
+endpoint(Server) ->
+    gen_server:call(Server, endpoint).
+
+backend(Server) ->
+    gen_server:call(Server, backend).
+
+pause(Server) ->
+    gen_server:call(Server, pause).
+
+release(Server) ->
+    gen_server:call(Server, release).
+
+disconnect(Server) ->
+    gen_server:call(Server, disconnect).
+
+headers(Server) ->
+    gen_server:call(Server, headers).
+
+restart(Server) ->
+    gen_server:call(Server, restart, 40000).
 
 init([Binary, Directory]) ->
     process_flag(trap_exit, true),
@@ -82,7 +105,8 @@ handle_call(restart, _, State) ->
     {reply, ok, start_backend(close_sockets(State))};
 %% Forward real HTTP/2 headers, but hold response bodies and final trailers.
 %% Keeping connection control frames flowing isolates an RPC that never finishes.
-handle_call({frame, Socket, Stream, Type, Flags, Packet}, _, State = #{paused := true}) when
+
+handle_call({frame, Socket, Stream, Type, Flags, Packet}, _, #{paused := true} = State) when
     Stream =/= 0, Type =:= 0; Stream =/= 0, Type =:= 1; Stream =/= 0, Type =:= 9
 ->
     Headers = (maps:get(headers, State))#{{Socket, Stream} => true},
@@ -100,12 +124,13 @@ handle_call({frame, Socket, _, _, _, Packet}, _, State) ->
 
 handle_cast({sockets, Client, Backend}, State) ->
     {noreply, State#{sockets := [Client, Backend | maps:get(sockets, State)]}}.
-handle_info({Port, {data, Data}}, State = #{backend_port := Port}) ->
+
+handle_info({Port, {data, Data}}, #{backend_port := Port} = State) ->
     file:write(maps:get(log, State), Data),
     {noreply, State};
-handle_info({Port, {exit_status, Status}}, State = #{backend_port := Port}) ->
+handle_info({Port, {exit_status, Status}}, #{backend_port := Port} = State) ->
     {stop, {database_exit, Status}, State};
-handle_info({'EXIT', Pid, Reason}, State = #{acceptor := Pid}) ->
+handle_info({'EXIT', Pid, Reason}, #{acceptor := Pid} = State) ->
     {stop, {acceptor_exit, Reason}, State};
 handle_info(_, State) ->
     {noreply, State}.
@@ -121,7 +146,9 @@ listen() ->
     {ok, Socket} = gen_tcp:listen(0, [binary, {active, false}, {ip, {127, 0, 0, 1}}]),
     {ok, {_, Port}} = inet:sockname(Socket),
     {Socket, Port}.
-address(Port) -> iolist_to_binary(io_lib:format("127.0.0.1:~B", [Port])).
+
+address(Port) ->
+    iolist_to_binary(io_lib:format("127.0.0.1:~B", [Port])).
 
 start_backend(State) ->
     Port = open_port(
@@ -158,6 +185,7 @@ await_backend(Port, State, Deadline) ->
         _ ->
             retry_backend(Port, State, Deadline)
     end.
+
 retry_backend(Port, State, Deadline) ->
     true = erlang:monotonic_time(millisecond) < Deadline,
     timer:sleep(50),
@@ -176,8 +204,13 @@ stop_backend(#{backend_port := Port, backend_pid := Pid, log := Log}) ->
                     signal(Pid, "-KILL"),
                     wait_exit(Port, Log, 5000)
             end,
-            catch port_close(Port)
+            try
+                port_close(Port)
+            catch
+                error:badarg -> ok
+            end
     end.
+
 signal(Pid, Signal) ->
     Port = open_port(
         {spawn_executable, os:find_executable("kill")},
@@ -185,8 +218,14 @@ signal(Pid, Signal) ->
     ),
     receive
         {Port, {exit_status, _}} -> ok
-    after 1000 -> catch port_close(Port)
+    after 1000 ->
+        try
+            port_close(Port)
+        catch
+            error:badarg -> ok
+        end
     end.
+
 wait_exit(Port, Log, Timeout) ->
     Deadline = erlang:monotonic_time(millisecond) + Timeout,
     receive
@@ -217,6 +256,7 @@ accept(Listener, RpcPort, Server) ->
         {error, closed} ->
             ok
     end.
+
 reader(Source, Destination, Direction, Server) ->
     Pid = spawn(fun() ->
         receive
@@ -232,17 +272,21 @@ reader(Source, Destination, Direction, Server) ->
                     end,
                     frames(Source, Destination, Direction, Server)
                 catch
-                    throw:disconnected -> ok
+                    error:disconnected -> ok
                 after
                     gen_tcp:close(Source),
                     gen_tcp:close(Destination)
                 end
+        after 5000 ->
+            gen_tcp:close(Source),
+            gen_tcp:close(Destination)
         end
     end),
     case gen_tcp:controlling_process(Source, Pid) of
         ok -> Pid ! start;
         {error, closed} -> exit(Pid, shutdown)
     end.
+
 frames(Source, Destination, Direction, Server) ->
     case gen_tcp:recv(Source, 9) of
         {ok, Header = <<Length:24, Type:8, Flags:8, _:1, Stream:31>>} ->
@@ -268,5 +312,5 @@ frames(Source, Destination, Direction, Server) ->
 recv(Socket, Length) ->
     case gen_tcp:recv(Socket, Length) of
         {ok, Data} -> Data;
-        {error, _} -> throw(disconnected)
+        {error, _} -> error(disconnected)
     end.

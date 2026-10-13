@@ -18,8 +18,8 @@
 
 -include("greptimedb_rs.hrl").
 
--behavior(gen_server).
--behavior(ecpool_worker).
+-behaviour(gen_server).
+-behaviour(ecpool_worker).
 
 -record(state, {
     client :: client_ref() | undefined,
@@ -31,11 +31,6 @@
     pending = #{},
     current = undefined
 }).
-
--define(client_ref(Ref), #state{client = Ref}).
-
--define(is_ok, {ok, _}).
--define(is_err, {error, _}).
 
 -export([
     connect/1,
@@ -52,6 +47,15 @@
     terminate/2
 ]).
 
+-type command() ::
+    ?CMD_CONNECT
+    | ?CMD_DISCONNECT
+    | ?CMD_EXECUTE
+    | ?CMD_INSERT
+    | ?CMD_STREAM_START
+    | ?CMD_STREAM_WRITE
+    | ?CMD_STREAM_CLOSE.
+
 -type args() :: term().
 -type conn() :: pid().
 -type opts() :: greptimedb_rs:opts().
@@ -64,9 +68,9 @@
 sync_command(Conn, Command, Args) ->
     Timeout =
         case Command of
-            ?cmd_stream_start -> 30000;
-            ?cmd_stream_write -> 30000;
-            ?cmd_stream_close -> 30000;
+            ?CMD_STREAM_START -> 30000;
+            ?CMD_STREAM_WRITE -> 30000;
+            ?CMD_STREAM_CLOSE -> 30000;
             _ -> 10000
         end,
     sync_command(Conn, Command, Args, erlang:monotonic_time(microsecond) + Timeout * 1000).
@@ -92,7 +96,7 @@ init([Opts0]) ->
     process_flag(trap_exit, true),
     RuntimeMonitor = erlang:monitor(process, greptimedb_rs_runtime),
     Opts = unwrap_password(Opts0),
-    case apply_nif(?cmd_connect, [Opts]) of
+    case apply_nif(?CMD_CONNECT, [Opts]) of
         {ok, ClientRef} ->
             log_connect_info(Opts0),
             {ok, #state{
@@ -122,7 +126,10 @@ handle_info({async, Cmd, Args, Callback, Deadline}, State) ->
     {noreply, enqueue(Cmd, Args, Deadline, {async, Callback}, undefined, State)};
 handle_info(?ASYNC_REQ(Cmd, Args, Callback), State) ->
     handle_info({async, Cmd, Args, Callback, local_deadline(Cmd, State)}, State);
-handle_info({greptimedb_nif, {Gen, Ref}, Result}, State = #state{generation = Gen, current = Ref}) ->
+handle_info(
+    {greptimedb_nif, {Gen, Ref}, Result},
+    #state{generation = Gen, current = Ref} = State
+) ->
     Req = maps:get(Ref, State#state.pending),
     Expired =
         maps:get(replied, Req) orelse erlang:monotonic_time(microsecond) >= maps:get(deadline, Req),
@@ -145,17 +152,17 @@ handle_info({greptimedb_nif, _, {ok, Writer}}, State) when is_reference(Writer) 
     {noreply, State};
 handle_info({deadline, Ref}, State) ->
     {noreply, expire(Ref, {error, timeout}, State)};
-handle_info({'DOWN', Monitor, process, _Pid, _Reason}, State = #state{runtime_monitor = Monitor}) ->
+handle_info({'DOWN', Monitor, process, _Pid, _Reason}, #state{runtime_monitor = Monitor} = State) ->
     {stop, normal, State};
 handle_info({'DOWN', Monitor, process, _Pid, _Reason}, State) ->
     Refs = [
         Ref
      || {Ref, Req} <- maps:to_list(State#state.pending), maps:get(monitor, Req) =:= Monitor
     ],
-    {noreply, lists:foldl(fun(Ref, S) -> abandon(Ref, S) end, State, Refs)};
-handle_info({reclaim, Ref}, State = #state{current = Ref}) ->
+    {noreply, lists:foldl(fun abandon/2, State, Refs)};
+handle_info({reclaim, Ref}, #state{current = Ref} = State) ->
     Req = maps:get(Ref, State#state.pending),
-    case ?NIF_MODULE:operation_active(maps:get(operation, Req)) of
+    case greptimedb_rs_nif:operation_active(maps:get(operation, Req)) of
         false ->
             Next = finish_command(Req, {error, cancelled}, true, State),
             {noreply, release(Ref, Next)};
@@ -168,7 +175,7 @@ handle_info(continue, State) ->
 handle_info(_, State) ->
     {noreply, State}.
 
-terminate(_Reason, State = #state{client = ClientRef, pending = Pending}) ->
+terminate(_Reason, #state{client = ClientRef, pending = Pending} = State) ->
     case ClientRef of
         undefined -> ok;
         _ -> apply_nif(disconnect, [ClientRef])
@@ -177,8 +184,14 @@ terminate(_Reason, State = #state{client = ClientRef, pending = Pending}) ->
         fun(_, Req) ->
             clear_request(Req),
             case maps:get(replied, Req) of
-                false -> catch deliver(Req, {error, closed});
-                true -> ok
+                false ->
+                    try
+                        deliver(Req, {error, closed})
+                    catch
+                        _:_ -> ok
+                    end;
+                true ->
+                    ok
             end
         end,
         Pending
@@ -203,7 +216,7 @@ enqueue(Cmd, Args, Deadline, Recipient, Monitor, State) ->
     Pending = (State#state.pending)#{Ref => Req},
     dispatch(State#state{pending = Pending, waiting = queue:in(Ref, State#state.waiting)}, 100).
 
-dispatch(State = #state{current = Ref}, _) when Ref =/= undefined -> State;
+dispatch(#state{current = Ref} = State, _) when Ref =/= undefined -> State;
 dispatch(State, 0) ->
     self() ! continue,
     State;
@@ -250,12 +263,12 @@ start_request(Ref, Req, State, Budget) ->
             dispatch(State#state{pending = maps:remove(Ref, State#state.pending)}, Budget - 1)
     end.
 
-nif_args(?cmd_stream_write, [Table, Rows], #state{writers = Writers}) ->
+nif_args(?CMD_STREAM_WRITE, [Table, Rows], #state{writers = Writers}) ->
     case maps:find(Table, Writers) of
         {ok, Writer} -> {ok, [Writer, Rows]};
         error -> {error, no_writer}
     end;
-nif_args(?cmd_stream_close, [Table], #state{writers = Writers}) ->
+nif_args(?CMD_STREAM_CLOSE, [Table], #state{writers = Writers}) ->
     case maps:find(Table, Writers) of
         {ok, Writer} -> {ok, [Writer]};
         error -> {error, no_writer}
@@ -281,7 +294,7 @@ abandon(Ref, State) ->
     Req = maps:get(Ref, State#state.pending),
     cancel_request(Ref, Req, State).
 
-cancel_request(Ref, Req, State = #state{current = Ref}) ->
+cancel_request(Ref, Req, #state{current = Ref} = State) ->
     clear_request(Req),
     _ = apply_nif(cancel, [maps:get(operation, Req)]),
     erlang:send_after(10, self(), {reclaim, Ref}),
@@ -297,14 +310,14 @@ release(Ref, State) ->
         State#state{current = undefined, pending = maps:remove(Ref, State#state.pending)}, 100
     ).
 
-finish_command(#{cmd := ?cmd_stream_start, args := [Table, _]}, {ok, Writer}, false, State) ->
+finish_command(#{cmd := ?CMD_STREAM_START, args := [Table, _]}, {ok, Writer}, false, State) ->
     State#state{writers = (State#state.writers)#{Table => Writer}};
-finish_command(#{cmd := ?cmd_stream_start}, {ok, Writer}, true, State) ->
+finish_command(#{cmd := ?CMD_STREAM_START}, {ok, Writer}, true, State) ->
     apply_nif(discard_writer, [Writer]),
     State;
-finish_command(#{cmd := ?cmd_stream_close, args := [Table]}, _, _, State) ->
+finish_command(#{cmd := ?CMD_STREAM_CLOSE, args := [Table]}, _, _, State) ->
     discard(Table, State);
-finish_command(#{cmd := ?cmd_stream_write, args := [Table, _]}, Result, Expired, State) ->
+finish_command(#{cmd := ?CMD_STREAM_WRITE, args := [Table, _]}, Result, Expired, State) ->
     case Result =/= ok orelse Expired of
         true -> discard(Table, State);
         false -> State
@@ -321,7 +334,7 @@ discard(Table, State) ->
             State
     end.
 
-public_result(#{cmd := ?cmd_stream_close}, _) -> ok;
+public_result(#{cmd := ?CMD_STREAM_CLOSE}, _) -> ok;
 public_result(_, Result) -> Result.
 
 clear_request(Req) ->
@@ -337,9 +350,9 @@ deliver(#{recipient := {async, {Fun, Args}}}, Result) -> erlang:apply(Fun, Args 
 local_deadline(Cmd, #state{opts = Opts}) ->
     Key =
         case Cmd of
-            ?cmd_stream_start -> stream_timeout;
-            ?cmd_stream_write -> stream_timeout;
-            ?cmd_stream_close -> stream_timeout;
+            ?CMD_STREAM_START -> stream_timeout;
+            ?CMD_STREAM_WRITE -> stream_timeout;
+            ?CMD_STREAM_CLOSE -> stream_timeout;
             _ -> request_timeout
         end,
     Default =

@@ -46,14 +46,20 @@
 
 -export_type([
     client/0,
-    opts/0
+    opts/0,
+    stream_client/0,
+    sql/0,
+    result/0,
+    reason/0,
+    pool_name/0,
+    callback/0
 ]).
 
 %% ===================================================================
 %% Type defs
 %% ===================================================================
 
--define(pool_name(PoolName), #{pool_name := PoolName}).
+-define(POOL_NAME(PoolName), #{pool_name := PoolName}).
 
 -type opts() :: #{
     endpoints := [binary()],
@@ -131,7 +137,7 @@ start_client(Opts) ->
 
 %% @doc Stop the connection pool and release resources.
 -spec stop_client(client() | pool_name()) -> ok.
-stop_client(?pool_name(PoolName)) ->
+stop_client(?POOL_NAME(PoolName)) ->
     ecpool:stop_sup_pool(PoolName);
 stop_client(PoolName) ->
     ecpool:stop_sup_pool(PoolName).
@@ -144,12 +150,12 @@ stop_client(PoolName) ->
 %% Picks a connection from the pool to do the write operation.
 -spec insert(client(), binary(), [map()]) -> {ok, integer()} | {error, reason()}.
 insert(Client, Table, Rows) ->
-    call_sync(Client, ?cmd_insert, [Table, Rows]).
+    call_sync(Client, ?CMD_INSERT, [Table, Rows]).
 
 %% @doc Batch write data (asynchronous).
 -spec insert_async(client(), binary(), [map()], callback()) -> {ok, pid()}.
 insert_async(Client, Table, Rows, ResultCallback) ->
-    call_async(Client, ?cmd_insert, [Table, Rows], ResultCallback).
+    call_async(Client, ?CMD_INSERT, [Table, Rows], ResultCallback).
 
 %% ===================================================================
 %% Write - Execute Query
@@ -158,12 +164,12 @@ insert_async(Client, Table, Rows, ResultCallback) ->
 %% @doc Execute SQL query (blocking).
 -spec query(client(), sql()) -> {ok, result()} | {error, reason()}.
 query(Client, Sql) ->
-    call_sync(Client, ?cmd_execute, [Sql]).
+    call_sync(Client, ?CMD_EXECUTE, [Sql]).
 
 %% @doc Execute SQL query (asynchronous).
 -spec query_async(client(), sql(), callback()) -> {ok, pid()}.
 query_async(Client, Sql, ResultCallback) ->
-    call_async(Client, ?cmd_execute, [Sql], ResultCallback).
+    call_async(Client, ?CMD_EXECUTE, [Sql], ResultCallback).
 
 %% ===================================================================
 %% Write - Streaming Write
@@ -173,8 +179,8 @@ query_async(Client, Sql, ResultCallback) ->
 %% Returns a StreamClient handle that binds the Table context to the Client.
 %% It attempts to initialize the stream on all workers (best effort).
 -spec stream_start(client(), binary(), map()) -> {ok, stream_client()}.
-stream_start(?pool_name(PoolName) = Client, Table, FirstRow) ->
-    Deadline = deadline(Client, ?cmd_stream_start),
+stream_start(?POOL_NAME(PoolName) = Client, Table, FirstRow) ->
+    Deadline = deadline(Client, ?CMD_STREAM_START),
     Workers = ecpool:workers(PoolName),
     %% Attempt to pre-warm all workers. Ignore errors/ignored returns.
     lists:foreach(
@@ -182,7 +188,7 @@ stream_start(?pool_name(PoolName) = Client, Table, FirstRow) ->
             try
                 {ok, Conn} = ecpool_worker:client(Worker),
                 greptimedb_rs_sock:sync_command(
-                    Conn, ?cmd_stream_start, [Table, FirstRow], Deadline
+                    Conn, ?CMD_STREAM_START, [Table, FirstRow], Deadline
                 )
             catch
                 _:_ -> ok
@@ -195,14 +201,14 @@ stream_start(?pool_name(PoolName) = Client, Table, FirstRow) ->
 %% @doc Stop the stream for a specific table.
 %% Releases stream resources on all workers in the pool.
 -spec stream_close(stream_client()) -> ok.
-stream_close({stream_client, ?pool_name(PoolName) = Client, Table}) ->
-    Deadline = deadline(Client, ?cmd_stream_close),
+stream_close({stream_client, ?POOL_NAME(PoolName) = Client, Table}) ->
+    Deadline = deadline(Client, ?CMD_STREAM_CLOSE),
     Workers = ecpool:workers(PoolName),
     lists:foreach(
         fun({_Name, Worker}) ->
             try
                 {ok, Conn} = ecpool_worker:client(Worker),
-                greptimedb_rs_sock:sync_command(Conn, ?cmd_stream_close, [Table], Deadline)
+                greptimedb_rs_sock:sync_command(Conn, ?CMD_STREAM_CLOSE, [Table], Deadline)
             catch
                 _:_ -> ok
             end
@@ -215,18 +221,18 @@ stream_close({stream_client, ?pool_name(PoolName) = Client, Table}) ->
 %% The worker lazily initializes the stream writer if needed.
 -spec stream_write(stream_client(), [map()]) -> ok | {error, term()}.
 stream_write({stream_client, Client, Table}, Rows) ->
-    call_sync(Client, ?cmd_stream_write, [Table, Rows]).
+    call_sync(Client, ?CMD_STREAM_WRITE, [Table, Rows]).
 
 %% @doc Write data to the stream (asynchronous).
 -spec stream_write_async(stream_client(), [map()], callback()) -> {ok, pid()}.
 stream_write_async({stream_client, Client, Table}, Rows, Callback) ->
-    call_async(Client, ?cmd_stream_write, [Table, Rows], Callback).
+    call_async(Client, ?CMD_STREAM_WRITE, [Table, Rows], Callback).
 
 %% ===================================================================
 %% Helpers
 %% ===================================================================
 
-call_sync(?pool_name(PoolName) = Client, Cmd, Args) ->
+call_sync(?POOL_NAME(PoolName) = Client, Cmd, Args) ->
     Deadline = deadline(Client, Cmd),
     ecpool:with_client(
         PoolName,
@@ -235,7 +241,7 @@ call_sync(?pool_name(PoolName) = Client, Cmd, Args) ->
         end
     ).
 
-call_async(?pool_name(PoolName) = Client, Cmd, Args, Callback) ->
+call_async(?POOL_NAME(PoolName) = Client, Cmd, Args, Callback) ->
     Deadline = deadline(Client, Cmd),
     ecpool:with_client(
         PoolName,
@@ -249,9 +255,9 @@ deadline(Client, Cmd) ->
     Opts = maps:get(conn_opts, Client, #{}),
     Timeout =
         case Cmd of
-            ?cmd_stream_start -> maps:get(stream_timeout, Opts, 30000);
-            ?cmd_stream_write -> maps:get(stream_timeout, Opts, 30000);
-            ?cmd_stream_close -> maps:get(stream_timeout, Opts, 30000);
+            ?CMD_STREAM_START -> maps:get(stream_timeout, Opts, 30000);
+            ?CMD_STREAM_WRITE -> maps:get(stream_timeout, Opts, 30000);
+            ?CMD_STREAM_CLOSE -> maps:get(stream_timeout, Opts, 30000);
             _ -> maps:get(request_timeout, Opts, 10000)
         end,
     erlang:monotonic_time(microsecond) + Timeout * 1000.
