@@ -295,4 +295,4 @@ Run the real network fault, runtime lifecycle and CPU cancellation tests using a
 make regression GREPTIME_BIN=/path/to/greptime
 ```
 
-The tests start and stop their own local services. Existing Common Test suites run with `make ct-docker`.
+The Common Test suite starts and stops its own local database and transparent HTTP/2 fault proxy. Results use the standard Common Test report. Existing TCP, TLS and authentication suites run with `make ct-docker`.

@@ -40,10 +40,6 @@ fmt:
 	cargo fmt --all -- --check
 
 .PHONY: regression
-regression: compile
+regression:
 	@test -n "$(GREPTIME_BIN)" || { echo "Set GREPTIME_BIN to the GreptimeDB executable"; exit 1; }
-	mkdir -p _build/regression
-	erlc -Werror -o _build/regression test/support/*.erl
-	python3 test/support/run_io_regression.py --greptime-bin "$(GREPTIME_BIN)" --out _build/regression/io
-	python3 test/support/run_async_lifecycle.py --greptime-bin "$(GREPTIME_BIN)" --out _build/regression/async
-	python3 test/support/run_cpu_lifecycle.py --greptime-bin "$(GREPTIME_BIN)" --out _build/regression/cpu
+	GREPTIME_BIN="$(abspath $(GREPTIME_BIN))" ERL_FLAGS="+S 4:4 +SDcpu 2:2 +SDio 4" rebar3 ct --suite test/greptimedb_rs_regression_SUITE.erl --readable true
