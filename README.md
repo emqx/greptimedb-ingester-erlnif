@@ -78,6 +78,8 @@ application:ensure_all_started(greptimedb_rs).
 
 Both settings accept 1–64 and take effect on application restart. The CPU pool accepts at most `2 * cpu_workers` queued and running jobs; additional operations wait asynchronously within their deadline. Running CPU work finishes before its client slot is released after cancellation.
 
+Application startup returns an error when native runtime creation fails. Async callback exceptions are logged as `greptimedb_callback_failed`; the worker continues processing requests.
+
 Stopping a pool releases its own requests and writers. Stopping the application closes the shared runtime and clients. Clients with `auto_reconnect` can reconnect after a runtime owner restart.
 
 **Connection with Authentication:**

@@ -1,10 +1,11 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::future::Future;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 
 use crate::data_conversion_pool::DataConversionPool;
@@ -153,22 +154,31 @@ pub fn start(workers: usize, cpu_workers: usize) -> Result<Arc<RuntimeOwner>, St
     if !(1..=64).contains(&cpu_workers) {
         return Err("cpu_workers must be between 1 and 64".into());
     }
-    let mut shared = SHARED.lock().unwrap();
+    let mut shared = shared_state();
     if let Some(previous) = shared.as_ref() {
         if !*previous.shutdown.borrow() {
             return Err("runtime already started".into());
         }
         previous.stop();
     }
-    let runtime = Arc::new(RuntimeOwner::new(workers, cpu_workers).map_err(|e| e.to_string())?);
+    // Catch initialization panics before they unwind through the shared-state lock.
+    let runtime = catch_unwind(AssertUnwindSafe(|| RuntimeOwner::new(workers, cpu_workers)))
+        .map_err(|panic| {
+            let reason = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("unknown panic");
+            format!("runtime initialization panicked: {reason}")
+        })?
+        .map_err(|e| e.to_string())?;
+    let runtime = Arc::new(runtime);
     *shared = Some(runtime.clone());
     Ok(runtime)
 }
 
 pub fn shared() -> Result<Arc<RuntimeOwner>, String> {
-    SHARED
-        .lock()
-        .unwrap()
+    shared_state()
         .as_ref()
         .filter(|runtime| !*runtime.shutdown.borrow())
         .cloned()
@@ -176,13 +186,27 @@ pub fn shared() -> Result<Arc<RuntimeOwner>, String> {
 }
 
 pub fn stop(resource: &RuntimeResource) {
-    let mut shared = SHARED.lock().unwrap();
+    let mut shared = shared_state();
     resource.0.stop();
     if shared
         .as_ref()
         .is_some_and(|runtime| Arc::ptr_eq(runtime, &resource.0))
     {
         *shared = None;
+    }
+}
+
+fn shared_state() -> MutexGuard<'static, Option<Arc<RuntimeOwner>>> {
+    match SHARED.lock() {
+        Ok(shared) => shared,
+        Err(poisoned) => {
+            let mut shared = poisoned.into_inner();
+            if let Some(previous) = shared.take() {
+                previous.stop();
+            }
+            SHARED.clear_poison();
+            shared
+        }
     }
 }
 

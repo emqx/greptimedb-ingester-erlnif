@@ -7,7 +7,8 @@ suite() ->
     [{timetrap, {seconds, 45}}].
 
 all() ->
-    [{group, Name} || {Name, _} <- network_cases()] ++ [{group, lifecycle}, {group, cpu}].
+    [{group, Name} || {Name, _} <- network_cases()] ++
+        [{group, lifecycle}, {group, cpu}, {group, failures}].
 
 groups() ->
     [{Name, [], [t_network]} || {Name, _} <- network_cases()] ++
@@ -15,7 +16,14 @@ groups() ->
             {lifecycle, [], [
                 t_queued, t_caller_cancel, t_pool_stop, t_socket_exit, t_library_stop, t_owner_exit
             ]},
-            {cpu, [], [t_cpu_cancel, t_cpu_timeout, t_cpu_stop, t_query_cancel]}
+            {cpu, [], [t_cpu_cancel, t_cpu_timeout, t_cpu_stop, t_query_cancel]},
+            {failures, [], [
+                t_startup_failure,
+                t_startup_pressure,
+                t_callback_exception,
+                t_callback_timeout,
+                t_conversion_errors
+            ]}
         ].
 
 network_cases() ->
@@ -492,3 +500,229 @@ cpu(Mode, Config) ->
     ok = application:stop(greptimedb_rs),
     counts({0, 0}),
     ?assertEqual({0, 0, 0, 0, 0}, greptimedb_rs_nif:cpu_counts()).
+
+t_startup_failure(Config) ->
+    startup_child(invalid_config, Config).
+
+t_startup_pressure(Config) ->
+    case {os:type(), os:find_executable("prlimit")} of
+        {{unix, linux}, Executable} when is_list(Executable) -> startup_child(pressure, Config);
+        _ -> {skip, "Requires Linux prlimit"}
+    end.
+
+startup_child(Scenario, Config) ->
+    Argument = #{
+        scenario => Scenario,
+        endpoint => greptimedb_test_server:backend(?config(server, Config))
+    },
+    Log = filename:join(?config(priv_dir, Config), atom_to_list(Scenario) ++ ".log"),
+    greptimedb_test_server:run_beam(?MODULE, startup_probe, Argument, Log).
+
+startup_probe(#{scenario := Scenario, endpoint := Endpoint}) ->
+    logger:set_primary_config(level, error),
+    try
+        {ok, _} = application:ensure_all_started(ecpool),
+        {module, greptimedb_rs_nif} = code:ensure_loaded(greptimedb_rs_nif),
+        application:load(greptimedb_rs),
+        startup_scenario(Scenario),
+        {ok, _} = application:ensure_all_started(greptimedb_rs),
+        counts({1, 0}),
+        {ok, Client} = greptimedb_rs:start_client(#{
+            endpoints => [Endpoint],
+            dbname => <<"public">>,
+            pool_name => startup_probe,
+            pool_size => 1
+        }),
+        ok = recover(Client, <<"regression_startup_recovered">>),
+        ok = greptimedb_rs:stop_client(Client),
+        ok = application:stop(greptimedb_rs),
+        counts({0, 0}),
+        halt(0)
+    catch
+        Class:Reason:Stack ->
+            logger:error(#{
+                msg => startup_probe_failed,
+                exception => Class,
+                reason => Reason,
+                stacktrace => Stack
+            }),
+            halt(1)
+    end.
+
+startup_scenario(invalid_config) ->
+    lists:foreach(
+        fun({Key, Value}) ->
+            application:set_env(greptimedb_rs, Key, Value),
+            ?assertMatch({error, _}, application:ensure_all_started(greptimedb_rs)),
+            ?assertEqual(undefined, whereis(greptimedb_rs_runtime)),
+            counts({0, 0}),
+            ?assertEqual({0, 0, 0, 0, 0}, greptimedb_rs_nif:cpu_counts()),
+            application:set_env(greptimedb_rs, Key, 2)
+        end,
+        [{runtime_workers, 65}, {cpu_workers, 0}]
+    );
+startup_scenario(pressure) ->
+    Saved = string:trim(prlimit(["--nproc", "--output", "SOFT", "--noheadings"])),
+    Upper =
+        case Saved of
+            "unlimited" -> 4096;
+            _ -> min(4096, list_to_integer(Saved))
+        end,
+    try
+        %% Only this child VM's thread limit changes; the database and parent keep theirs.
+        {Boundary, Panicked} = startup_boundary(1, Upper, false),
+        Outcomes = lists:map(
+            fun(Limit) -> pressure_attempt(max(1, Limit)) end,
+            lists:seq(Boundary - 4, Boundary + 2)
+        ),
+        ?assert(Panicked orelse lists:member(panic, Outcomes))
+    after
+        thread_limit(Saved)
+    end.
+
+startup_boundary(Low, High, Panicked) when Low > High ->
+    case Low of
+        1 -> halt(77);
+        _ -> {Low, Panicked}
+    end;
+startup_boundary(Low, High, Panicked) ->
+    Middle = (Low + High) div 2,
+    case pressure_attempt(Middle) of
+        ok -> startup_boundary(Low, Middle - 1, Panicked);
+        error -> startup_boundary(Middle + 1, High, Panicked);
+        panic -> startup_boundary(Middle + 1, High, true)
+    end.
+
+pressure_attempt(Limit) ->
+    thread_limit(integer_to_list(Limit)),
+    Result =
+        try
+            greptimedb_rs_nif:runtime_start(1, 1)
+        catch
+            Class:Reason -> {exception, Class, Reason}
+        end,
+    Outcome =
+        case Result of
+            Runtime when is_reference(Runtime) ->
+                ok = greptimedb_rs_nif:runtime_stop(Runtime),
+                ok;
+            {error, <<"runtime initialization panicked:", _/binary>>} ->
+                panic;
+            {error, _} ->
+                error;
+            _ ->
+                error({unexpected_startup_result, Result})
+        end,
+    ?assertEqual({0, 0}, greptimedb_rs_nif:resource_counts()),
+    ?assertEqual({0, 0, 0, 0, 0}, greptimedb_rs_nif:cpu_counts()),
+    Outcome.
+
+thread_limit(Soft) ->
+    _ = prlimit(["--nproc=" ++ Soft ++ ":"]),
+    timer:sleep(20).
+
+prlimit(Args) ->
+    Port = open_port(
+        {spawn_executable, os:find_executable("prlimit")},
+        [binary, exit_status, stderr_to_stdout, {args, ["--pid", os:getpid() | Args]}]
+    ),
+    prlimit_output(Port, <<>>).
+
+prlimit_output(Port, Acc) ->
+    receive
+        {Port, {data, Data}} -> prlimit_output(Port, <<Acc/binary, Data/binary>>);
+        {Port, {exit_status, 0}} -> binary_to_list(Acc);
+        {Port, {exit_status, Status}} -> error({prlimit_failed, Status, Acc})
+    after 5000 -> error(prlimit_timeout)
+    end.
+
+t_callback_exception(Config) ->
+    Client = client(?config(server, Config), 1, 1, 10000, true),
+    [{_, Worker}] = ecpool:workers(maps:get(pool_name, Client)),
+    {ok, Conn} = ecpool_worker:client(Worker),
+    lists:foreach(
+        fun(Class) ->
+            Ref = make_ref(),
+            Callback = failing_callback(Ref, Class),
+            {ok, _} = greptimedb_rs:query_async(Client, <<"SELECT 1">>, Callback),
+            ?assertEqual({ok, [[1]]}, callback_result(Ref)),
+            no_callback(Ref),
+            ?assert(is_process_alive(Conn)),
+            ?assertEqual({ok, [[1]]}, greptimedb_rs:query(Client, <<"SELECT 1">>))
+        end,
+        [error, throw, exit]
+    ).
+
+t_callback_timeout(Config) ->
+    Server = ?config(server, Config),
+    Client = client(Server, 1, 1, 200, false),
+    Ref = make_ref(),
+    greptimedb_test_server:pause(Server),
+    {ok, _} = greptimedb_rs:query_async(Client, <<"SELECT 1">>, failing_callback(Ref, error)),
+    ?assertEqual({error, timeout}, callback_result(Ref)),
+    counts({1, 0}),
+    no_callback(Ref),
+    greptimedb_test_server:release(Server),
+    ?assertEqual({ok, [[1]]}, greptimedb_rs:query(Client, <<"SELECT 1">>)).
+
+failing_callback(Ref, Class) ->
+    Parent = self(),
+    {
+        fun(Result) ->
+            Parent ! {Ref, Result},
+            erlang:raise(Class, callback_failure, [])
+        end,
+        []
+    }.
+
+callback_result(Ref) ->
+    receive
+        {Ref, Result} -> Result
+    after 5000 -> error(callback_timeout)
+    end.
+
+no_callback(Ref) ->
+    receive
+        {Ref, Result} -> error({duplicate_callback, Result})
+    after 200 -> ok
+    end.
+
+t_conversion_errors(Config) ->
+    Client = client(?config(server, Config), 1, 1, 10000, true),
+    Table = <<"regression_int8">>,
+    {ok, _} = greptimedb_rs:query(
+        Client,
+        <<"CREATE TABLE regression_int8 (ts TIMESTAMP TIME INDEX, reading INT8)">>
+    ),
+    BadRow = (row())#{fields := #{<<"reading">> => 256}},
+    RangeError = {error, {nif_error, <<"Value 256 out of range for type Int8">>}},
+    ?assertEqual(RangeError, greptimedb_rs:insert(Client, Table, [BadRow])),
+    ?assertEqual(
+        RangeError,
+        async(fun(Cb) ->
+            greptimedb_rs:insert_async(Client, Table, [BadRow], Cb)
+        end)
+    ),
+    {ok, Stream} = greptimedb_rs:stream_start(Client, Table, row()),
+    ?assertEqual(RangeError, greptimedb_rs:stream_write(Stream, [BadRow])),
+    {ok, NewStream} = greptimedb_rs:stream_start(Client, Table, row()),
+    ?assertEqual(
+        RangeError,
+        async(fun(Cb) ->
+            greptimedb_rs:stream_write_async(NewStream, [BadRow], Cb)
+        end)
+    ),
+    WrongType = (row())#{fields := #{<<"reading">> => <<"not an integer">>}},
+    ?assertEqual(
+        {error, {nif_error, <<"Invalid value for type Int8: expected integer">>}},
+        greptimedb_rs:insert(Client, Table, [WrongType])
+    ),
+    ?assertEqual(
+        {error, {nif_error, task_panic}},
+        greptimedb_rs:insert(Client, Table, [BadRow | bad_tail])
+    ),
+    ?assertEqual({ok, 1}, greptimedb_rs:insert(Client, Table, [row()])),
+    ?assertEqual(
+        {ok, [[7]]}, greptimedb_rs:query(Client, <<"SELECT reading FROM regression_int8">>)
+    ),
+    counts({1, 0}).

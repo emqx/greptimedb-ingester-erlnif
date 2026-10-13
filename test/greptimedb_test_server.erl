@@ -1,5 +1,6 @@
 -module(greptimedb_test_server).
 -behaviour(gen_server).
+-export([run_beam/4]).
 -export([
     start/2, stop/1, endpoint/1, backend/1, pause/1, release/1, disconnect/1, headers/1, restart/1
 ]).
@@ -10,6 +11,38 @@
     handle_info/2,
     terminate/2
 ]).
+
+run_beam(Module, Function, Argument, LogPath) ->
+    Eval = lists:flatten(io_lib:format("~p:~p(~p).", [Module, Function, Argument])),
+    Args =
+        ["+S", "1:1", "+SDcpu", "1:1", "+SDio", "1", "-noshell", "-pa"] ++
+            [filename:absname(Path) || Path <- code:get_path()] ++ ["-eval", Eval],
+    {ok, Log} = file:open(LogPath, [write]),
+    Port = open_port(
+        {spawn_executable, os:find_executable("erl")},
+        [binary, exit_status, stderr_to_stdout, {args, Args}]
+    ),
+    {os_pid, Pid} = erlang:port_info(Port, os_pid),
+    try
+        beam_result(Port, Log, erlang:monotonic_time(millisecond) + 30000)
+    after
+        stop_backend(#{backend_port => Port, backend_pid => Pid, log => Log}),
+        file:close(Log)
+    end.
+
+beam_result(Port, Log, Deadline) ->
+    receive
+        {Port, {data, Data}} ->
+            file:write(Log, Data),
+            beam_result(Port, Log, Deadline);
+        {Port, {exit_status, 0}} ->
+            ok;
+        {Port, {exit_status, 77}} ->
+            {skip, "OS thread limits are not enforced"};
+        {Port, {exit_status, Status}} ->
+            error({beam_exit, Status})
+    after max(0, Deadline - erlang:monotonic_time(millisecond)) -> error(beam_timeout)
+    end.
 
 start(Binary, Directory) ->
     gen_server:start(?MODULE, [Binary, Directory], []).

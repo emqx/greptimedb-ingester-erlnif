@@ -394,6 +394,7 @@ impl Value {
 
 enum Failure {
     Native(String),
+    Raised { env: OwnedEnv, reason: SavedTerm },
     BadArg,
     Timeout,
     Cancelled,
@@ -410,6 +411,14 @@ impl Failure {
                     .decode()
                     .unwrap_or_else(|_| "invalid input".into()),
             ),
+            rustler::Error::RaiseTerm(reason) => {
+                let saved_env = OwnedEnv::new();
+                let reason = saved_env.save(reason.encode(env));
+                Self::Raised {
+                    env: saved_env,
+                    reason,
+                }
+            }
             _ => Self::BadArg,
         }
     }
@@ -417,6 +426,13 @@ impl Failure {
     fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
         match self {
             Self::Native(reason) => (atoms::error(), reason).encode(env),
+            Self::Raised {
+                env: source,
+                reason,
+            } => {
+                let reason = source.run(|source_env| reason.load(source_env).in_env(env));
+                (atoms::error(), (atoms::nif_error(), reason)).encode(env)
+            }
             Self::BadArg => (
                 atoms::error(),
                 (atoms::nif_error(), rustler::types::atom::badarg()),

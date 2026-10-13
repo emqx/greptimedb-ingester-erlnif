@@ -185,11 +185,7 @@ terminate(_Reason, #state{client = ClientRef, pending = Pending} = State) ->
             clear_request(Req),
             case maps:get(replied, Req) of
                 false ->
-                    try
-                        deliver(Req, {error, closed})
-                    catch
-                        _:_ -> ok
-                    end;
+                    deliver(Req, {error, closed});
                 true ->
                     ok
             end
@@ -344,8 +340,20 @@ clear_request(Req) ->
         Monitor -> erlang:demonitor(Monitor, [flush])
     end.
 
-deliver(#{recipient := {sync, From}}, Result) -> gen_server:reply(From, Result);
-deliver(#{recipient := {async, {Fun, Args}}}, Result) -> erlang:apply(Fun, Args ++ [Result]).
+deliver(#{recipient := {sync, From}}, Result) ->
+    gen_server:reply(From, Result);
+deliver(#{recipient := {async, {Fun, Args}}}, Result) ->
+    try
+        erlang:apply(Fun, Args ++ [Result])
+    catch
+        Class:Reason:Stacktrace ->
+            logger:error(#{
+                msg => greptimedb_callback_failed,
+                exception => Class,
+                reason => Reason,
+                stacktrace => Stacktrace
+            })
+    end.
 
 local_deadline(Cmd, #state{opts = Opts}) ->
     Key =
