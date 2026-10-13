@@ -17,14 +17,14 @@ static WAITING: AtomicUsize = AtomicUsize::new(0);
 
 type Job = Box<dyn FnOnce() + Send>;
 
-pub(crate) struct CpuPool {
+pub(crate) struct DataConversionPool {
     jobs: Mutex<Option<mpsc::Sender<Job>>>,
     permits: Arc<Semaphore>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     stopped: AtomicBool,
 }
 
-impl CpuPool {
+impl DataConversionPool {
     pub(crate) fn new(workers: usize) -> std::io::Result<Arc<Self>> {
         let (sender, receiver) = mpsc::channel::<Job>();
         let receiver = Arc::new(Mutex::new(receiver));
@@ -130,7 +130,7 @@ impl CpuPool {
     }
 }
 
-impl Drop for CpuPool {
+impl Drop for DataConversionPool {
     fn drop(&mut self) {
         self.stop();
     }

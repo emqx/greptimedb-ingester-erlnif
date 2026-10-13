@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use crate::cpu::CpuPool;
+use crate::data_conversion_pool::DataConversionPool;
 use greptimedb_ingester::BulkStreamWriter;
 use rustler::{Env, LocalPid, Monitor, Resource};
 use tokio::runtime::Builder;
@@ -26,15 +26,15 @@ type Job = Box<dyn FnOnce(Rc<Context>) -> Pin<Box<dyn Future<Output = ()>>> + Se
 
 pub struct RuntimeOwner {
     jobs: mpsc::UnboundedSender<Job>,
-    pub(crate) cpu: Arc<CpuPool>,
+    pub(crate) data_conversion_pool: Arc<DataConversionPool>,
     shutdown: watch::Sender<bool>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl RuntimeOwner {
     fn new(workers: usize, cpu_workers: usize) -> std::io::Result<Self> {
-        let cpu = CpuPool::new(cpu_workers)?;
-        let owner_cpu = cpu.clone();
+        let data_conversion_pool = DataConversionPool::new(cpu_workers)?;
+        let owner_data_conversion_pool = data_conversion_pool.clone();
         let runtime = Builder::new_multi_thread()
             .worker_threads(workers)
             .thread_name("greptime-worker")
@@ -72,14 +72,14 @@ impl RuntimeOwner {
                 }));
                 runtime.block_on(tasks);
                 drop(context);
-                owner_cpu.stop();
+                owner_data_conversion_pool.stop();
                 drop(runtime);
                 RUNTIMES.fetch_sub(1, Ordering::AcqRel);
             });
         match thread {
             Ok(thread) => Ok(Self {
                 jobs,
-                cpu,
+                data_conversion_pool,
                 shutdown,
                 thread: Mutex::new(Some(thread)),
             }),
@@ -113,7 +113,7 @@ impl RuntimeOwner {
 
     fn signal_shutdown(&self) {
         self.shutdown.send_replace(true);
-        self.cpu.close();
+        self.data_conversion_pool.close();
     }
 
     fn stop(&self) {

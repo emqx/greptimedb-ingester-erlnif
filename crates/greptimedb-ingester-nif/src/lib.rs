@@ -21,7 +21,7 @@ use std::rc::Rc;
 static FIPS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub mod atoms;
-mod cpu;
+mod data_conversion_pool;
 mod operation;
 mod types;
 mod util;
@@ -529,7 +529,7 @@ fn submit<'a>(
                 let encoded = running
                     .client
                     .runtime
-                    .cpu
+                    .data_conversion_pool
                     .run(control.clone(), deadline, move || {
                         Ok(encode_reply(output, token, result))
                     })
@@ -570,7 +570,7 @@ fn encode_reply(
 
 #[rustler::nif]
 fn cpu_counts() -> (usize, usize, usize, usize, usize) {
-    cpu::counts()
+    data_conversion_pool::counts()
 }
 
 #[rustler::nif]
@@ -637,7 +637,7 @@ async fn perform(
             let ts_column = client.ts_column.clone();
             let (schema, rows) = client
                 .runtime
-                .cpu
+                .data_conversion_pool
                 .run(control.clone(), deadline, move || {
                     input.convert(|rows| match server {
                         Ok(schema) => {
@@ -710,7 +710,7 @@ async fn perform(
             let schema = resource.schema.clone();
             let rows = client
                 .runtime
-                .cpu
+                .data_conversion_pool
                 .run(control.clone(), deadline, move || {
                     input.convert(|rows| util::terms_to_rows(&schema, rows))
                 })
