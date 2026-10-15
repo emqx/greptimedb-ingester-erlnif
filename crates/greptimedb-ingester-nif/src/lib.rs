@@ -116,9 +116,12 @@ fn runtime_start(env: Env, workers: usize, codec_workers: usize) -> NifResult<Te
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-fn runtime_stop(runtime: ResourceArc<RuntimeResource>) -> Atom {
-    runtime::stop(&runtime);
-    atoms::ok()
+fn runtime_stop(runtime: ResourceArc<RuntimeResource>, timeout_ms: u64) -> NifResult<Atom> {
+    if !(1..=30_000).contains(&timeout_ms) {
+        return Err(rustler::Error::BadArg);
+    }
+    runtime::stop_with_timeout(&runtime, Duration::from_millis(timeout_ms));
+    Ok(atoms::ok())
 }
 
 #[rustler::nif]
@@ -513,6 +516,7 @@ fn submit<'a>(
     let request = Request::decode(command, arguments)?;
     let closing = matches!(&request, Request::StreamCloseAll(_));
     let writer = request.writer();
+    let finish_stream = writer.is_some() || closing;
     let (operation, mut cancelled) = Operation::new();
     let running = Running {
         client: client.clone(),
@@ -557,9 +561,7 @@ fn submit<'a>(
                 tokio::pin!(future);
                 tokio::select! {
                     biased;
-                    _ = async {
-                        if !*stopping.borrow() { let _ = stopping.changed().await; }
-                    } => Err(Failure::Closed),
+                    _ = runtime::wait_for_shutdown(&mut stopping, finish_stream) => Err(Failure::Closed),
                     _ = cancelled.changed() => Err(Failure::Cancelled),
                     _ = tokio::time::sleep_until(deadline) => Err(Failure::Timeout),
                     value = &mut future => value.unwrap_or(Err(Failure::Panic)),
@@ -573,12 +575,14 @@ fn submit<'a>(
                 }
                 result = Err(error);
             }
-            // A cancelled stream may have submitted only part of a batch.
-            // Drop it before acknowledging reclamation; never reuse that writer.
+            // Invalid streams cannot be reused. During graceful shutdown, keep any
+            // retained writer for the final drain of previously submitted batches.
             if result.is_err() {
                 if let Some(writer) = writer {
                     writer.closed.store(true, Ordering::Release);
-                    context.writers.borrow_mut().remove(&writer.id);
+                    if !running.client.runtime.is_draining() {
+                        context.writers.borrow_mut().remove(&writer.id);
+                    }
                 }
             }
             let large_reply = matches!(&result, Ok(Value::Batches(batches))
@@ -781,10 +785,11 @@ async fn perform(
                 .borrow_mut()
                 .remove(&resource.id)
                 .ok_or_else(|| Failure::Native("Writer is closed".into()))?;
-            writer.write_rows_async(rows).await.map_err(native)?;
+            let result = writer.write_rows_async(rows).await.map_err(native);
             if !resource.closed.load(Ordering::Acquire) {
                 context.writers.borrow_mut().insert(resource.id, writer);
             }
+            result?;
             Ok(Value::Ok)
         }
         Request::StreamCloseAll(resources) => {

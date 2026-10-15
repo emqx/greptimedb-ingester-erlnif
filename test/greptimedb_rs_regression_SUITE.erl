@@ -34,7 +34,13 @@ groups() ->
                 t_pool_stop_flush,
                 t_pool_stop_flush_busy,
                 t_pool_stop_flush_timeout,
-                t_pool_stop_flush_killed
+                t_pool_stop_flush_killed,
+                t_library_stop_flush,
+                t_library_stop_flush_timeout,
+                t_owner_exit_no_flush,
+                t_owner_error_no_flush,
+                t_library_stop_active_close,
+                t_library_stop_active_write
             ]}
         ].
 
@@ -87,12 +93,19 @@ init_per_group(Name, Config) ->
 end_per_group(_, _) ->
     ok.
 
-init_per_testcase(_, Config) ->
+init_per_testcase(Testcase, Config) ->
     logger:set_primary_config(level, warning),
     application:load(greptimedb_rs),
     application:set_env(
         greptimedb_rs, codec_workers, proplists:get_value(codec_workers, Config, 2)
     ),
+    ShutdownTimeout =
+        case Testcase of
+            t_library_stop_flush_timeout -> 200;
+            T when T =:= t_owner_exit_no_flush; T =:= t_owner_error_no_flush -> 10000;
+            _ -> 5000
+        end,
+    application:set_env(greptimedb_rs, shutdown_timeout, ShutdownTimeout),
     {ok, _} = application:ensure_all_started(greptimedb_rs),
     Config.
 
@@ -573,7 +586,12 @@ startup_scenario(invalid_config) ->
             ?assertEqual({0, 0, 0, 0, 0}, greptimedb_rs_nif:codec_counts()),
             application:set_env(greptimedb_rs, Key, 2)
         end,
-        [{runtime_workers, 65}, {codec_workers, 0}]
+        [
+            {runtime_workers, 65},
+            {codec_workers, 0},
+            {shutdown_timeout, 0},
+            {shutdown_timeout, 30001}
+        ]
     );
 startup_scenario(pressure) ->
     Saved = string:trim(prlimit(["--nproc", "--output", "SOFT", "--noheadings"])),
@@ -1065,3 +1083,155 @@ pool_stop_flush_fault(Mode, Config) ->
     ?assert(Elapsed >= 150000 andalso Elapsed < 1000000),
     counts({1, 0}),
     ok = greptimedb_test_server:release(Server).
+
+%% Application shutdown must finish idle writers before dropping the shared runtime.
+t_library_stop_flush(Config) ->
+    Server = ?config(server, Config),
+    Client = client(Server, 1, 1, 10000, true),
+    {ok, _} = greptimedb_rs:query(
+        Client,
+        <<"CREATE TABLE regression_app_flush (ts TIMESTAMP TIME INDEX, reading INT64)">>
+    ),
+    {ok, Stream} = greptimedb_rs:stream_start(Client, <<"regression_app_flush">>, row()),
+    Rows = [(row())#{timestamp := 1700000000000 + I} || I <- lists:seq(1, 200000)],
+    ok = greptimedb_rs:stream_write(Stream, Rows),
+    ok = application:stop(greptimedb_rs),
+    counts({0, 0}),
+    ok = greptimedb_rs:stop_client(Client),
+    {ok, _} = application:ensure_all_started(greptimedb_rs),
+    Reader = client(Server, healthy, 1, 10000, true),
+    ?assertEqual(
+        {ok, [[200000]]},
+        greptimedb_rs:query(
+            Reader, <<"SELECT count(*) FROM regression_app_flush">>
+        )
+    ).
+
+t_library_stop_flush_timeout(Config) ->
+    library_stop_fault(timeout, Config).
+
+t_owner_exit_no_flush(Config) ->
+    library_stop_fault(killed, Config).
+
+t_owner_error_no_flush(Config) ->
+    library_stop_fault(error, Config).
+
+library_stop_fault(Mode, Config) ->
+    Server = ?config(server, Config),
+    Client = client(Server, 1, 1, 10000, false),
+    Healthy = client(Server, healthy, 1, 10000, true),
+    Tables = [
+        <<"regression_app_fault_a">>, <<"regression_app_fault_b">>, <<"regression_app_fault_c">>
+    ],
+    Streams = lists:map(
+        fun(Table) ->
+            {ok, _} = greptimedb_rs:query(Client, <<"DROP TABLE IF EXISTS ", Table/binary>>),
+            {ok, _} = greptimedb_rs:query(
+                Client,
+                <<"CREATE TABLE ", Table/binary, " (ts TIMESTAMP TIME INDEX, reading INT64)">>
+            ),
+            {ok, Stream} = greptimedb_rs:stream_start(Client, Table, row()),
+            ok = greptimedb_rs:stream_write(Stream, [row()]),
+            wait(
+                fun() ->
+                    greptimedb_rs:query(Healthy, <<"SELECT reading FROM ", Table/binary>>) =:=
+                        {ok, [[7]]}
+                end,
+                2000
+            ),
+            Stream
+        end,
+        Tables
+    ),
+    ok = greptimedb_test_server:pause(Server),
+    lists:foreach(
+        fun(Stream) ->
+            ok = greptimedb_rs:stream_write(Stream, [(row())#{timestamp := 1700000000001}])
+        end,
+        Streams
+    ),
+    Owner = whereis(greptimedb_rs_runtime),
+    {Elapsed, ok} = timer:tc(fun() ->
+        case Mode of
+            timeout ->
+                ok = application:stop(greptimedb_rs),
+                counts({0, 0});
+            _ ->
+                case Mode of
+                    killed -> exit(Owner, kill);
+                    error -> gen_server:stop(Owner, owner_crash, infinity)
+                end,
+                wait(
+                    fun() ->
+                        New = whereis(greptimedb_rs_runtime),
+                        is_pid(New) andalso New =/= Owner andalso
+                            greptimedb_rs_nif:resource_counts() =:= {1, 0}
+                    end,
+                    1000
+                )
+        end
+    end),
+    ?assert(Elapsed < 1000000),
+    case Mode of
+        timeout -> ?assert(Elapsed >= 150000 andalso Elapsed < 500000);
+        _ -> ok
+    end,
+    ok = greptimedb_test_server:release(Server).
+
+t_library_stop_active_close(Config) ->
+    library_stop_active(close, Config).
+
+t_library_stop_active_write(Config) ->
+    library_stop_active(write, Config).
+
+%% In-flight stream work must not discard older batches during graceful shutdown.
+library_stop_active(Mode, Config) ->
+    Server = ?config(server, Config),
+    Client = client(Server, 1, 1, 10000, false),
+    Healthy = client(Server, healthy, 1, 10000, true),
+    Table = iolist_to_binary(["regression_app_active_", atom_to_binary(Mode)]),
+    {ok, _} = greptimedb_rs:query(
+        Client,
+        <<"CREATE TABLE ", Table/binary, " (ts TIMESTAMP TIME INDEX, reading INT64)">>
+    ),
+    {ok, Stream} = greptimedb_rs:stream_start(Client, Table, row()),
+    ok = greptimedb_rs:stream_write(Stream, [row()]),
+    wait(
+        fun() ->
+            greptimedb_rs:query(Healthy, <<"SELECT count(*) FROM ", Table/binary>>) =:=
+                {ok, [[1]]}
+        end,
+        2000
+    ),
+    ok = greptimedb_test_server:pause(Server),
+    ok = greptimedb_rs:stream_write(Stream, [(row())#{timestamp := 1700000000001}]),
+    Active =
+        case Mode of
+            close ->
+                start_request(fun() -> greptimedb_rs:stream_close(Stream) end);
+            write ->
+                Rows = lists:duplicate(600000, (row())#{timestamp := 1700000000002}),
+                start_request(fun() -> greptimedb_rs:stream_write(Stream, Rows) end)
+        end,
+    wait(
+        fun() ->
+            case Mode of
+                close -> greptimedb_rs_nif:resource_counts() =:= {1, 1};
+                write -> element(3, greptimedb_rs_nif:codec_counts()) > 0
+            end
+        end,
+        2000
+    ),
+    Stop = start_request(fun() -> application:stop(greptimedb_rs) end),
+    no_result(Stop),
+    ok = greptimedb_test_server:release(Server),
+    {ok, _} = result(Stop, 5000),
+    {Reply, _} = result(Active, 1000),
+    ?assert(lists:member(Reply, [ok, {error, closed}])),
+    counts({0, 0}),
+    ok = greptimedb_rs:stop_client(Client),
+    ok = greptimedb_rs:stop_client(Healthy),
+    {ok, _} = application:ensure_all_started(greptimedb_rs),
+    Reader = client(Server, healthy, 1, 10000, true),
+    {ok, [[Count]]} = greptimedb_rs:query(Reader, <<"SELECT count(*) FROM ", Table/binary>>),
+    ?assert(Count >= 2).

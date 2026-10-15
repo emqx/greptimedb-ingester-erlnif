@@ -19,6 +19,7 @@
 -export([
     runtime_start/2,
     runtime_stop/1,
+    runtime_stop/2,
     connect/1,
     disconnect/1,
     submit/5,
@@ -48,7 +49,10 @@ init() ->
 runtime_start(_Workers, _CodecWorkers) ->
     not_loaded(?LINE).
 
-runtime_stop(_Runtime) ->
+runtime_stop(Runtime) ->
+    runtime_stop(Runtime, 5000).
+
+runtime_stop(_Runtime, _Timeout) ->
     not_loaded(?LINE).
 
 connect(_Opts) ->

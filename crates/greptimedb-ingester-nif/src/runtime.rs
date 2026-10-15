@@ -1,7 +1,8 @@
 //! Owns the application-wide Tokio runtime and its native threads.
 //!
 //! Non-Send SDK futures and streaming writers stay on the owner thread's LocalSet.
-//! Its event loop drives requests, then drains tasks and joins codec workers on shutdown.
+//! Shutdown cancels requests, bounds graceful writer draining with one deadline,
+//! then joins codec workers. Abnormal owner exits skip writer draining.
 //! The Erlang runtime owner's resource monitor signals shutdown when that process exits.
 
 use std::cell::RefCell;
@@ -13,12 +14,16 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
+use std::time::Duration;
+
+use futures::FutureExt;
 
 use crate::codec::CodecPool;
 use greptimedb_ingester::BulkStreamWriter;
 use rustler::{Env, LocalPid, Monitor, Resource};
 use tokio::runtime::Builder;
 use tokio::sync::{mpsc, watch};
+use tokio::time::Instant;
 
 static RUNTIMES: AtomicUsize = AtomicUsize::new(0);
 static SHARED: Mutex<Option<Arc<RuntimeOwner>>> = Mutex::new(None);
@@ -28,12 +33,73 @@ pub struct Context {
     pub writers: RefCell<HashMap<usize, BulkStreamWriter>>,
 }
 
+#[derive(Clone, Copy)]
+pub enum Shutdown {
+    Running,
+    Graceful(Instant),
+    Abort,
+}
+
+impl Shutdown {
+    pub fn is_stopping(self) -> bool {
+        !matches!(self, Self::Running)
+    }
+}
+
+pub async fn wait_for_shutdown(stopping: &mut watch::Receiver<Shutdown>, finish_stream: bool) {
+    loop {
+        let state = *stopping.borrow_and_update();
+        match state {
+            Shutdown::Running => {
+                if stopping.changed().await.is_err() {
+                    return;
+                }
+            }
+            Shutdown::Graceful(deadline) if finish_stream => {
+                tokio::select! {
+                    biased;
+                    changed = stopping.changed() => { if changed.is_err() { return; } },
+                    _ = tokio::time::sleep_until(deadline) => return,
+                }
+            }
+            _ => return,
+        }
+    }
+}
+
+impl Context {
+    async fn finish_writers(&self, stopping: &mut watch::Receiver<Shutdown>) {
+        let Shutdown::Graceful(deadline) = *stopping.borrow() else {
+            return;
+        };
+        if Instant::now() >= deadline {
+            return;
+        }
+        let writers: Vec<_> = self
+            .writers
+            .borrow_mut()
+            .drain()
+            .map(|(_, writer)| writer)
+            .collect();
+        let finish = futures::future::join_all(
+            writers
+                .into_iter()
+                .map(|writer| AssertUnwindSafe(writer.finish()).catch_unwind()),
+        );
+        tokio::select! {
+            biased;
+            _ = wait_for_shutdown(stopping, true) => {},
+            _ = finish => {},
+        }
+    }
+}
+
 type Job = Box<dyn FnOnce(Rc<Context>) -> Pin<Box<dyn Future<Output = ()>>> + Send>;
 
 pub struct RuntimeOwner {
     jobs: mpsc::UnboundedSender<Job>,
     pub(crate) codec_pool: Arc<CodecPool>,
-    shutdown: watch::Sender<bool>,
+    shutdown: watch::Sender<Shutdown>,
     thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -46,7 +112,7 @@ impl RuntimeOwner {
             .thread_name("greptime-worker")
             .enable_all()
             .build()?;
-        let (shutdown, mut stopping) = watch::channel(false);
+        let (shutdown, mut stopping) = watch::channel(Shutdown::Running);
         let (jobs, mut receiver) = mpsc::unbounded_channel::<Job>();
         RUNTIMES.fetch_add(1, Ordering::AcqRel);
         let thread = std::thread::Builder::new()
@@ -55,7 +121,7 @@ impl RuntimeOwner {
                 let context = Rc::new(Context {
                     writers: RefCell::new(HashMap::new()),
                 });
-                let tasks = tokio::task::LocalSet::new();
+                let mut tasks = tokio::task::LocalSet::new();
                 runtime.block_on(tasks.run_until(async {
                     loop {
                         tokio::select! {
@@ -69,12 +135,17 @@ impl RuntimeOwner {
                     }
                 }));
                 receiver.close();
-                runtime.block_on(tasks.run_until(async {
-                    while let Some(job) = receiver.recv().await {
-                        tokio::task::spawn_local(job(context.clone()));
-                    }
-                }));
-                runtime.block_on(tasks);
+                runtime.block_on(async {
+                    tasks
+                        .run_until(async {
+                            while let Some(job) = receiver.recv().await {
+                                tokio::task::spawn_local(job(context.clone()));
+                            }
+                        })
+                        .await;
+                    (&mut tasks).await;
+                    tasks.run_until(context.finish_writers(&mut stopping)).await;
+                });
                 drop(context);
                 owner_codec_pool.stop();
                 drop(runtime);
@@ -99,7 +170,7 @@ impl RuntimeOwner {
         F: FnOnce(Rc<Context>) -> Fut + Send + 'static,
         Fut: Future<Output = ()> + 'static,
     {
-        if *self.shutdown.borrow() {
+        if self.is_stopping() {
             return Err(());
         }
         self.jobs
@@ -108,20 +179,40 @@ impl RuntimeOwner {
     }
 
     pub fn is_stopping(&self) -> bool {
-        *self.shutdown.borrow()
+        self.shutdown.borrow().is_stopping()
     }
 
-    pub fn stopping(&self) -> watch::Receiver<bool> {
+    pub fn is_draining(&self) -> bool {
+        matches!(*self.shutdown.borrow(), Shutdown::Graceful(deadline) if Instant::now() < deadline)
+    }
+
+    pub fn stopping(&self) -> watch::Receiver<Shutdown> {
         self.shutdown.subscribe()
     }
 
-    fn signal_shutdown(&self) {
-        self.shutdown.send_replace(true);
+    fn signal_shutdown(&self, drain: Option<Duration>) {
+        let requested = drain.map_or(Shutdown::Abort, |timeout| {
+            Shutdown::Graceful(Instant::now() + timeout)
+        });
+        // Once aborted, a later join or graceful stop must not re-enable draining.
+        self.shutdown.send_if_modified(|state| {
+            if matches!(state, Shutdown::Running)
+                || matches!(
+                    (*state, requested),
+                    (Shutdown::Graceful(_), Shutdown::Abort)
+                )
+            {
+                *state = requested;
+                true
+            } else {
+                false
+            }
+        });
         self.codec_pool.close();
     }
 
-    fn stop(&self) {
-        self.signal_shutdown();
+    fn stop(&self, drain: Option<Duration>) {
+        self.signal_shutdown(drain);
         if let Some(thread) = self.thread.lock().unwrap().take() {
             let _ = thread.join();
         }
@@ -140,13 +231,13 @@ impl Resource for RuntimeResource {
     const IMPLEMENTS_DOWN: bool = true;
 
     fn down(&self, _env: Env, _pid: LocalPid, _monitor: Monitor) {
-        self.0.signal_shutdown();
+        self.0.signal_shutdown(None);
     }
 }
 
 impl Drop for RuntimeResource {
     fn drop(&mut self) {
-        self.0.signal_shutdown();
+        self.0.signal_shutdown(None);
     }
 }
 
@@ -159,10 +250,10 @@ pub fn start(workers: usize, codec_workers: usize) -> Result<Arc<RuntimeOwner>, 
     }
     let mut shared = shared_state();
     if let Some(previous) = shared.as_ref() {
-        if !*previous.shutdown.borrow() {
+        if !previous.is_stopping() {
             return Err("runtime already started".into());
         }
-        previous.stop();
+        previous.stop(None);
     }
     // Catch initialization panics before they unwind through the shared-state lock.
     let runtime = catch_unwind(AssertUnwindSafe(|| {
@@ -185,14 +276,18 @@ pub fn start(workers: usize, codec_workers: usize) -> Result<Arc<RuntimeOwner>, 
 pub fn shared() -> Result<Arc<RuntimeOwner>, String> {
     shared_state()
         .as_ref()
-        .filter(|runtime| !*runtime.shutdown.borrow())
+        .filter(|runtime| !runtime.is_stopping())
         .cloned()
         .ok_or_else(|| "greptimedb_rs runtime is not running".into())
 }
 
 pub fn stop(resource: &RuntimeResource) {
+    stop_with_timeout(resource, Duration::from_secs(5));
+}
+
+pub fn stop_with_timeout(resource: &RuntimeResource, timeout: Duration) {
     let mut shared = shared_state();
-    resource.0.stop();
+    resource.0.stop(Some(timeout));
     if shared
         .as_ref()
         .is_some_and(|runtime| Arc::ptr_eq(runtime, &resource.0))
@@ -207,7 +302,7 @@ fn shared_state() -> MutexGuard<'static, Option<Arc<RuntimeOwner>>> {
         Err(poisoned) => {
             let mut shared = poisoned.into_inner();
             if let Some(previous) = shared.take() {
-                previous.stop();
+                previous.stop(None);
             }
             SHARED.clear_poison();
             shared
