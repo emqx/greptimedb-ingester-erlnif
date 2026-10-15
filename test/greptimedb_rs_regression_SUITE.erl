@@ -8,7 +8,7 @@ suite() ->
 
 all() ->
     [{group, Name} || {Name, _} <- network_cases()] ++
-        [{group, lifecycle}, {group, cpu}, {group, failures}].
+        [{group, lifecycle}, {group, codec}, {group, failures}].
 
 groups() ->
     [{Name, [], [t_network]} || {Name, _} <- network_cases()] ++
@@ -16,13 +16,16 @@ groups() ->
             {lifecycle, [], [
                 t_queued, t_caller_cancel, t_pool_stop, t_socket_exit, t_library_stop, t_owner_exit
             ]},
-            {cpu, [], [t_cpu_cancel, t_cpu_timeout, t_cpu_stop, t_query_cancel]},
+            {codec, [], [t_codec_cancel, t_codec_timeout, t_codec_stop, t_query_cancel]},
             {failures, [], [
                 t_startup_failure,
                 t_startup_pressure,
                 t_callback_exception,
                 t_callback_timeout,
-                t_conversion_errors
+                t_conversion_errors,
+                t_request_timeout,
+                t_request_timeout_expiry,
+                t_submit_rejection
             ]}
         ].
 
@@ -64,8 +67,8 @@ init_per_suite(Config) ->
 end_per_suite(Config) ->
     greptimedb_test_server:stop(?config(server, Config)).
 
-init_per_group(cpu, Config) ->
-    [{cpu_workers, 1} | Config];
+init_per_group(codec, Config) ->
+    [{codec_workers, 1} | Config];
 init_per_group(Name, Config) ->
     case lists:keyfind(Name, 1, network_cases()) of
         {Name, Case} -> [{network_case, Case} | Config];
@@ -78,7 +81,9 @@ end_per_group(_, _) ->
 init_per_testcase(_, Config) ->
     logger:set_primary_config(level, warning),
     application:load(greptimedb_rs),
-    application:set_env(greptimedb_rs, cpu_workers, proplists:get_value(cpu_workers, Config, 2)),
+    application:set_env(
+        greptimedb_rs, codec_workers, proplists:get_value(codec_workers, Config, 2)
+    ),
     {ok, _} = application:ensure_all_started(greptimedb_rs),
     Config.
 
@@ -277,7 +282,7 @@ async(Fun) ->
     {ok, _} = Fun({fun(Result) -> Parent ! {Ref, Result} end, []}),
     receive
         {Ref, Result} -> Result
-    after 10000 -> ct:fail(callback_timeout)
+    after 30000 -> ct:fail(callback_timeout)
     end.
 
 recover(Client, Table) ->
@@ -413,19 +418,19 @@ pool_cycles(Server, Client, Healthy) ->
     ok = greptimedb_rs:stop_client(C1),
     counts({1, 0}).
 
-t_cpu_cancel(Config) ->
-    cpu(cancel, Config).
+t_codec_cancel(Config) ->
+    codec(cancel, Config).
 
-t_cpu_timeout(Config) ->
-    cpu(timeout, Config).
+t_codec_timeout(Config) ->
+    codec(timeout, Config).
 
-t_cpu_stop(Config) ->
-    cpu(library_stop, Config).
+t_codec_stop(Config) ->
+    codec(library_stop, Config).
 
 t_query_cancel(Config) ->
-    cpu(query_cancel, Config).
+    codec(query_cancel, Config).
 
-cpu(Mode, Config) ->
+codec(Mode, Config) ->
     Server = ?config(server, Config),
     Timeout =
         case Mode of
@@ -435,32 +440,32 @@ cpu(Mode, Config) ->
     Client = client(Server, 1, 4, Timeout, true),
     {ok, _} = greptimedb_rs:query(
         Client,
-        <<"CREATE TABLE IF NOT EXISTS regression_cpu (ts TIMESTAMP TIME INDEX, reading INT64)">>
+        <<"CREATE TABLE IF NOT EXISTS regression_codec (ts TIMESTAMP TIME INDEX, reading INT64)">>
     ),
-    ?assertEqual({1, 2, 0, 0, 0}, greptimedb_rs_nif:cpu_counts()),
-    {ok, 0} = greptimedb_rs:insert(Client, <<"regression_cpu">>, []),
+    ?assertEqual({1, 2, 0, 0, 0}, greptimedb_rs_nif:codec_counts()),
+    {ok, 0} = greptimedb_rs:insert(Client, <<"regression_codec">>, []),
     Request =
         case Mode of
             query_cancel ->
                 WarmRows = [(row())#{timestamp := 1700000000000 + I} || I <- lists:seq(1, 60000)],
-                {ok, 60000} = greptimedb_rs:insert(Client, <<"regression_cpu">>, WarmRows),
+                {ok, 60000} = greptimedb_rs:insert(Client, <<"regression_codec">>, WarmRows),
                 fun() ->
                     greptimedb_rs:query(
                         Client,
                         <<
-                            "SELECT a.reading FROM regression_cpu a "
-                            "CROSS JOIN regression_cpu b LIMIT 600000"
+                            "SELECT a.reading FROM regression_codec a "
+                            "CROSS JOIN regression_codec b LIMIT 600000"
                         >>
                     )
                 end;
             _ ->
                 Rows = lists:duplicate(600000, row()),
-                fun() -> greptimedb_rs:insert(Client, <<"regression_cpu">>, Rows) end
+                fun() -> greptimedb_rs:insert(Client, <<"regression_codec">>, Rows) end
         end,
     Requests = [start_request(Request) || _ <- lists:seq(1, 4)],
     wait(
         fun() ->
-            {Workers, Capacity, Active, Queued, Waiting} = greptimedb_rs_nif:cpu_counts(),
+            {Workers, Capacity, Active, Queued, Waiting} = greptimedb_rs_nif:codec_counts(),
             ?assert(Active =< Workers),
             ?assert(Queued =< Capacity),
             Active > 0 andalso
@@ -477,7 +482,7 @@ cpu(Mode, Config) ->
     wait(
         fun() ->
             {_, Operations} = greptimedb_rs_nif:resource_counts(),
-            {Workers, Capacity, Active, Queued, Waiting} = greptimedb_rs_nif:cpu_counts(),
+            {Workers, Capacity, Active, Queued, Waiting} = greptimedb_rs_nif:codec_counts(),
             ?assert(Active =< Workers),
             ?assert(Queued =< Capacity),
             ?assert(Operations >= Active),
@@ -489,17 +494,17 @@ cpu(Mode, Config) ->
         case Mode of
             library_stop ->
                 counts({0, 0}),
-                ?assertEqual({0, 0, 0, 0, 0}, greptimedb_rs_nif:cpu_counts()),
+                ?assertEqual({0, 0, 0, 0, 0}, greptimedb_rs_nif:codec_counts()),
                 ok = greptimedb_rs:stop_client(Client),
                 {ok, _} = application:ensure_all_started(greptimedb_rs),
                 client(Server, 1, 4, 10000, true);
             _ ->
                 Client
         end,
-    ok = recover(Recovered, <<"regression_cpu_recovered">>),
+    ok = recover(Recovered, <<"regression_codec_recovered">>),
     ok = application:stop(greptimedb_rs),
     counts({0, 0}),
-    ?assertEqual({0, 0, 0, 0, 0}, greptimedb_rs_nif:cpu_counts()).
+    ?assertEqual({0, 0, 0, 0, 0}, greptimedb_rs_nif:codec_counts()).
 
 t_startup_failure(Config) ->
     startup_child(invalid_config, Config).
@@ -556,10 +561,10 @@ startup_scenario(invalid_config) ->
             ?assertMatch({error, _}, application:ensure_all_started(greptimedb_rs)),
             ?assertEqual(undefined, whereis(greptimedb_rs_runtime)),
             counts({0, 0}),
-            ?assertEqual({0, 0, 0, 0, 0}, greptimedb_rs_nif:cpu_counts()),
+            ?assertEqual({0, 0, 0, 0, 0}, greptimedb_rs_nif:codec_counts()),
             application:set_env(greptimedb_rs, Key, 2)
         end,
-        [{runtime_workers, 65}, {cpu_workers, 0}]
+        [{runtime_workers, 65}, {codec_workers, 0}]
     );
 startup_scenario(pressure) ->
     Saved = string:trim(prlimit(["--nproc", "--output", "SOFT", "--noheadings"])),
@@ -614,7 +619,7 @@ pressure_attempt(Limit) ->
                 error({unexpected_startup_result, Result})
         end,
     ?assertEqual({0, 0}, greptimedb_rs_nif:resource_counts()),
-    ?assertEqual({0, 0, 0, 0, 0}, greptimedb_rs_nif:cpu_counts()),
+    ?assertEqual({0, 0, 0, 0, 0}, greptimedb_rs_nif:codec_counts()),
     Outcome.
 
 thread_limit(Soft) ->
@@ -726,3 +731,100 @@ t_conversion_errors(Config) ->
         {ok, [[7]]}, greptimedb_rs:query(Client, <<"SELECT reading FROM regression_int8">>)
     ),
     counts({1, 0}).
+
+%% Hold initial response headers to exercise the SDK's transport timeout.
+t_request_timeout(Config) ->
+    Server = ?config(server, Config),
+    QueryClient = client(Server, 1, 1, 20000, false),
+    InsertClient = client(Server, 2, 1, 20000, false),
+    Table = <<"regression_long_timeout">>,
+    {ok, _} = greptimedb_rs:query(
+        QueryClient,
+        <<"CREATE TABLE regression_long_timeout (ts TIMESTAMP TIME INDEX, reading INT64)">>
+    ),
+    ok = greptimedb_test_server:pause_headers(Server),
+    Query = start_request(fun() -> invoke(query, QueryClient) end),
+    Insert = start_request(fun() ->
+        async(fun(Cb) -> greptimedb_rs:insert_async(InsertClient, Table, [row()], Cb) end)
+    end),
+    wait(fun() -> greptimedb_test_server:headers(Server) >= 2 end, 1000),
+    receive
+        {Ref, Result, _} -> ct:fail({premature_result, Ref, Result})
+    after 11000 -> ok
+    end,
+    ok = greptimedb_test_server:release(Server),
+    {{ok, [[1]]}, _} = result(Query, 5000),
+    {{ok, 1}, _} = result(Insert, 5000),
+    counts({1, 0}),
+    ?assertEqual(
+        {ok, [[7]]}, greptimedb_rs:query(QueryClient, <<"SELECT reading FROM ", Table/binary>>)
+    ),
+    lists:foreach(fun no_result/1, [Query, Insert]).
+
+t_request_timeout_expiry(Config) ->
+    Server = ?config(server, Config),
+    Clients = [client(Server, I, 1, 12000, false) || I <- [1, 2]],
+    ok = greptimedb_test_server:pause_headers(Server),
+    Requests = [
+        start_request(fun() -> invoke(Mode, Client) end)
+     || {Mode, Client} <- lists:zip([query, query_async], Clients)
+    ],
+    lists:foreach(
+        fun(Request) ->
+            {{error, timeout}, Elapsed} = result(Request, 14000),
+            ?assert(Elapsed >= 11500000 andalso Elapsed =< 14000000)
+        end,
+        Requests
+    ),
+    counts({1, 0}),
+    ok = greptimedb_test_server:release(Server),
+    lists:foreach(
+        fun(Client) -> ?assertEqual({ok, [[1]]}, greptimedb_rs:query(Client, <<"SELECT 1">>)) end,
+        Clients
+    ),
+    lists:foreach(fun no_result/1, Requests).
+
+%% Rejected native submissions must not release another request's client slot.
+t_submit_rejection(Config) ->
+    Server = ?config(server, Config),
+    Client = client(Server, 1, 1, 10000, false),
+    Healthy = client(Server, 2, 1, 10000, true),
+    [{_, Worker}] = ecpool:workers(maps:get(pool_name, Client)),
+    {ok, Conn} = ecpool_worker:client(Worker),
+    NativeClient = element(2, sys:get_state(Conn)),
+    Deadline = erlang:monotonic_time(microsecond) + 10000000,
+    Token = make_ref(),
+    ok = greptimedb_test_server:pause(Server),
+    {ok, Operation} = greptimedb_rs_nif:submit(
+        NativeClient, execute, [<<"SELECT 1">>], Token, Deadline
+    ),
+    wait(fun() -> greptimedb_test_server:headers(Server) >= 1 end, 1000),
+    %% A second rejection checks that cleaning up the first kept the occupied slot.
+    lists:foreach(
+        fun(_) ->
+            ?assertEqual(
+                {error, busy},
+                greptimedb_rs_nif:submit(
+                    NativeClient, execute, [<<"SELECT 1">>], make_ref(), Deadline
+                )
+            ),
+            ?assert(greptimedb_rs_nif:operation_active(Operation)),
+            counts({1, 1})
+        end,
+        [first, second]
+    ),
+    ok = greptimedb_rs_nif:cancel(Operation),
+    receive
+        {greptimedb_nif, Token, {error, cancelled}} -> ok
+    after 1000 -> error(missing_cancelled_reply)
+    end,
+    counts({1, 0}),
+    ok = greptimedb_test_server:release(Server),
+    ?assertEqual({ok, [[1]]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
+    ok = greptimedb_rs_nif:disconnect(NativeClient),
+    ?assertEqual(
+        {error, closed},
+        greptimedb_rs_nif:submit(NativeClient, execute, [<<"SELECT 1">>], make_ref(), Deadline)
+    ),
+    counts({1, 0}),
+    ?assertEqual({ok, [[1]]}, greptimedb_rs:query(Healthy, <<"SELECT 1">>)).

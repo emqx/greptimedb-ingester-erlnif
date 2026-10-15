@@ -89,6 +89,9 @@ jobs:
         run: |
           rebar3 compile
 
+      - name: Test Rust failure handling
+        run: cargo test --release --workspace --lib --locked
+
       - name: Check Erlang style (Elvis)
         run: make lint
 

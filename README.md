@@ -59,26 +59,28 @@ Opts = #{
 - `request_timeout`: Positive milliseconds for query and insert; default `10000`.
 - `stream_timeout`: Positive milliseconds for stream start, write and close; default `30000`.
 
+RPC timeouts are controlled by the operation deadline rather than the SDK's default 10-second request timeout. The SDK retains its connection establishment timeout and the streaming writer's 30-second internal timeout.
+
 The deadline starts when the public API accepts the call and includes library queueing, schema discovery, RPC and response consumption. Query/insert/write timeouts return `{error, timeout}` or invoke the existing asynchronous callback with that result. Stream start and close retain their existing best effort public return semantics.
 
 Timeouts cancel local work and do not undo writes already accepted by the server. Uncertain writes are not automatically retried. After a streaming write timeout or error, establish a new writer using `stream_start/3` before writing again.
 
 ### Shared runtime
 
-All pools share one Tokio runtime. Defaults are two Tokio workers, one owner thread for non-`Send` SDK tasks, and two CPU workers for row conversion and large query result encoding.
+All pools share one Tokio runtime. Defaults are two Tokio workers, one owner thread for non-`Send` SDK tasks, and two codec workers for row conversion and large query result encoding.
 
 Configure worker counts before starting the application:
 
 ```erlang
 application:load(greptimedb_rs),
 application:set_env(greptimedb_rs, runtime_workers, 2),
-application:set_env(greptimedb_rs, cpu_workers, 2),
+application:set_env(greptimedb_rs, codec_workers, 2),
 application:ensure_all_started(greptimedb_rs).
 ```
 
-Both settings accept 1–64 and take effect on application restart. The CPU pool accepts at most `2 * cpu_workers` queued and running jobs; additional operations wait asynchronously within their deadline. Running CPU work finishes before its client slot is released after cancellation.
+Both settings accept 1–64 and take effect on application restart. The codec pool accepts at most `2 * codec_workers` queued and running jobs; additional operations wait asynchronously within their deadline. Running codec work finishes before its client slot is released after cancellation.
 
-Application startup returns an error when native runtime creation fails. Async callback exceptions are logged as `greptimedb_callback_failed`; the worker continues processing requests.
+Application startup returns an error when native runtime creation fails. A poisoned native client state lock closes that client and cancels its active request while retaining codec work until reclamation. The affected pool connection must be recreated. Async callback exceptions are logged as `greptimedb_callback_failed`; the worker continues processing requests.
 
 Stopping a pool releases its own requests and writers. Stopping the application closes the shared runtime and clients. Clients with `auto_reconnect` can reconnect after a runtime owner restart.
 
@@ -297,7 +299,7 @@ against Erlang sources, headers, tests and `rebar.config`; rules are in
 
 ## Regression tests
 
-Run the real network fault, runtime lifecycle and CPU cancellation tests using a GreptimeDB executable:
+Run the real network fault, runtime lifecycle and codec cancellation tests using a GreptimeDB executable:
 
 ```bash
 make regression GREPTIME_BIN=/path/to/greptime

@@ -10,7 +10,7 @@
         ecpool
     ]},
     {mod, {greptimedb_rs_app, []}},
-    {env, [{runtime_workers, 2}, {cpu_workers, 2}]},
+    {env, [{runtime_workers, 2}, {codec_workers, 2}]},
     {modules, []},
     {licenses, ["Apache-2.0"]},
     {links, []}

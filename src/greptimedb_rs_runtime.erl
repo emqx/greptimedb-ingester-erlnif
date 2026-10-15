@@ -15,8 +15,8 @@ start_link() ->
 init([]) ->
     process_flag(trap_exit, true),
     Workers = application:get_env(greptimedb_rs, runtime_workers, 2),
-    CpuWorkers = application:get_env(greptimedb_rs, cpu_workers, 2),
-    case greptimedb_rs_nif:runtime_start(Workers, CpuWorkers) of
+    CodecWorkers = application:get_env(greptimedb_rs, codec_workers, 2),
+    case greptimedb_rs_nif:runtime_start(Workers, CodecWorkers) of
         Runtime when is_reference(Runtime) -> {ok, Runtime};
         {error, Reason} -> {stop, Reason}
     end.

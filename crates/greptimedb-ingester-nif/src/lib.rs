@@ -1,12 +1,13 @@
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures::FutureExt;
 use std::time::Duration;
 
 use greptime_proto::v1::auth_header::AuthScheme;
 use greptime_proto::v1::Basic;
+use greptimedb_ingester::channel_manager::{ChannelConfig, ChannelManager};
 use greptimedb_ingester::client::Client;
 use greptimedb_ingester::database::Database;
 use greptimedb_ingester::{BulkInserter, BulkWriteOptions, ColumnDataType, TableSchema};
@@ -14,15 +15,17 @@ use rustler::{
     Atom, Encoder, Env, LocalPid, Monitor, NifResult, OwnedEnv, Resource, ResourceArc, Term,
 };
 
-use operation::{Context, Operation, OperationResource, RuntimeOwner, RuntimeResource};
+use operation::{Operation, OperationResource};
+use runtime::{Context, RuntimeOwner, RuntimeResource};
 use rustler::env::SavedTerm;
 use std::rc::Rc;
 
 static FIPS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub mod atoms;
-mod data_conversion_pool;
+mod codec;
 mod operation;
+mod runtime;
 mod types;
 mod util;
 
@@ -59,9 +62,26 @@ impl Resource for GreptimeResource {
 }
 
 impl GreptimeResource {
+    fn lock_operation(&self) -> MutexGuard<'_, Option<Arc<Operation>>> {
+        match self.operation.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => {
+                // Stop admitting requests, but leave active work tracked until reclamation.
+                self.closed.store(true, Ordering::Release);
+                let slot = poisoned.into_inner();
+                if let Some(operation) = slot.as_ref() {
+                    operation.cancel();
+                }
+                self.operation.clear_poison();
+                slot
+            }
+        }
+    }
+
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
-        if let Some(operation) = self.operation.lock().unwrap().as_ref() {
+        let operation = self.lock_operation().clone();
+        if let Some(operation) = operation {
             operation.cancel();
         }
     }
@@ -84,12 +104,12 @@ fn check_fips_enabled() -> bool {
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
-fn runtime_start(env: Env, workers: usize, cpu_workers: usize) -> NifResult<Term> {
+fn runtime_start(env: Env, workers: usize, codec_workers: usize) -> NifResult<Term> {
     let runtime =
-        operation::start(workers, cpu_workers).map_err(|e| rustler::Error::Term(Box::new(e)))?;
+        runtime::start(workers, codec_workers).map_err(|e| rustler::Error::Term(Box::new(e)))?;
     let resource = ResourceArc::new(RuntimeResource(runtime));
     if resource.monitor(Some(env), &env.pid()).is_none() {
-        operation::stop(&resource);
+        runtime::stop(&resource);
         return Err(rustler::Error::BadArg);
     }
     Ok(resource.encode(env))
@@ -97,7 +117,7 @@ fn runtime_start(env: Env, workers: usize, cpu_workers: usize) -> NifResult<Term
 
 #[rustler::nif(schedule = "DirtyIo")]
 fn runtime_stop(runtime: ResourceArc<RuntimeResource>) -> Atom {
-    operation::stop(&runtime);
+    runtime::stop(&runtime);
     atoms::ok()
 }
 
@@ -139,7 +159,7 @@ fn decode_tls_verify(verify_term: Term) -> Result<TlsVerify, String> {
 fn connect(opts: Term) -> NifResult<Term> {
     let env = opts.get_env();
 
-    let runtime = operation::shared().map_err(|e| rustler::Error::Term(Box::new(e)))?;
+    let runtime = runtime::shared().map_err(|e| rustler::Error::Term(Box::new(e)))?;
 
     let endpoints_term: Term = opts.map_get(atoms::endpoints().to_term(env))?;
     let dbname_term: Term = opts.map_get(atoms::dbname().to_term(env))?;
@@ -147,6 +167,11 @@ fn connect(opts: Term) -> NifResult<Term> {
     let endpoints: Vec<String> = endpoints_term.decode()?;
     let dbname: String = dbname_term.decode()?;
 
+    // The operation deadline includes queueing and response consumption.
+    let channel_config = ChannelConfig {
+        timeout: None,
+        ..Default::default()
+    };
     let client = if let Ok(tls_term) = opts.map_get(atoms::tls().to_term(env)) {
         if tls_term.decode::<bool>()? {
             let tls_verify = match opts.map_get(atoms::verify().to_term(env)) {
@@ -179,15 +204,19 @@ fn connect(opts: Term) -> NifResult<Term> {
                     .unwrap_or_default(),
             };
 
-            match Client::with_tls_and_urls_with_verify(endpoints, tls_option, tls_verify) {
-                Ok(c) => c,
+            match ChannelManager::with_tls_config(
+                channel_config
+                    .tls_verify(tls_verify)
+                    .client_tls_config(tls_option),
+            ) {
+                Ok(manager) => Client::with_manager_and_urls(manager, endpoints),
                 Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
             }
         } else {
-            Client::with_urls(endpoints)
+            Client::with_manager_and_urls(ChannelManager::with_config(channel_config), endpoints)
         }
     } else {
-        Client::with_urls(endpoints)
+        Client::with_manager_and_urls(ChannelManager::with_config(channel_config), endpoints)
     };
 
     let mut db = Database::new_with_dbname(dbname, client.clone());
@@ -453,8 +482,13 @@ struct Running {
 
 impl Drop for Running {
     fn drop(&mut self) {
-        let mut slot = self.client.operation.lock().unwrap();
-        *slot = None;
+        let mut slot = self.client.lock_operation();
+        if slot
+            .as_ref()
+            .is_some_and(|operation| Arc::ptr_eq(operation, &self.operation))
+        {
+            *slot = None;
+        }
         self.operation.finish();
     }
 }
@@ -474,25 +508,29 @@ fn submit<'a>(
     let deadline = tokio::time::Instant::now() + Duration::from_micros(remaining);
     let request = Request::decode(command, arguments)?;
     let writer = request.writer();
-    let mut slot = client.operation.lock().unwrap();
-    if client.closed.load(Ordering::Acquire) || client.runtime.is_stopping() {
-        return Ok((atoms::error(), atoms::closed()).encode(env));
-    }
-    if slot.is_some() {
-        return Ok((atoms::error(), atoms::busy()).encode(env));
-    }
     let (operation, mut cancelled) = Operation::new();
-    let operation_resource = ResourceArc::new(OperationResource(operation.clone()));
-    if operation_resource.monitor(Some(env), &env.pid()).is_none() {
-        operation.finish();
-        return Err(rustler::Error::BadArg);
-    }
-    *slot = Some(operation.clone());
-    drop(slot);
     let running = Running {
         client: client.clone(),
-        operation,
+        operation: operation.clone(),
     };
+    let operation_resource = ResourceArc::new(OperationResource(operation.clone()));
+    operation_resource
+        .monitor(Some(env), &env.pid())
+        .ok_or(rustler::Error::BadArg)?;
+    let rejected = {
+        let mut slot = client.lock_operation();
+        if client.closed.load(Ordering::Acquire) || client.runtime.is_stopping() {
+            Some(atoms::closed())
+        } else if slot.is_some() {
+            Some(atoms::busy())
+        } else {
+            *slot = Some(operation);
+            None
+        }
+    };
+    if let Some(reason) = rejected {
+        return Ok((atoms::error(), reason).encode(env));
+    }
     let control = running.operation.clone();
     let pid = env.pid();
     let output = OwnedEnv::new();
@@ -521,7 +559,7 @@ fn submit<'a>(
                     value = &mut future => value.unwrap_or(Err(Failure::Panic)),
                 }
             };
-            control.wait_cpu().await;
+            control.wait_codec_jobs().await;
             if let Err(error) = check_operation(deadline, &control) {
                 if let Ok(Value::Writer(writer)) = &result {
                     writer.closed.store(true, Ordering::Release);
@@ -545,12 +583,12 @@ fn submit<'a>(
                 let encoded = running
                     .client
                     .runtime
-                    .data_conversion_pool
+                    .codec_pool
                     .run(control.clone(), deadline, move || {
                         Ok(encode_reply(output, token, result))
                     })
                     .await;
-                control.wait_cpu().await;
+                control.wait_codec_jobs().await;
                 match encoded {
                     Ok(reply) => reply,
                     Err(error) => encode_reply(fallback, fallback_token, Err(error)),
@@ -585,8 +623,8 @@ fn encode_reply(
 }
 
 #[rustler::nif]
-fn cpu_counts() -> (usize, usize, usize, usize, usize) {
-    data_conversion_pool::counts()
+fn codec_counts() -> (usize, usize, usize, usize, usize) {
+    codec::counts()
 }
 
 #[rustler::nif]
@@ -609,7 +647,7 @@ fn discard_writer(writer: ResourceArc<StreamWriterResource>) -> Atom {
 
 #[rustler::nif]
 fn resource_counts() -> (usize, usize) {
-    operation::counts()
+    (runtime::count(), operation::count())
 }
 
 fn check_operation(deadline: tokio::time::Instant, control: &Operation) -> Result<(), Failure> {
@@ -653,7 +691,7 @@ async fn perform(
             let ts_column = client.ts_column.clone();
             let (schema, rows) = client
                 .runtime
-                .data_conversion_pool
+                .codec_pool
                 .run(control.clone(), deadline, move || {
                     input.convert(|rows| match server {
                         Ok(schema) => {
@@ -713,7 +751,7 @@ async fn perform(
                 .await
                 .map_err(native)?;
             writer.alloc_rows_buffer(5000, 1024).map_err(native)?;
-            let id = operation::writer_id();
+            let id = runtime::writer_id();
             context.writers.borrow_mut().insert(id, writer);
             Ok(Value::Writer(ResourceArc::new(StreamWriterResource {
                 id,
@@ -726,7 +764,7 @@ async fn perform(
             let schema = resource.schema.clone();
             let rows = client
                 .runtime
-                .data_conversion_pool
+                .codec_pool
                 .run(control.clone(), deadline, move || {
                     input.convert(|rows| util::terms_to_rows(&schema, rows))
                 })
@@ -755,3 +793,43 @@ async fn perform(
 }
 
 rustler::init!("greptimedb_rs_nif", load = load);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn poisoned_client_slot_closes_and_cancels_without_finishing_early() {
+        let owner = RuntimeResource(runtime::start(1, 1).expect("start test runtime"));
+        for occupied in [false, true] {
+            let sdk = Client::with_urls(["127.0.0.1:4001"]);
+            let (operation, _cancelled) = Operation::new();
+            let client = GreptimeResource {
+                db: Database::new_with_dbname("public", sdk.clone()),
+                client: sdk,
+                auth: None,
+                ts_column: None,
+                ttl: None,
+                runtime: owner.0.clone(),
+                operation: Mutex::new(occupied.then(|| operation.clone())),
+                closed: AtomicBool::new(false),
+            };
+            let _ = catch_unwind(AssertUnwindSafe(|| {
+                let _slot = client.operation.lock().expect("unpoisoned test slot");
+                panic!("poison client slot");
+            }));
+            let result = catch_unwind(AssertUnwindSafe(|| client.close()));
+            let cancelled = *operation.cancel.borrow();
+            let still_active = operation.active.load(Ordering::Acquire);
+            operation.finish();
+            assert!(result.is_ok());
+            assert!(client.closed.load(Ordering::Acquire));
+            assert!(!client.operation.is_poisoned());
+            assert_eq!(cancelled, occupied);
+            assert!(still_active);
+            assert!(catch_unwind(AssertUnwindSafe(|| client.close())).is_ok());
+        }
+        runtime::stop(&owner);
+    }
+}

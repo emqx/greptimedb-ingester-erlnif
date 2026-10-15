@@ -1,3 +1,8 @@
+//! Runs Erlang row decoding, SDK data conversion and Erlang result encoding.
+//!
+//! A fixed thread pool and shared permits bound queued/running codec jobs.
+//! Transport protocol encoding and decoding remain the SDK's responsibility.
+
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -6,7 +11,7 @@ use std::thread::JoinHandle;
 use tokio::sync::{oneshot, Semaphore};
 use tokio::time::Instant;
 
-use crate::operation::{CpuGuard, Operation};
+use crate::operation::{CodecJobGuard, Operation};
 use crate::Failure;
 
 static WORKERS: AtomicUsize = AtomicUsize::new(0);
@@ -17,14 +22,14 @@ static WAITING: AtomicUsize = AtomicUsize::new(0);
 
 type Job = Box<dyn FnOnce() + Send>;
 
-pub(crate) struct DataConversionPool {
+pub(crate) struct CodecPool {
     jobs: Mutex<Option<mpsc::Sender<Job>>>,
     permits: Arc<Semaphore>,
     threads: Mutex<Vec<JoinHandle<()>>>,
     stopped: AtomicBool,
 }
 
-impl DataConversionPool {
+impl CodecPool {
     pub(crate) fn new(workers: usize) -> std::io::Result<Arc<Self>> {
         let (sender, receiver) = mpsc::channel::<Job>();
         let receiver = Arc::new(Mutex::new(receiver));
@@ -39,7 +44,7 @@ impl DataConversionPool {
         for i in 0..workers {
             let receiver = receiver.clone();
             let thread = std::thread::Builder::new()
-                .name(format!("greptime-cpu-{i}"))
+                .name(format!("greptime-codec-{i}"))
                 .spawn(move || loop {
                     let job = receiver.lock().unwrap().recv();
                     match job {
@@ -130,7 +135,7 @@ impl DataConversionPool {
     }
 }
 
-impl Drop for DataConversionPool {
+impl Drop for CodecPool {
     fn drop(&mut self) {
         self.stop();
     }
@@ -145,13 +150,13 @@ impl Drop for Waiting {
 }
 
 struct JobGuard {
-    _operation: CpuGuard,
+    _operation: CodecJobGuard,
     started: bool,
 }
 
 impl JobGuard {
     fn new(operation: Arc<Operation>) -> Self {
-        let operation = operation.begin_cpu();
+        let operation = operation.begin_codec_job();
         QUEUED.fetch_add(1, Ordering::AcqRel);
         Self {
             _operation: operation,

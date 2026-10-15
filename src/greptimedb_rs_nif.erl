@@ -25,7 +25,7 @@
     cancel/1,
     operation_active/1,
     resource_counts/0,
-    cpu_counts/0,
+    codec_counts/0,
     discard_writer/1,
     fips_status/0,
     cached_fips_status/0
@@ -45,7 +45,7 @@ init() ->
 %% =================================================================================================
 %% NIFs
 
-runtime_start(_Workers, _CpuWorkers) ->
+runtime_start(_Workers, _CodecWorkers) ->
     not_loaded(?LINE).
 
 runtime_stop(_Runtime) ->
@@ -66,7 +66,7 @@ cancel(_Operation) ->
 operation_active(_Operation) ->
     not_loaded(?LINE).
 
-cpu_counts() ->
+codec_counts() ->
     not_loaded(?LINE).
 
 resource_counts() ->

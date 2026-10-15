@@ -1,224 +1,24 @@
-use std::cell::RefCell;
-use std::collections::HashMap;
-use std::future::Future;
-use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::pin::Pin;
-use std::rc::Rc;
+//! Tracks cancellation and reclamation of individual native requests.
+//!
+//! State is shared by the runtime owner and codec workers; this module creates no threads.
+//! The resource monitor cancels requests when their Erlang connection process exits.
+//! Codec job guards keep cancelled requests active until their conversion/encoding work ends.
+
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
-use std::thread::JoinHandle;
+use std::sync::Arc;
 
-use crate::data_conversion_pool::DataConversionPool;
-use greptimedb_ingester::BulkStreamWriter;
 use rustler::{Env, LocalPid, Monitor, Resource};
-use tokio::runtime::Builder;
-use tokio::sync::{mpsc, watch, Notify};
+use tokio::sync::{watch, Notify};
 
-static RUNTIMES: AtomicUsize = AtomicUsize::new(0);
 static OPERATIONS: AtomicUsize = AtomicUsize::new(0);
-static SHARED: Mutex<Option<Arc<RuntimeOwner>>> = Mutex::new(None);
-static NEXT_WRITER: AtomicUsize = AtomicUsize::new(0);
-
-pub struct Context {
-    pub writers: RefCell<HashMap<usize, BulkStreamWriter>>,
-}
-
-type Job = Box<dyn FnOnce(Rc<Context>) -> Pin<Box<dyn Future<Output = ()>>> + Send>;
-
-pub struct RuntimeOwner {
-    jobs: mpsc::UnboundedSender<Job>,
-    pub(crate) data_conversion_pool: Arc<DataConversionPool>,
-    shutdown: watch::Sender<bool>,
-    thread: Mutex<Option<JoinHandle<()>>>,
-}
-
-impl RuntimeOwner {
-    fn new(workers: usize, cpu_workers: usize) -> std::io::Result<Self> {
-        let data_conversion_pool = DataConversionPool::new(cpu_workers)?;
-        let owner_data_conversion_pool = data_conversion_pool.clone();
-        let runtime = Builder::new_multi_thread()
-            .worker_threads(workers)
-            .thread_name("greptime-worker")
-            .enable_all()
-            .build()?;
-        let (shutdown, mut stopping) = watch::channel(false);
-        let (jobs, mut receiver) = mpsc::unbounded_channel::<Job>();
-        RUNTIMES.fetch_add(1, Ordering::AcqRel);
-        let thread = std::thread::Builder::new()
-            .name("greptime-runtime-owner".into())
-            .spawn(move || {
-                // SDK streaming futures are not Send. Construct and poll them
-                // here; all clients share this LocalSet and the worker pool.
-                let context = Rc::new(Context {
-                    writers: RefCell::new(HashMap::new()),
-                });
-                let tasks = tokio::task::LocalSet::new();
-                runtime.block_on(tasks.run_until(async {
-                    loop {
-                        tokio::select! {
-                            biased;
-                            _ = stopping.changed() => break,
-                            job = receiver.recv() => match job {
-                                Some(job) => { tokio::task::spawn_local(job(context.clone())); }
-                                None => break,
-                            }
-                        }
-                    }
-                }));
-                receiver.close();
-                runtime.block_on(tasks.run_until(async {
-                    while let Some(job) = receiver.recv().await {
-                        tokio::task::spawn_local(job(context.clone()));
-                    }
-                }));
-                runtime.block_on(tasks);
-                drop(context);
-                owner_data_conversion_pool.stop();
-                drop(runtime);
-                RUNTIMES.fetch_sub(1, Ordering::AcqRel);
-            });
-        match thread {
-            Ok(thread) => Ok(Self {
-                jobs,
-                data_conversion_pool,
-                shutdown,
-                thread: Mutex::new(Some(thread)),
-            }),
-            Err(error) => {
-                RUNTIMES.fetch_sub(1, Ordering::AcqRel);
-                Err(error)
-            }
-        }
-    }
-
-    pub fn spawn<F, Fut>(&self, make: F) -> Result<(), ()>
-    where
-        F: FnOnce(Rc<Context>) -> Fut + Send + 'static,
-        Fut: Future<Output = ()> + 'static,
-    {
-        if *self.shutdown.borrow() {
-            return Err(());
-        }
-        self.jobs
-            .send(Box::new(move |context| Box::pin(make(context))))
-            .map_err(|_| ())
-    }
-
-    pub fn is_stopping(&self) -> bool {
-        *self.shutdown.borrow()
-    }
-
-    pub fn stopping(&self) -> watch::Receiver<bool> {
-        self.shutdown.subscribe()
-    }
-
-    fn signal_shutdown(&self) {
-        self.shutdown.send_replace(true);
-        self.data_conversion_pool.close();
-    }
-
-    fn stop(&self) {
-        self.signal_shutdown();
-        if let Some(thread) = self.thread.lock().unwrap().take() {
-            let _ = thread.join();
-        }
-    }
-
-    pub fn discard(&self, id: usize) {
-        let _ = self.spawn(move |context| async move {
-            context.writers.borrow_mut().remove(&id);
-        });
-    }
-}
-
-pub struct RuntimeResource(pub Arc<RuntimeOwner>);
-
-impl Resource for RuntimeResource {
-    const IMPLEMENTS_DOWN: bool = true;
-
-    fn down(&self, _env: Env, _pid: LocalPid, _monitor: Monitor) {
-        self.0.signal_shutdown();
-    }
-}
-
-impl Drop for RuntimeResource {
-    fn drop(&mut self) {
-        self.0.signal_shutdown();
-    }
-}
-
-pub fn start(workers: usize, cpu_workers: usize) -> Result<Arc<RuntimeOwner>, String> {
-    if !(1..=64).contains(&workers) {
-        return Err("runtime_workers must be between 1 and 64".into());
-    }
-    if !(1..=64).contains(&cpu_workers) {
-        return Err("cpu_workers must be between 1 and 64".into());
-    }
-    let mut shared = shared_state();
-    if let Some(previous) = shared.as_ref() {
-        if !*previous.shutdown.borrow() {
-            return Err("runtime already started".into());
-        }
-        previous.stop();
-    }
-    // Catch initialization panics before they unwind through the shared-state lock.
-    let runtime = catch_unwind(AssertUnwindSafe(|| RuntimeOwner::new(workers, cpu_workers)))
-        .map_err(|panic| {
-            let reason = panic
-                .downcast_ref::<String>()
-                .map(String::as_str)
-                .or_else(|| panic.downcast_ref::<&str>().copied())
-                .unwrap_or("unknown panic");
-            format!("runtime initialization panicked: {reason}")
-        })?
-        .map_err(|e| e.to_string())?;
-    let runtime = Arc::new(runtime);
-    *shared = Some(runtime.clone());
-    Ok(runtime)
-}
-
-pub fn shared() -> Result<Arc<RuntimeOwner>, String> {
-    shared_state()
-        .as_ref()
-        .filter(|runtime| !*runtime.shutdown.borrow())
-        .cloned()
-        .ok_or_else(|| "greptimedb_rs runtime is not running".into())
-}
-
-pub fn stop(resource: &RuntimeResource) {
-    let mut shared = shared_state();
-    resource.0.stop();
-    if shared
-        .as_ref()
-        .is_some_and(|runtime| Arc::ptr_eq(runtime, &resource.0))
-    {
-        *shared = None;
-    }
-}
-
-fn shared_state() -> MutexGuard<'static, Option<Arc<RuntimeOwner>>> {
-    match SHARED.lock() {
-        Ok(shared) => shared,
-        Err(poisoned) => {
-            let mut shared = poisoned.into_inner();
-            if let Some(previous) = shared.take() {
-                previous.stop();
-            }
-            SHARED.clear_poison();
-            shared
-        }
-    }
-}
-
-pub fn writer_id() -> usize {
-    NEXT_WRITER.fetch_add(1, Ordering::Relaxed)
-}
 
 pub struct Operation {
+    // The owner task and conversion jobs need both the latest cancellation state
+    // and an async wakeup. Receivers added after cancellation can read true.
     pub cancel: watch::Sender<bool>,
     pub active: AtomicBool,
-    cpu_jobs: AtomicUsize,
-    cpu_done: Notify,
+    codec_jobs: AtomicUsize,
+    codec_done: Notify,
 }
 
 impl Operation {
@@ -229,21 +29,21 @@ impl Operation {
             Arc::new(Self {
                 cancel,
                 active: AtomicBool::new(true),
-                cpu_jobs: AtomicUsize::new(0),
-                cpu_done: Notify::new(),
+                codec_jobs: AtomicUsize::new(0),
+                codec_done: Notify::new(),
             }),
             receiver,
         )
     }
 
-    pub(crate) fn begin_cpu(self: &Arc<Self>) -> CpuGuard {
-        self.cpu_jobs.fetch_add(1, Ordering::AcqRel);
-        CpuGuard(self.clone())
+    pub(crate) fn begin_codec_job(self: &Arc<Self>) -> CodecJobGuard {
+        self.codec_jobs.fetch_add(1, Ordering::AcqRel);
+        CodecJobGuard(self.clone())
     }
 
-    pub(crate) async fn wait_cpu(&self) {
-        while self.cpu_jobs.load(Ordering::Acquire) != 0 {
-            self.cpu_done.notified().await;
+    pub(crate) async fn wait_codec_jobs(&self) {
+        while self.codec_jobs.load(Ordering::Acquire) != 0 {
+            self.codec_done.notified().await;
         }
     }
 
@@ -258,12 +58,12 @@ impl Operation {
     }
 }
 
-pub(crate) struct CpuGuard(Arc<Operation>);
+pub(crate) struct CodecJobGuard(Arc<Operation>);
 
-impl Drop for CpuGuard {
+impl Drop for CodecJobGuard {
     fn drop(&mut self) {
-        if self.0.cpu_jobs.fetch_sub(1, Ordering::AcqRel) == 1 {
-            self.0.cpu_done.notify_one();
+        if self.0.codec_jobs.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.codec_done.notify_one();
         }
     }
 }
@@ -278,9 +78,6 @@ impl Resource for OperationResource {
     }
 }
 
-pub fn counts() -> (usize, usize) {
-    (
-        RUNTIMES.load(Ordering::Acquire),
-        OPERATIONS.load(Ordering::Acquire),
-    )
+pub fn count() -> usize {
+    OPERATIONS.load(Ordering::Acquire)
 }

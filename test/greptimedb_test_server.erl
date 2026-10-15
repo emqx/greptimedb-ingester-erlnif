@@ -2,7 +2,16 @@
 -behaviour(gen_server).
 -export([run_beam/4]).
 -export([
-    start/2, stop/1, endpoint/1, backend/1, pause/1, release/1, disconnect/1, headers/1, restart/1
+    start/2,
+    stop/1,
+    endpoint/1,
+    backend/1,
+    pause/1,
+    pause_headers/1,
+    release/1,
+    disconnect/1,
+    headers/1,
+    restart/1
 ]).
 -export([
     init/1,
@@ -59,6 +68,9 @@ backend(Server) ->
 pause(Server) ->
     gen_server:call(Server, pause).
 
+pause_headers(Server) ->
+    gen_server:call(Server, pause_headers).
+
 release(Server) ->
     gen_server:call(Server, release).
 
@@ -109,7 +121,7 @@ init([Binary, Directory]) ->
         sockets => [],
         held => [],
         headers => #{},
-        paused => false
+        paused => none
     },
     Started = start_backend(State),
     {Listener, Port} = listen(),
@@ -122,7 +134,9 @@ handle_call(endpoint, _, State) ->
 handle_call(backend, _, State) ->
     {reply, address(maps:get(rpc, State)), State};
 handle_call(pause, _, State) ->
-    {reply, ok, State#{paused := true, headers := #{}}};
+    {reply, ok, State#{paused := body, headers := #{}}};
+handle_call(pause_headers, _, State) ->
+    {reply, ok, State#{paused := headers, headers := #{}}};
 handle_call(headers, _, State) ->
     {reply, map_size(maps:get(headers, State)), State};
 handle_call(release, _, State) ->
@@ -130,21 +144,22 @@ handle_call(release, _, State) ->
         fun({Socket, Packet}) -> gen_tcp:send(Socket, Packet) end,
         lists:reverse(maps:get(held, State))
     ),
-    {reply, ok, State#{paused := false, held := []}};
+    {reply, ok, State#{paused := none, held := []}};
 handle_call(disconnect, _, State) ->
     {reply, ok, close_sockets(State)};
 handle_call(restart, _, State) ->
     stop_backend(State),
     {reply, ok, start_backend(close_sockets(State))};
-%% Forward real HTTP/2 headers, but hold response bodies and final trailers.
-%% Keeping connection control frames flowing isolates an RPC that never finishes.
+%% Keep connection control frames flowing while holding RPC responses.
+%% Body mode forwards initial headers; headers mode holds those too.
 
-handle_call({frame, Socket, Stream, Type, Flags, Packet}, _, #{paused := true} = State) when
-    Stream =/= 0, Type =:= 0; Stream =/= 0, Type =:= 1; Stream =/= 0, Type =:= 9
+handle_call({frame, Socket, Stream, Type, Flags, Packet}, _, #{paused := Paused} = State) when
+    Paused =/= none andalso Stream =/= 0 andalso
+        (Type =:= 0 orelse Type =:= 1 orelse Type =:= 9)
 ->
     Headers = (maps:get(headers, State))#{{Socket, Stream} => true},
     Next = State#{headers := Headers},
-    case Type =:= 1 andalso Flags band 1 =:= 0 of
+    case Paused =:= body andalso Type =:= 1 andalso Flags band 1 =:= 0 of
         true ->
             gen_tcp:send(Socket, Packet),
             {reply, ok, Next};
@@ -272,7 +287,7 @@ wait_exit(Port, Log, Timeout) ->
 
 close_sockets(State) ->
     lists:foreach(fun gen_tcp:close/1, maps:get(sockets, State)),
-    State#{sockets := [], held := [], paused := false}.
+    State#{sockets := [], held := [], paused := none}.
 
 accept(Listener, RpcPort, Server) ->
     case gen_tcp:accept(Listener) of
