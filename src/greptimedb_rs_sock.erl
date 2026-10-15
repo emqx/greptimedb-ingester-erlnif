@@ -192,8 +192,60 @@ terminate(_Reason, #state{client = ClientRef, pending = Pending} = State) ->
         end,
         Pending
     ),
+    flush_writers(State),
     maps:foreach(fun(_, Writer) -> apply_nif(discard_writer, [Writer]) end, State#state.writers),
     ok.
+
+flush_writers(#state{writers = Writers}) when map_size(Writers) =:= 0 ->
+    ok;
+flush_writers(State) ->
+    Deadline = local_deadline(?CMD_STREAM_CLOSE, State),
+    case await_current(State, Deadline) of
+        ok ->
+            Token = make_ref(),
+            case
+                apply_nif(submit, [
+                    State#state.client,
+                    stream_close_all,
+                    [maps:values(State#state.writers)],
+                    Token,
+                    Deadline
+                ])
+            of
+                {ok, Operation} ->
+                    receive
+                        {greptimedb_nif, Token, _Result} -> ok
+                    after remaining_ms(Deadline) ->
+                        apply_nif(cancel, [Operation])
+                    end;
+                _ ->
+                    ok
+            end;
+        timeout ->
+            ok
+    end.
+
+await_current(#state{current = undefined}, _Deadline) ->
+    ok;
+await_current(State, Deadline) ->
+    Req = maps:get(State#state.current, State#state.pending),
+    await_reclaimed(maps:get(operation, Req), Deadline).
+
+await_reclaimed(Operation, Deadline) ->
+    case greptimedb_rs_nif:operation_active(Operation) of
+        false ->
+            ok;
+        true ->
+            case remaining_ms(Deadline) of
+                0 -> timeout;
+                Remaining -> receive
+                    after min(10, Remaining) -> await_reclaimed(Operation, Deadline)
+                    end
+            end
+    end.
+
+remaining_ms(Deadline) ->
+    max(0, (Deadline - erlang:monotonic_time(microsecond) + 999) div 1000).
 
 enqueue(Cmd, Args, Deadline, Recipient, Monitor, State) ->
     Ref = make_ref(),

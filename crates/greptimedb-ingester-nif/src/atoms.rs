@@ -6,6 +6,7 @@ rustler::atoms! {
     stream_start,
     stream_write,
     stream_close,
+    stream_close_all,
     nif_error,
     timeout,
     cancelled,

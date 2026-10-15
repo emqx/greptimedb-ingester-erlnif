@@ -30,7 +30,11 @@ groups() ->
                 t_rejected_close,
                 t_close_during_start,
                 t_close_after_queued_start,
-                t_submit_rejection
+                t_submit_rejection,
+                t_pool_stop_flush,
+                t_pool_stop_flush_busy,
+                t_pool_stop_flush_timeout,
+                t_pool_stop_flush_killed
             ]}
         ].
 
@@ -961,3 +965,103 @@ close_during_start(Mode, Config) ->
     ?assertEqual(ok, greptimedb_rs:stream_write(Fresh, [row()])),
     ?assertEqual(ok, greptimedb_rs:stream_close(Fresh)),
     counts({1, 0}).
+
+%% Stopping a pool must finish batches already accepted by its stream writers.
+t_pool_stop_flush(Config) ->
+    pool_stop_flush(idle, Config).
+
+t_pool_stop_flush_busy(Config) ->
+    pool_stop_flush(busy, Config).
+
+pool_stop_flush(Mode, Config) ->
+    Server = ?config(server, Config),
+    Client = client(Server, 1, 1, 10000, false),
+    Healthy = client(Server, healthy, 1, 10000, true),
+    Tables = [
+        iolist_to_binary(["regression_stop_", atom_to_binary(Mode), Suffix])
+     || Suffix <- ["_a", "_b"]
+    ],
+    Rows = [(row())#{timestamp := 1700000000000 + I} || I <- lists:seq(1, 200000)],
+    lists:foreach(
+        fun(Table) ->
+            {ok, _} = greptimedb_rs:query(
+                Client,
+                <<"CREATE TABLE ", Table/binary, " (ts TIMESTAMP TIME INDEX, reading INT64)">>
+            ),
+            {ok, Stream} = greptimedb_rs:stream_start(Client, Table, row()),
+            ok = greptimedb_rs:stream_write(Stream, Rows)
+        end,
+        Tables
+    ),
+    Query =
+        case Mode of
+            idle ->
+                undefined;
+            busy ->
+                ok = greptimedb_test_server:pause_headers(Server),
+                Request = start_request(fun() -> greptimedb_rs:query(Client, <<"SELECT 1">>) end),
+                wait(fun() -> greptimedb_test_server:headers(Server) >= 1 end, 1000),
+                Request
+        end,
+    ?assertEqual(ok, greptimedb_rs:stop_client(maps:get(pool_name, Client))),
+    case Query of
+        undefined -> ok;
+        _ -> {{error, closed}, _} = result(Query, 1000)
+    end,
+    ok = greptimedb_test_server:release(Server),
+    lists:foreach(
+        fun(Table) ->
+            ?assertEqual(
+                {ok, [[200000]]},
+                greptimedb_rs:query(
+                    Healthy, <<"SELECT count(*) FROM ", Table/binary>>
+                )
+            )
+        end,
+        Tables
+    ),
+    counts({1, 0}).
+
+%% An unresponsive stream must not prevent pool shutdown or occupy dirty I/O.
+t_pool_stop_flush_timeout(Config) ->
+    pool_stop_flush_fault(timeout, Config).
+
+t_pool_stop_flush_killed(Config) ->
+    pool_stop_flush_fault(killed, Config).
+
+pool_stop_flush_fault(Mode, Config) ->
+    Server = ?config(server, Config),
+    Timeout =
+        case Mode of
+            timeout -> 200;
+            killed -> 10000
+        end,
+    Client = client(Server, 1, 1, Timeout, false),
+    Healthy = client(Server, healthy, 1, 10000, true),
+    {ok, _} = greptimedb_rs:query(Client, <<"DROP TABLE IF EXISTS regression_stop_timeout">>),
+    {ok, _} = greptimedb_rs:query(
+        Client,
+        <<"CREATE TABLE regression_stop_timeout (ts TIMESTAMP TIME INDEX, reading INT64)">>
+    ),
+    {ok, Stream} = greptimedb_rs:stream_start(Client, <<"regression_stop_timeout">>, row()),
+    ok = greptimedb_rs:stream_write(Stream, [row()]),
+    wait(
+        fun() ->
+            greptimedb_rs:query(Healthy, <<"SELECT reading FROM regression_stop_timeout">>) =:=
+                {ok, [[7]]}
+        end,
+        2000
+    ),
+    ok = greptimedb_test_server:pause(Server),
+    ok = greptimedb_rs:stream_write(Stream, [(row())#{timestamp := 1700000000001}]),
+    Stop = start_request(fun() -> greptimedb_rs:stop_client(Client) end),
+    wait(fun() -> greptimedb_rs_nif:resource_counts() =:= {1, 1} end, 1000),
+    File = filename:join(?config(priv_dir, Config), "stop-dirty-io.data"),
+    Io = start_request(fun() -> file:write_file(File, <<"stop">>) end),
+    {ok, IoElapsed} = result(Io, 1000),
+    ?assert(IoElapsed < 1000000),
+    ?assertEqual({ok, [[1]]}, greptimedb_rs:query(Healthy, <<"SELECT 1">>)),
+    {ok, Elapsed} = result(Stop, 1000),
+    ?assert(Elapsed >= 150000 andalso Elapsed < 1000000),
+    counts({1, 0}),
+    ok = greptimedb_test_server:release(Server).

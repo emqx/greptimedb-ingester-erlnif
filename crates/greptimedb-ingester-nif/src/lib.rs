@@ -370,6 +370,7 @@ enum Request {
     StreamStart(String),
     StreamWrite(ResourceArc<StreamWriterResource>, Input),
     StreamClose(ResourceArc<StreamWriterResource>),
+    StreamCloseAll(Vec<ResourceArc<StreamWriterResource>>),
 }
 
 impl Request {
@@ -385,6 +386,9 @@ impl Request {
                 Ok(Self::StreamWrite(writer.decode()?, Input::new(*rows)))
             }
             (c, [writer]) if c == atoms::stream_close() => Ok(Self::StreamClose(writer.decode()?)),
+            (c, [writers]) if c == atoms::stream_close_all() => {
+                Ok(Self::StreamCloseAll(writers.decode()?))
+            }
             _ => Err(rustler::Error::BadArg),
         }
     }
@@ -507,6 +511,7 @@ fn submit<'a>(
     let remaining = deadline_us.saturating_sub(now).max(0) as u64;
     let deadline = tokio::time::Instant::now() + Duration::from_micros(remaining);
     let request = Request::decode(command, arguments)?;
+    let closing = matches!(&request, Request::StreamCloseAll(_));
     let writer = request.writer();
     let (operation, mut cancelled) = Operation::new();
     let running = Running {
@@ -519,7 +524,8 @@ fn submit<'a>(
         .ok_or(rustler::Error::BadArg)?;
     let rejected = {
         let mut slot = client.lock_operation();
-        if client.closed.load(Ordering::Acquire) || client.runtime.is_stopping() {
+        // Disconnect cancels active work before termination drains the remaining writers.
+        if (client.closed.load(Ordering::Acquire) && !closing) || client.runtime.is_stopping() {
             Some(atoms::closed())
         } else if slot.is_some() {
             Some(atoms::busy())
@@ -778,6 +784,21 @@ async fn perform(
             writer.write_rows_async(rows).await.map_err(native)?;
             if !resource.closed.load(Ordering::Acquire) {
                 context.writers.borrow_mut().insert(resource.id, writer);
+            }
+            Ok(Value::Ok)
+        }
+        Request::StreamCloseAll(resources) => {
+            let writers: Vec<_> = resources
+                .iter()
+                .filter_map(|resource| {
+                    resource.closed.store(true, Ordering::Release);
+                    context.writers.borrow_mut().remove(&resource.id)
+                })
+                .collect();
+            let results =
+                futures::future::join_all(writers.into_iter().map(|writer| writer.finish())).await;
+            for result in results {
+                result.map_err(native)?;
             }
             Ok(Value::Ok)
         }
