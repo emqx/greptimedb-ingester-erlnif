@@ -35,6 +35,7 @@ pub struct GreptimeResource {
     pub auth: Option<AuthScheme>,
     pub ts_column: Option<String>,
     pub ttl: Option<String>,
+    pub stream_timeout: Duration,
     pub runtime: Arc<RuntimeOwner>,
     operation: Mutex<Option<Arc<Operation>>>,
     closed: AtomicBool,
@@ -232,6 +233,14 @@ fn connect(opts: Term) -> NifResult<Term> {
         .map_get(atoms::ttl().to_term(env))
         .ok()
         .and_then(|term| term.decode().ok());
+    let stream_timeout_ms = match opts.map_get(atoms::stream_timeout().to_term(env)) {
+        Ok(timeout) => timeout.decode::<u64>()?,
+        Err(_) => 30_000,
+    };
+    if stream_timeout_ms == 0 {
+        return Err(rustler::Error::BadArg);
+    }
+    let stream_timeout = Duration::from_millis(stream_timeout_ms);
 
     if let Ok(username_term) = opts.map_get(atoms::username().to_term(env)) {
         if let Ok(password_term) = opts.map_get(atoms::password().to_term(env)) {
@@ -249,6 +258,7 @@ fn connect(opts: Term) -> NifResult<Term> {
         auth,
         ts_column,
         ttl,
+        stream_timeout,
         runtime,
         operation: Mutex::new(None),
         closed: AtomicBool::new(false),
@@ -756,7 +766,7 @@ async fn perform(
             let writer = inserter
                 .create_bulk_stream_writer(
                     &schema,
-                    Some(BulkWriteOptions::default().with_timeout(Duration::from_secs(30))),
+                    Some(BulkWriteOptions::default().with_timeout(client.stream_timeout)),
                 )
                 .await
                 .map_err(native)?;
@@ -837,6 +847,7 @@ mod tests {
                 auth: None,
                 ts_column: None,
                 ttl: None,
+                stream_timeout: Duration::from_secs(30),
                 runtime: owner.0.clone(),
                 operation: Mutex::new(occupied.then(|| operation.clone())),
                 closed: AtomicBool::new(false),

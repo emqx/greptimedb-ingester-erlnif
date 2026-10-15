@@ -59,7 +59,7 @@ Opts = #{
 - `request_timeout`: Positive milliseconds for query and insert; default `10000`.
 - `stream_timeout`: Positive milliseconds for stream start, write and close; default `30000`.
 
-RPC timeouts are controlled by the operation deadline rather than the SDK's default 10-second request timeout. The SDK retains its connection establishment timeout and the streaming writer's 30-second internal timeout.
+RPC timeouts are controlled by the operation deadline rather than the SDK's default 10-second request timeout. The SDK retains its connection establishment timeout. The streaming writer's internal timeout follows `stream_timeout`; the operation deadline also includes queueing and conversion time.
 
 The deadline starts when the public API accepts the call and includes library queueing, schema discovery, RPC and response consumption. Query/insert/write timeouts return `{error, timeout}` or invoke the existing asynchronous callback with that result. Stream start and close retain their existing best effort public return semantics.
 

@@ -25,6 +25,7 @@ groups() ->
                 t_conversion_errors,
                 t_request_timeout,
                 t_request_timeout_expiry,
+                t_stream_timeout,
                 t_queued_close_timeout,
                 t_queued_close_cancel,
                 t_rejected_close,
@@ -299,12 +300,15 @@ invoke(stream_write_async, Stream) ->
     end).
 
 async(Fun) ->
+    async(Fun, 30000).
+
+async(Fun, Timeout) ->
     Parent = self(),
     Ref = make_ref(),
     {ok, _} = Fun({fun(Result) -> Parent ! {Ref, Result} end, []}),
     receive
         {Ref, Result} -> Result
-    after 30000 -> ct:fail(callback_timeout)
+    after Timeout -> ct:fail(callback_timeout)
     end.
 
 recover(Client, Table) ->
@@ -809,6 +813,65 @@ t_request_timeout_expiry(Config) ->
         fun(Client) -> ?assertEqual({ok, [[1]]}, greptimedb_rs:query(Client, <<"SELECT 1">>)) end,
         Clients
     ),
+    lists:foreach(fun no_result/1, Requests).
+
+%% All SDK waits must respect a stream timeout longer than its former 30s limit.
+t_stream_timeout(Config) ->
+    Server = ?config(server, Config),
+    Clients = [client(Server, Name, 1, 40000, false) || Name <- [1, 2, healthy]],
+    Tables = [<<"stream_handshake">>, <<"stream_backpressure">>, <<"stream_finish">>],
+    Streams = lists:zipwith(
+        fun(Client, Table) ->
+            {ok, _} = greptimedb_rs:query(
+                Client,
+                <<"CREATE TABLE ", Table/binary, " (ts TIMESTAMP TIME INDEX, reading INT64)">>
+            ),
+            {ok, Stream} = greptimedb_rs:stream_start(Client, Table, row()),
+            Stream
+        end,
+        Clients,
+        Tables
+    ),
+    [Handshake, Backpressure, Finish] = Streams,
+    lists:foreach(fun(Stream) -> ok = greptimedb_rs:stream_write(Stream, [row()]) end, [
+        Backpressure, Finish
+    ]),
+    ok = greptimedb_test_server:pause(Server),
+    ok = greptimedb_rs:stream_write(Finish, [(row())#{timestamp := 1700000000001}]),
+    Requests = [
+        start_request(fun() ->
+            async(fun(Cb) -> greptimedb_rs:stream_write_async(Handshake, [row()], Cb) end, 40000)
+        end),
+        start_request(fun() ->
+            lists:foreach(
+                fun(I) ->
+                    ok = greptimedb_rs:stream_write(Backpressure, [
+                        (row())#{timestamp := 1700000000000 + I}
+                    ])
+                end,
+                lists:seq(1, 8)
+            )
+        end),
+        start_request(fun() -> greptimedb_rs:stream_close(Finish) end)
+    ],
+    wait(fun() -> greptimedb_rs_nif:resource_counts() =:= {1, 3} end, 2000),
+    receive
+        {Ref, Result, _} -> ct:fail({premature_result, Ref, Result})
+    after 31000 -> ok
+    end,
+    ok = greptimedb_test_server:release(Server),
+    lists:foreach(fun(Request) -> {ok, _} = result(Request, 5000) end, Requests),
+    lists:foreach(fun(Stream) -> ok = greptimedb_rs:stream_close(Stream) end, Streams),
+    lists:foreach(
+        fun({Client, Table, Count}) ->
+            ?assertEqual(
+                {ok, [[Count]]},
+                greptimedb_rs:query(Client, <<"SELECT count(*) FROM ", Table/binary>>)
+            )
+        end,
+        lists:zip3(Clients, Tables, [1, 9, 2])
+    ),
+    counts({1, 0}),
     lists:foreach(fun no_result/1, Requests).
 
 %% Rejected native submissions must not release another request's client slot.

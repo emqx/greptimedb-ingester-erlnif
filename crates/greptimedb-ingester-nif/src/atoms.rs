@@ -21,6 +21,7 @@ rustler::atoms! {
     password,
     ts_column,
     ttl,
+    stream_timeout,
     tls,
     verify,
     verify_peer,
