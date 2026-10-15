@@ -256,7 +256,8 @@ start_request(Ref, Req, State, Budget) ->
         ErrorResult ->
             deliver(Req, public_result(Req, ErrorResult)),
             clear_request(Req),
-            dispatch(State#state{pending = maps:remove(Ref, State#state.pending)}, Budget - 1)
+            Next = finish_unstarted(Req, State),
+            dispatch(Next#state{pending = maps:remove(Ref, Next#state.pending)}, Budget - 1)
     end.
 
 nif_args(?CMD_STREAM_WRITE, [Table, Rows], #state{writers = Writers}) ->
@@ -297,7 +298,34 @@ cancel_request(Ref, Req, #state{current = Ref} = State) ->
     State#state{pending = (State#state.pending)#{Ref := Req#{replied := true}}};
 cancel_request(Ref, Req, State) ->
     clear_request(Req),
-    State#state{pending = maps:remove(Ref, State#state.pending)}.
+    Next = finish_unstarted(Req, State),
+    Next#state{pending = maps:remove(Ref, Next#state.pending)}.
+
+finish_unstarted(#{cmd := ?CMD_STREAM_CLOSE, ref := Ref, args := [Table]}, State) ->
+    discard(Table, invalidate_starts(Ref, Table, State));
+finish_unstarted(_, State) ->
+    State.
+
+%% Earlier starts may still finish after a queued close has expired or been abandoned.
+invalidate_starts(_Ref, _Table, #state{current = undefined} = State) ->
+    State;
+invalidate_starts(Ref, Table, State) ->
+    Earlier = lists:takewhile(
+        fun(Waiting) -> Waiting =/= Ref end, queue:to_list(State#state.waiting)
+    ),
+    Pending = lists:foldl(
+        fun(StartRef, Acc) ->
+            case maps:find(StartRef, Acc) of
+                {ok, #{cmd := ?CMD_STREAM_START, args := [Table, _]} = Req} ->
+                    Acc#{StartRef := Req#{discard_writer => true}};
+                _ ->
+                    Acc
+            end
+        end,
+        State#state.pending,
+        [State#state.current | Earlier]
+    ),
+    State#state{pending = Pending}.
 
 release(Ref, State) ->
     Req = maps:get(Ref, State#state.pending),
@@ -306,6 +334,9 @@ release(Ref, State) ->
         State#state{current = undefined, pending = maps:remove(Ref, State#state.pending)}, 100
     ).
 
+finish_command(#{cmd := ?CMD_STREAM_START, discard_writer := true}, {ok, Writer}, _, State) ->
+    apply_nif(discard_writer, [Writer]),
+    State;
 finish_command(#{cmd := ?CMD_STREAM_START, args := [Table, _]}, {ok, Writer}, false, State) ->
     State#state{writers = (State#state.writers)#{Table => Writer}};
 finish_command(#{cmd := ?CMD_STREAM_START}, {ok, Writer}, true, State) ->

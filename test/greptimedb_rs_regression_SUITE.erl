@@ -25,6 +25,11 @@ groups() ->
                 t_conversion_errors,
                 t_request_timeout,
                 t_request_timeout_expiry,
+                t_queued_close_timeout,
+                t_queued_close_cancel,
+                t_rejected_close,
+                t_close_during_start,
+                t_close_after_queued_start,
                 t_submit_rejection
             ]}
         ].
@@ -828,3 +833,131 @@ t_submit_rejection(Config) ->
     ),
     counts({1, 0}),
     ?assertEqual({ok, [[1]]}, greptimedb_rs:query(Healthy, <<"SELECT 1">>)).
+
+%% Closing must release the writer even when the native close never starts.
+t_queued_close_timeout(Config) ->
+    queued_close(timeout, Config).
+
+t_queued_close_cancel(Config) ->
+    queued_close(cancel, Config).
+
+queued_close(Mode, Config) ->
+    Server = ?config(server, Config),
+    {Client, Conn, Stream} = close_client(Server),
+    ok = greptimedb_test_server:pause_headers(Server),
+    Query = start_request(fun() -> greptimedb_rs:query(Client, <<"SELECT 1">>) end),
+    wait(fun() -> greptimedb_test_server:headers(Server) >= 1 end, 1000),
+    Opts = maps:get(conn_opts, Client),
+    Timeout =
+        case Mode of
+            timeout -> 200;
+            cancel -> 10000
+        end,
+    CloseClient = Client#{conn_opts := Opts#{stream_timeout := Timeout}},
+    Close = start_request(fun() ->
+        greptimedb_rs:stream_close({stream_client, CloseClient, <<"regression_close">>})
+    end),
+    wait(fun() -> map_size(element(8, sys:get_state(Conn))) =:= 2 end, 1000),
+    case Mode of
+        timeout -> {ok, _} = result(Close, 1000);
+        cancel -> kill_callers([Close])
+    end,
+    wait(fun() -> map_size(element(8, sys:get_state(Conn))) =:= 1 end, 1000),
+    ?assertEqual(#{}, element(4, sys:get_state(Conn))),
+    ok = greptimedb_test_server:release(Server),
+    {{ok, [[1]]}, _} = result(Query, 1000),
+    ?assertEqual({error, no_writer}, greptimedb_rs:stream_write(Stream, [row()])),
+    {ok, Fresh} = greptimedb_rs:stream_start(Client, <<"regression_close">>, row()),
+    ?assertEqual(ok, greptimedb_rs:stream_write(Fresh, [row()])),
+    ?assertEqual(ok, greptimedb_rs:stream_close(Fresh)),
+    counts({1, 0}).
+
+t_rejected_close(Config) ->
+    Server = ?config(server, Config),
+    {Client, Conn, Stream} = close_client(Server),
+    NativeClient = element(2, sys:get_state(Conn)),
+    Token = make_ref(),
+    ok = greptimedb_test_server:pause_headers(Server),
+    {ok, Operation} = greptimedb_rs_nif:submit(
+        NativeClient,
+        execute,
+        [<<"SELECT 1">>],
+        Token,
+        erlang:monotonic_time(microsecond) + 10000000
+    ),
+    wait(fun() -> greptimedb_test_server:headers(Server) >= 1 end, 1000),
+    ?assertEqual(ok, greptimedb_rs:stream_close(Stream)),
+    ?assertEqual(#{}, element(4, sys:get_state(Conn))),
+    ?assert(greptimedb_rs_nif:operation_active(Operation)),
+    ok = greptimedb_rs_nif:cancel(Operation),
+    receive
+        {greptimedb_nif, Token, {error, cancelled}} -> ok
+    after 1000 -> error(missing_cancelled_reply)
+    end,
+    ok = greptimedb_test_server:release(Server),
+    ?assertEqual({error, no_writer}, greptimedb_rs:stream_write(Stream, [row()])),
+    ?assertEqual({ok, [[1]]}, greptimedb_rs:query(Client, <<"SELECT 1">>)),
+    counts({1, 0}).
+
+close_client(Server) ->
+    Client = client(Server, 1, 1, 10000, false),
+    {ok, _} = greptimedb_rs:query(Client, <<"DROP TABLE IF EXISTS regression_close">>),
+    {ok, _} = greptimedb_rs:query(
+        Client, <<"CREATE TABLE regression_close (ts TIMESTAMP TIME INDEX, reading INT64)">>
+    ),
+    {ok, Stream} = greptimedb_rs:stream_start(Client, <<"regression_close">>, row()),
+    [{_, Worker}] = ecpool:workers(maps:get(pool_name, Client)),
+    {ok, Conn} = ecpool_worker:client(Worker),
+    ClientState = sys:get_state(Conn),
+    ?assertEqual(1, map_size(element(4, ClientState))),
+    {Client, Conn, Stream}.
+
+%% A start submitted before close must not publish a writer after close expires.
+t_close_during_start(Config) ->
+    close_during_start(active, Config).
+
+t_close_after_queued_start(Config) ->
+    close_during_start(queued, Config).
+
+close_during_start(Mode, Config) ->
+    Server = ?config(server, Config),
+    {Client, Conn, Stream} = close_client(Server),
+    ok = greptimedb_test_server:pause_headers(Server),
+    Query =
+        case Mode of
+            active ->
+                undefined;
+            queued ->
+                Request = start_request(fun() -> greptimedb_rs:query(Client, <<"SELECT 1">>) end),
+                wait(fun() -> map_size(element(8, sys:get_state(Conn))) =:= 1 end, 1000),
+                Request
+        end,
+    Start = start_request(fun() ->
+        greptimedb_rs:stream_start(Client, <<"regression_close">>, row())
+    end),
+    Count =
+        case Mode of
+            active -> 1;
+            queued -> 2
+        end,
+    wait(fun() -> map_size(element(8, sys:get_state(Conn))) =:= Count end, 1000),
+    Opts = maps:get(conn_opts, Client),
+    Short = Client#{conn_opts := Opts#{stream_timeout := 200}},
+    ?assertEqual(
+        ok,
+        greptimedb_rs:stream_close(
+            {stream_client, Short, <<"regression_close">>}
+        )
+    ),
+    ok = greptimedb_test_server:release(Server),
+    case Query of
+        undefined -> ok;
+        _ -> {{ok, [[1]]}, _} = result(Query, 1000)
+    end,
+    {{ok, _}, _} = result(Start, 2000),
+    ?assertEqual(#{}, element(4, sys:get_state(Conn))),
+    ?assertEqual({error, no_writer}, greptimedb_rs:stream_write(Stream, [row()])),
+    {ok, Fresh} = greptimedb_rs:stream_start(Client, <<"regression_close">>, row()),
+    ?assertEqual(ok, greptimedb_rs:stream_write(Fresh, [row()])),
+    ?assertEqual(ok, greptimedb_rs:stream_close(Fresh)),
+    counts({1, 0}).
