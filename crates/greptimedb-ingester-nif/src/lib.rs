@@ -1,5 +1,5 @@
 use std::panic::AssertUnwindSafe;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use futures::FutureExt;
@@ -18,9 +18,10 @@ use rustler::{
 use operation::{Operation, OperationResource};
 use runtime::{Context, RuntimeOwner, RuntimeResource};
 use rustler::env::SavedTerm;
-use std::rc::Rc;
 
 static FIPS_ENABLED: AtomicBool = AtomicBool::new(false);
+
+const STREAM_RESPONSE_DRAIN_INTERVAL: usize = 256;
 
 pub mod atoms;
 mod codec;
@@ -44,6 +45,7 @@ pub struct GreptimeResource {
 pub struct StreamWriterResource {
     id: usize,
     schema: TableSchema,
+    submitted_batches: AtomicUsize,
     runtime: Arc<RuntimeOwner>,
     closed: AtomicBool,
 }
@@ -352,13 +354,14 @@ async fn fetch_table_schema(db: &Database, table_name: &str) -> Result<TableSche
 struct Input {
     env: OwnedEnv,
     rows: SavedTerm,
+    small: bool,
 }
 
 impl Input {
-    fn new(rows: Term) -> Self {
+    fn new(rows: Term, small: bool) -> Self {
         let env = OwnedEnv::new();
         let rows = env.save(rows);
-        Self { env, rows }
+        Self { env, rows, small }
     }
 
     fn is_empty(&self) -> bool {
@@ -387,17 +390,18 @@ enum Request {
 }
 
 impl Request {
-    fn decode(command: Atom, args: Term) -> NifResult<Self> {
+    fn decode(command: Atom, args: Term, small: bool) -> NifResult<Self> {
         let args: Vec<Term> = args.decode()?;
         match (command, args.as_slice()) {
             (c, [sql]) if c == atoms::execute() => Ok(Self::Execute(sql.decode()?)),
             (c, [table, rows]) if c == atoms::insert() => {
-                Ok(Self::Insert(table.decode()?, Input::new(*rows)))
+                Ok(Self::Insert(table.decode()?, Input::new(*rows, small)))
             }
             (c, [table, _]) if c == atoms::stream_start() => Ok(Self::StreamStart(table.decode()?)),
-            (c, [writer, rows]) if c == atoms::stream_write() => {
-                Ok(Self::StreamWrite(writer.decode()?, Input::new(*rows)))
-            }
+            (c, [writer, rows]) if c == atoms::stream_write() => Ok(Self::StreamWrite(
+                writer.decode()?,
+                Input::new(*rows, small),
+            )),
             (c, [writer]) if c == atoms::stream_close() => Ok(Self::StreamClose(writer.decode()?)),
             (c, [writers]) if c == atoms::stream_close_all() => {
                 Ok(Self::StreamCloseAll(writers.decode()?))
@@ -510,8 +514,98 @@ impl Drop for Running {
     }
 }
 
-#[rustler::nif(schedule = "DirtyCpu")]
-fn submit<'a>(
+#[rustler::nif]
+fn bounded_submission<'a>(env: Env<'a>, arguments: Term<'a>) -> Term<'a> {
+    let started = std::time::Instant::now();
+    let mut binaries = Vec::new();
+    let bounded = bounded_arguments(arguments, &mut binaries);
+    consume_submission_timeslice(env, started);
+    if bounded {
+        binaries.encode(env)
+    } else {
+        false.encode(env)
+    }
+}
+
+fn bounded_arguments<'a>(arguments: Term<'a>, binaries: &mut Vec<Term<'a>>) -> bool {
+    let Ok((first, rest)) = arguments.list_get_cell() else {
+        return false;
+    };
+    if first.is_binary() {
+        binaries.push(first);
+    } else if !first.is_ref() {
+        return false;
+    }
+    if rest.is_empty_list() {
+        return true;
+    }
+    let Ok((mut rows, tail)) = rest.list_get_cell() else {
+        return false;
+    };
+    if !tail.is_empty_list() {
+        return false;
+    }
+    let mut cursor = rows;
+    for _ in 0..128 {
+        if cursor.is_empty_list() {
+            break;
+        }
+        let Ok((_, tail)) = cursor.list_get_cell() else {
+            return false;
+        };
+        cursor = tail;
+    }
+    if !cursor.is_empty_list() {
+        return false;
+    }
+    let mut budget = 2048;
+    for _ in 0..128 {
+        if rows.is_empty_list() {
+            return true;
+        }
+        let Ok((row, tail)) = rows.list_get_cell() else {
+            return false;
+        };
+        if !bounded_value(row, 3, &mut budget, binaries) {
+            return false;
+        }
+        rows = tail;
+    }
+    rows.is_empty_list()
+}
+
+fn bounded_value<'a>(
+    term: Term<'a>,
+    depth: usize,
+    budget: &mut usize,
+    binaries: &mut Vec<Term<'a>>,
+) -> bool {
+    if *budget == 0 {
+        return false;
+    }
+    *budget -= 1;
+    match term.get_type() {
+        rustler::TermType::Binary => {
+            binaries.push(term);
+            true
+        }
+        rustler::TermType::Atom | rustler::TermType::Float => true,
+        rustler::TermType::Integer => term.decode::<i64>().is_ok() || term.decode::<u64>().is_ok(),
+        rustler::TermType::Map if depth > 0 && term.map_size().is_ok_and(|size| size <= 8) => {
+            let Ok(entries) = term.decode::<rustler::MapIterator>() else {
+                return false;
+            };
+            entries.into_iter().all(|(key, value)| {
+                bounded_value(key, depth - 1, budget, binaries)
+                    && bounded_value(value, depth - 1, budget, binaries)
+            })
+        }
+        _ => false,
+    }
+}
+
+#[rustler::nif]
+fn submit_small<'a>(
     env: Env<'a>,
     client: ResourceArc<GreptimeResource>,
     command: Atom,
@@ -519,15 +613,48 @@ fn submit<'a>(
     token: Term<'a>,
     deadline_us: i64,
 ) -> NifResult<Term<'a>> {
+    let started = std::time::Instant::now();
+    let result = submit_impl(env, client, command, arguments, token, deadline_us, true);
+    consume_submission_timeslice(env, started);
+    result
+}
+
+fn consume_submission_timeslice(env: Env, started: std::time::Instant) {
+    // Account normal NIF work against an estimated 1 ms scheduler timeslice.
+    let percent = started.elapsed().as_micros().div_ceil(10).clamp(1, 100) as i32;
+    rustler::schedule::consume_timeslice(env, percent);
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+fn submit_dirty<'a>(
+    env: Env<'a>,
+    client: ResourceArc<GreptimeResource>,
+    command: Atom,
+    arguments: Term<'a>,
+    token: Term<'a>,
+    deadline_us: i64,
+) -> NifResult<Term<'a>> {
+    submit_impl(env, client, command, arguments, token, deadline_us, false)
+}
+
+fn submit_impl<'a>(
+    env: Env<'a>,
+    client: ResourceArc<GreptimeResource>,
+    command: Atom,
+    arguments: Term<'a>,
+    token: Term<'a>,
+    deadline_us: i64,
+    small: bool,
+) -> NifResult<Term<'a>> {
     let now =
         unsafe { rustler::sys::enif_monotonic_time(rustler::sys::ErlNifTimeUnit::ERL_NIF_USEC) };
     let remaining = deadline_us.saturating_sub(now).max(0) as u64;
     let deadline = tokio::time::Instant::now() + Duration::from_micros(remaining);
-    let request = Request::decode(command, arguments)?;
+    let request = Request::decode(command, arguments, small)?;
     let closing = matches!(&request, Request::StreamCloseAll(_));
     let writer = request.writer();
     let finish_stream = writer.is_some() || closing;
-    let (operation, mut cancelled) = Operation::new();
+    let (operation, cancelled) = Operation::new();
     let running = Running {
         client: client.clone(),
         operation: operation.clone(),
@@ -556,73 +683,121 @@ fn submit<'a>(
     let output = OwnedEnv::new();
     let token = output.save(token);
     let runtime = client.runtime.clone();
-    let mut stopping = runtime.stopping();
-    runtime
-        .spawn(move |context| async move {
-            let mut result = {
-                let future = AssertUnwindSafe(perform(
-                    client,
-                    request,
-                    context.clone(),
-                    deadline,
-                    control.clone(),
-                ))
-                .catch_unwind();
-                tokio::pin!(future);
-                tokio::select! {
-                    biased;
-                    _ = runtime::wait_for_shutdown(&mut stopping, finish_stream) => Err(Failure::Closed),
-                    _ = cancelled.changed() => Err(Failure::Cancelled),
-                    _ = tokio::time::sleep_until(deadline) => Err(Failure::Timeout),
-                    value = &mut future => value.unwrap_or(Err(Failure::Panic)),
+    let work = Submitted {
+        running,
+        output,
+        token,
+        pid,
+        deadline,
+        cancelled,
+        stopping: runtime.stopping(),
+    };
+    let started = match request {
+        request @ (Request::Execute(_) | Request::Insert(_, _)) => {
+            let future = perform_statement(client, request, deadline, control);
+            runtime.spawn(work.run(future, false, |result, _, late| {
+                if let Some(error) = late {
+                    *result = Err(error);
                 }
-            };
-            control.wait_codec_jobs().await;
-            if let Err(error) = check_operation(deadline, &control) {
-                if let Ok(Value::Writer(writer)) = &result {
-                    writer.closed.store(true, Ordering::Release);
-                    context.writers.borrow_mut().remove(&writer.id);
-                }
-                result = Err(error);
-            }
-            // Invalid streams cannot be reused. During graceful shutdown, keep any
-            // retained writer for the final drain of previously submitted batches.
-            if result.is_err() {
-                if let Some(writer) = writer {
-                    writer.closed.store(true, Ordering::Release);
-                    if !running.client.runtime.is_draining() {
-                        context.writers.borrow_mut().remove(&writer.id);
+            }))
+        }
+        request => {
+            let context = runtime.context.clone();
+            let future = perform_stream(client, request, context.clone(), deadline, control);
+            runtime.spawn(
+                work.run(future, finish_stream, move |result, client, late| {
+                    if let Some(error) = late {
+                        if let Ok(Value::Writer(writer)) = result {
+                            writer.closed.store(true, Ordering::Release);
+                            context.writers().remove(&writer.id);
+                        }
+                        *result = Err(error);
                     }
-                }
-            }
-            let large_reply = matches!(&result, Ok(Value::Batches(batches))
-                if batches.iter().map(|batch| batch.num_rows()).sum::<usize>() > 256);
-            let (mut output, token, encoded) = if large_reply {
-                let fallback = OwnedEnv::new();
-                let fallback_token = output.run(|env| fallback.save(token.load(env)));
-                let encoded = running
-                    .client
-                    .runtime
-                    .codec_pool
-                    .run(control.clone(), deadline, move || {
-                        Ok(encode_reply(output, token, result))
-                    })
-                    .await;
-                control.wait_codec_jobs().await;
-                match encoded {
-                    Ok(reply) => reply,
-                    Err(error) => encode_reply(fallback, fallback_token, Err(error)),
-                }
-            } else {
-                encode_reply(output, token, result)
-            };
-            drop(running);
-            let _ = output.send_and_clear(&pid, |env| {
-                (atoms::greptimedb_nif(), token.load(env), encoded.load(env)).encode(env)
-            });
-        })
-        .map_err(|_| rustler::Error::Term(Box::new("runtime stopped".to_string())))?;
+                    if result.is_err() {
+                        if let Some(writer) = writer {
+                            writer.closed.store(true, Ordering::Release);
+                            if !client.runtime.is_draining() {
+                                context.writers().remove(&writer.id);
+                            }
+                        }
+                    }
+                }),
+            )
+        }
+    };
+    started.map_err(|_| rustler::Error::Term(Box::new("runtime stopped".to_string())))?;
     Ok((atoms::ok(), operation_resource).encode(env))
+}
+
+struct Submitted {
+    running: Running,
+    output: OwnedEnv,
+    token: SavedTerm,
+    pid: LocalPid,
+    deadline: tokio::time::Instant,
+    cancelled: tokio::sync::watch::Receiver<bool>,
+    stopping: tokio::sync::watch::Receiver<runtime::Shutdown>,
+}
+
+impl Submitted {
+    async fn run<F, C>(self, future: F, finish_stream: bool, cleanup: C)
+    where
+        F: std::future::Future<Output = Result<Value, Failure>>,
+        C: FnOnce(&mut Result<Value, Failure>, &GreptimeResource, Option<Failure>),
+    {
+        let Self {
+            running,
+            output,
+            token,
+            pid,
+            deadline,
+            mut cancelled,
+            mut stopping,
+        } = self;
+        let control = running.operation.clone();
+        let mut result = {
+            let future = AssertUnwindSafe(future).catch_unwind();
+            tokio::pin!(future);
+            tokio::select! {
+                biased;
+                _ = runtime::wait_for_shutdown(&mut stopping, finish_stream) => Err(Failure::Closed),
+                _ = cancelled.changed() => Err(Failure::Cancelled),
+                _ = tokio::time::sleep_until(deadline) => Err(Failure::Timeout),
+                value = &mut future => value.unwrap_or(Err(Failure::Panic)),
+            }
+        };
+        control.wait_codec_jobs().await;
+        cleanup(
+            &mut result,
+            &running.client,
+            check_operation(deadline, &control).err(),
+        );
+        let large_reply = matches!(&result, Ok(Value::Batches(batches))
+                if batches.iter().map(|batch| batch.num_rows()).sum::<usize>() > 256);
+        let (mut output, token, encoded) = if large_reply {
+            let fallback = OwnedEnv::new();
+            let fallback_token = output.run(|env| fallback.save(token.load(env)));
+            let encoded = running
+                .client
+                .runtime
+                .codec_pool
+                .run(control.clone(), deadline, move || {
+                    Ok(encode_reply(output, token, result))
+                })
+                .await;
+            control.wait_codec_jobs().await;
+            match encoded {
+                Ok(reply) => reply,
+                Err(error) => encode_reply(fallback, fallback_token, Err(error)),
+            }
+        } else {
+            encode_reply(output, token, result)
+        };
+        drop(running);
+        let _ = output.send_and_clear(&pid, |env| {
+            (atoms::greptimedb_nif(), token.load(env), encoded.load(env)).encode(env)
+        });
+    }
 }
 
 fn encode_reply(
@@ -680,10 +855,9 @@ fn check_operation(deadline: tokio::time::Instant, control: &Operation) -> Resul
     }
 }
 
-async fn perform(
+async fn perform_statement(
     client: ResourceArc<GreptimeResource>,
     request: Request,
-    context: Rc<Context>,
     deadline: tokio::time::Instant,
     control: Arc<Operation>,
 ) -> Result<Value, Failure> {
@@ -709,33 +883,50 @@ async fn perform(
             let server = fetch_table_schema(&client.db, &table).await;
             check()?;
             let ts_column = client.ts_column.clone();
-            let (schema, rows) = client
-                .runtime
-                .codec_pool
-                .run(control.clone(), deadline, move || {
-                    input.convert(|rows| match server {
-                        Ok(schema) => {
-                            let columns: Vec<ColumnSchema> = schema
-                                .columns()
-                                .iter()
-                                .map(|c| ColumnSchema {
-                                    column_name: c.name.clone(),
-                                    datatype: c.data_type as i32,
-                                    semantic_type: c.semantic_type as i32,
-                                    ..Default::default()
-                                })
-                                .collect();
-                            let columns = util::merge_inferred_columns(columns, &rows)?;
-                            let rows = util::terms_to_proto_rows_with_columns(&columns, rows)?;
-                            Ok((columns, rows))
-                        }
-                        Err(_) => util::terms_to_schema_and_rows(
-                            rows,
-                            ts_column.as_deref().unwrap_or("ts"),
-                        ),
+            let inline = match &server {
+                Ok(schema)
+                    if input.small
+                        && schema.columns().len() <= 8
+                        && schema
+                            .columns()
+                            .iter()
+                            .all(|column| column.name.len() <= 128) =>
+                {
+                    input.convert(|rows| util::try_encode_known_rows(schema, rows))?
+                }
+                _ => None,
+            };
+            let (schema, rows) = if let Some(value) = inline {
+                value
+            } else {
+                client
+                    .runtime
+                    .codec_pool
+                    .run(control.clone(), deadline, move || {
+                        input.convert(|rows| match server {
+                            Ok(schema) => {
+                                let columns: Vec<ColumnSchema> = schema
+                                    .columns()
+                                    .iter()
+                                    .map(|c| ColumnSchema {
+                                        column_name: c.name.clone(),
+                                        datatype: c.data_type as i32,
+                                        semantic_type: c.semantic_type as i32,
+                                        ..Default::default()
+                                    })
+                                    .collect();
+                                let columns = util::merge_inferred_columns(columns, &rows)?;
+                                let rows = util::terms_to_proto_rows_with_columns(&columns, rows)?;
+                                Ok((columns, rows))
+                            }
+                            Err(_) => util::terms_to_schema_and_rows(
+                                rows,
+                                ts_column.as_deref().unwrap_or("ts"),
+                            ),
+                        })
                     })
-                })
-                .await?;
+                    .await?
+            };
             let request = RowInsertRequests {
                 inserts: vec![RowInsertRequest {
                     table_name: table,
@@ -754,6 +945,21 @@ async fn perform(
             };
             Ok(Value::Count(count))
         }
+        _ => Err(Failure::BadArg),
+    }
+}
+
+async fn perform_stream(
+    client: ResourceArc<GreptimeResource>,
+    request: Request,
+    context: Arc<Context>,
+    deadline: tokio::time::Instant,
+    control: Arc<Operation>,
+) -> Result<Value, Failure> {
+    let native = |e: greptimedb_ingester::Error| Failure::Native(e.to_string());
+    let check = || check_operation(deadline, &control);
+    check()?;
+    match request {
         Request::StreamStart(table) => {
             let schema = fetch_table_schema(&client.db, &table)
                 .await
@@ -772,32 +978,52 @@ async fn perform(
                 .map_err(native)?;
             writer.alloc_rows_buffer(5000, 1024).map_err(native)?;
             let id = runtime::writer_id();
-            context.writers.borrow_mut().insert(id, writer);
+            context.writers().insert(id, writer);
             Ok(Value::Writer(ResourceArc::new(StreamWriterResource {
                 id,
                 schema,
+                submitted_batches: AtomicUsize::new(0),
                 runtime: client.runtime.clone(),
                 closed: AtomicBool::new(false),
             })))
         }
         Request::StreamWrite(resource, input) => {
             let schema = resource.schema.clone();
-            let rows = client
-                .runtime
-                .codec_pool
-                .run(control.clone(), deadline, move || {
-                    input.convert(|rows| util::terms_to_rows(&schema, rows))
-                })
-                .await?;
+            let rows = if input.small
+                && schema.columns().len() <= 8
+                && schema
+                    .columns()
+                    .iter()
+                    .all(|column| column.name.len() <= 128)
+            {
+                input.convert(|rows| util::terms_to_rows(&schema, rows))?
+            } else {
+                client
+                    .runtime
+                    .codec_pool
+                    .run(control.clone(), deadline, move || {
+                        input.convert(|rows| util::terms_to_rows(&schema, rows))
+                    })
+                    .await?
+            };
             check()?;
             let mut writer = context
-                .writers
-                .borrow_mut()
+                .writers()
                 .remove(&resource.id)
                 .ok_or_else(|| Failure::Native("Writer is closed".into()))?;
             let result = writer.write_rows_async(rows).await.map_err(native);
+            if result.is_ok()
+                && resource.submitted_batches.fetch_add(1, Ordering::Relaxed)
+                    % STREAM_RESPONSE_DRAIN_INTERVAL
+                    == STREAM_RESPONSE_DRAIN_INTERVAL - 1
+            {
+                // Response IDs are not exposed by this driver. Consume completed successes
+                // below the SDK's 1024-entry cleanup threshold; its four in-flight requests
+                // remain tracked for backpressure, errors and finish().
+                let _ = writer.flush_completed_responses();
+            }
             if !resource.closed.load(Ordering::Acquire) {
-                context.writers.borrow_mut().insert(resource.id, writer);
+                context.writers().insert(resource.id, writer);
             }
             result?;
             Ok(Value::Ok)
@@ -807,7 +1033,7 @@ async fn perform(
                 .iter()
                 .filter_map(|resource| {
                     resource.closed.store(true, Ordering::Release);
-                    context.writers.borrow_mut().remove(&resource.id)
+                    context.writers().remove(&resource.id)
                 })
                 .collect();
             let results =
@@ -819,12 +1045,13 @@ async fn perform(
         }
         Request::StreamClose(resource) => {
             resource.closed.store(true, Ordering::Release);
-            let writer = context.writers.borrow_mut().remove(&resource.id);
+            let writer = context.writers().remove(&resource.id);
             if let Some(writer) = writer {
                 writer.finish().await.map_err(native)?;
             }
             Ok(Value::Ok)
         }
+        _ => Err(Failure::BadArg),
     }
 }
 

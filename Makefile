@@ -47,3 +47,9 @@ lint:
 regression:
 	@test -n "$(GREPTIME_BIN)" || { echo "Set GREPTIME_BIN to the GreptimeDB executable"; exit 1; }
 	GREPTIME_BIN="$(abspath $(GREPTIME_BIN))" ERL_FLAGS="+S 4:4 +SDcpu 2:2 +SDio 4" rebar3 ct --suite test/greptimedb_rs_regression_SUITE.erl --readable true
+
+.PHONY: benchmark
+benchmark:
+	@test -n "$(GREPTIME_BIN)" || { echo "Set GREPTIME_BIN to the GreptimeDB executable"; exit 1; }
+	FORCE_BUILD=1 rebar3 compile
+	GREPTIME_BIN="$(GREPTIME_BIN)" bash scripts/benchmark.sh

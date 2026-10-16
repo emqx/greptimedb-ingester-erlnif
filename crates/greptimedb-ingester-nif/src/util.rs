@@ -208,11 +208,17 @@ fn collect_unknown_columns(
     known: &HashSet<String>,
     out: &mut BTreeMap<String, ColumnDataType>,
 ) -> rustler::NifResult<()> {
-    let mut keys: Vec<Term> = map
-        .decode::<rustler::MapIterator>()
-        .map_err(|_| rustler::Error::BadArg)?
-        .map(|(k, _)| k)
-        .collect();
+    let mut keys = Vec::new();
+    for (key, _) in map.decode::<rustler::MapIterator>()? {
+        if let Ok(binary) = key.decode::<rustler::Binary>() {
+            if let Ok(name) = std::str::from_utf8(binary.as_slice()) {
+                if known.contains(name) || out.contains_key(name) {
+                    continue;
+                }
+            }
+        }
+        keys.push(key);
+    }
     keys.sort();
 
     for key in keys {
@@ -316,4 +322,48 @@ fn term_to_string(term: Term) -> rustler::NifResult<String> {
     } else {
         term.decode::<String>()
     }
+}
+
+// The caller limits the input size and server schema. New columns and other
+// key representations retain the general inference path on codec workers.
+pub fn try_encode_known_rows<'a>(
+    schema: &TableSchema,
+    rows: Vec<Term<'a>>,
+) -> rustler::NifResult<Option<(Vec<ColumnSchema>, Vec<ProtoRow>)>> {
+    if rows.is_empty() || rows.len() > 128 {
+        return Ok(None);
+    }
+    let env = rows[0].get_env();
+    let keys: Vec<_> = schema
+        .columns()
+        .iter()
+        .map(|c| c.name.encode(env))
+        .collect();
+    for row in &rows {
+        for key in [atoms::fields(), atoms::tags()] {
+            if let Ok(map) = row.map_get(key) {
+                if map.map_size().unwrap_or(usize::MAX) > 8 {
+                    return Ok(None);
+                }
+                let Ok(entries) = map.decode::<rustler::MapIterator>() else {
+                    return Ok(None);
+                };
+                if entries.into_iter().any(|(name, _)| !keys.contains(&name)) {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    let columns: Vec<_> = schema
+        .columns()
+        .iter()
+        .map(|c| ColumnSchema {
+            column_name: c.name.clone(),
+            datatype: c.data_type as i32,
+            semantic_type: c.semantic_type as i32,
+            ..Default::default()
+        })
+        .collect();
+    let rows = terms_to_proto_rows_with_columns(&columns, rows)?;
+    Ok(Some((columns, rows)))
 }

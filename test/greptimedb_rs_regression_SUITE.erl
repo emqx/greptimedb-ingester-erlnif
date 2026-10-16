@@ -23,9 +23,14 @@ groups() ->
                 t_callback_exception,
                 t_callback_timeout,
                 t_conversion_errors,
+                t_insert_bounds,
+                t_stream_bounds,
                 t_request_timeout,
                 t_request_timeout_expiry,
                 t_stream_timeout,
+                t_stream_response_drain,
+                t_stream_response_error,
+                t_stream_response_faults,
                 t_queued_close_timeout,
                 t_queued_close_cancel,
                 t_rejected_close,
@@ -763,6 +768,215 @@ t_conversion_errors(Config) ->
     ),
     counts({1, 0}).
 
+t_insert_bounds(Config) ->
+    Client = client(?config(server, Config), 1, 1, 10000, true),
+    Table = <<"bounded_insert">>,
+    {ok, _} = greptimedb_rs:query(
+        Client,
+        <<"CREATE TABLE bounded_insert (ts TIMESTAMP TIME INDEX, reading INT64, payload STRING)">>
+    ),
+    %% Exercise both sides of the row limit through sync and async APIs.
+    Total = lists:foldl(
+        fun(N, Offset) ->
+            Rows = bounded_rows(Offset, N),
+            ?assertEqual({ok, N}, greptimedb_rs:insert(Client, Table, Rows)),
+            NextRows = bounded_rows(Offset + N, N),
+            ?assertEqual(
+                {ok, N},
+                async(fun(Cb) -> greptimedb_rs:insert_async(Client, Table, NextRows, Cb) end)
+            ),
+            Offset + 2 * N
+        end,
+        0,
+        [1, 100, 128, 129, 512]
+    ),
+    ?assertEqual(
+        {ok, [[Total, Total * (Total + 1) div 2]]},
+        greptimedb_rs:query(Client, <<"SELECT count(*), sum(reading) FROM bounded_insert">>)
+    ),
+    %% A single row can exceed the byte limit, independent of its row count.
+    Large = #{
+        timestamp => 1700000020000,
+        fields => #{
+            <<"reading">> => 20000, <<"payload">> => binary:copy(<<"x">>, 32768)
+        }
+    },
+    ?assertEqual({ok, 1}, greptimedb_rs:insert(Client, Table, [Large])),
+    ?assertEqual(
+        {ok, [[20000, 32768]]},
+        greptimedb_rs:query(
+            Client, <<"SELECT reading, length(payload) FROM bounded_insert WHERE reading = 20000">>
+        )
+    ),
+    %% Check both sides of the binary budget, including unaligned binaries.
+    BaseBytes = byte_size(Table) + byte_size(<<"reading">>) + byte_size(<<"payload">>),
+    lists:foreach(
+        fun(Extra) ->
+            Size = 16384 - BaseBytes + Extra,
+            Bits = <<0:1, (binary:copy(<<"x">>, Size))/binary, 0:7>>,
+            <<_:1, Payload:Size/binary, _:7>> = Bits,
+            I = 21000 + Extra,
+            Row = #{
+                timestamp => 1700000000000 + I,
+                fields => #{
+                    <<"reading">> => I, <<"payload">> => Payload
+                }
+            },
+            ?assertEqual({ok, 1}, greptimedb_rs:insert(Client, Table, [Row])),
+            SQL = iolist_to_binary([
+                "SELECT reading, length(payload) FROM bounded_insert WHERE reading = ",
+                integer_to_binary(I)
+            ]),
+            ?assertEqual({ok, [[I, Size]]}, greptimedb_rs:query(Client, SQL))
+        end,
+        [0, 1]
+    ),
+    %% Complex scalar values must fall back without an unbounded normal-NIF walk.
+    [Nested] = bounded_rows(22000, 1),
+    Bad = Nested#{fields := #{<<"reading">> => lists:duplicate(8192, 1)}},
+    ?assertEqual(
+        {error, {nif_error, <<"Invalid value for type Int64: expected integer">>}},
+        greptimedb_rs:insert(Client, Table, [Bad])
+    ),
+    %% A small input against a wide server schema must retain general conversion.
+    lists:foreach(
+        fun(I) ->
+            Name = integer_to_binary(I),
+            {ok, _} = greptimedb_rs:query(
+                Client, <<"ALTER TABLE bounded_insert ADD COLUMN extra", Name/binary, " INT64">>
+            ),
+            case I of
+                5 ->
+                    ?assertEqual(
+                        {ok, 1}, greptimedb_rs:insert(Client, Table, bounded_rows(30000, 1))
+                    );
+                _ ->
+                    ok
+            end
+        end,
+        lists:seq(1, 6)
+    ),
+    ?assertEqual({ok, 1}, greptimedb_rs:insert(Client, Table, bounded_rows(30001, 1))),
+    ?assertEqual(
+        {ok, [[30001, <<"value">>], [30002, <<"value">>]]},
+        greptimedb_rs:query(
+            Client,
+            <<"SELECT reading, payload FROM bounded_insert ",
+                "WHERE reading >= 30000 ORDER BY reading">>
+        )
+    ),
+    counts({1, 0}).
+
+t_stream_bounds(Config) ->
+    Client = client(?config(server, Config), 1, 1, 10000, true),
+    Table = <<"bounded_stream">>,
+    {ok, _} = greptimedb_rs:query(
+        Client,
+        <<"CREATE TABLE bounded_stream (ts TIMESTAMP TIME INDEX, reading INT64, payload STRING)">>
+    ),
+    {ok, Stream} = greptimedb_rs:stream_start(Client, Table, row()),
+    Total = lists:foldl(
+        fun(N, Offset) ->
+            ok = greptimedb_rs:stream_write(Stream, bounded_rows(Offset, N)),
+            ?assertEqual(
+                ok,
+                async(fun(Cb) ->
+                    greptimedb_rs:stream_write_async(Stream, bounded_rows(Offset + N, N), Cb)
+                end)
+            ),
+            Offset + 2 * N
+        end,
+        0,
+        [1, 100, 128, 129, 512]
+    ),
+    %% Stream arguments contain a writer reference, so only row binaries count.
+    BaseBytes = byte_size(<<"reading">>) + byte_size(<<"payload">>),
+    lists:foreach(
+        fun(Extra) ->
+            Size = 16384 - BaseBytes + Extra,
+            Bits = <<0:1, (binary:copy(<<"x">>, Size))/binary, 0:7>>,
+            <<_:1, Payload:Size/binary, _:7>> = Bits,
+            I = 21000 + Extra,
+            Row = #{
+                timestamp => 1700000000000 + I,
+                fields => #{<<"reading">> => I, <<"payload">> => Payload}
+            },
+            ok = greptimedb_rs:stream_write(Stream, [Row])
+        end,
+        [0, 1]
+    ),
+    ok = greptimedb_rs:stream_close(Stream),
+    ?assertEqual(
+        {ok, [[Total, Total * (Total + 1) div 2]]},
+        greptimedb_rs:query(
+            Client,
+            <<"SELECT count(*), sum(reading) FROM bounded_stream WHERE reading < 20000">>
+        )
+    ),
+    ?assertEqual(
+        {ok, [[21000, 16384 - BaseBytes], [21001, 16385 - BaseBytes]]},
+        greptimedb_rs:query(
+            Client,
+            <<"SELECT reading, length(payload) FROM bounded_stream ",
+                "WHERE reading >= 21000 ORDER BY reading">>
+        )
+    ),
+    BadRow = #{
+        timestamp => 1700000040000,
+        fields => #{<<"reading">> => 40000, <<"payload">> => <<1:1>>}
+    },
+    ExpectedError = {error, {nif_error, <<"Invalid value for type String">>}},
+    {ok, BadStream} = greptimedb_rs:stream_start(Client, Table, row()),
+    ?assertEqual(ExpectedError, greptimedb_rs:stream_write(BadStream, [BadRow])),
+    {ok, AsyncBadStream} = greptimedb_rs:stream_start(Client, Table, row()),
+    ?assertEqual(
+        ExpectedError,
+        async(fun(Cb) ->
+            greptimedb_rs:stream_write_async(AsyncBadStream, [BadRow], Cb)
+        end)
+    ),
+    %% Reopen against schemas on both sides of the inline-conversion limit.
+    lists:foreach(
+        fun(I) ->
+            Name = integer_to_binary(I),
+            {ok, _} = greptimedb_rs:query(
+                Client,
+                <<"ALTER TABLE bounded_stream ADD COLUMN extra", Name/binary, " INT64">>
+            )
+        end,
+        lists:seq(1, 5)
+    ),
+    {ok, EightColumns} = greptimedb_rs:stream_start(Client, Table, row()),
+    ok = greptimedb_rs:stream_write(EightColumns, bounded_rows(30000, 1)),
+    ok = greptimedb_rs:stream_close(EightColumns),
+    {ok, _} = greptimedb_rs:query(
+        Client,
+        <<"ALTER TABLE bounded_stream ADD COLUMN extra6 INT64">>
+    ),
+    {ok, NineColumns} = greptimedb_rs:stream_start(Client, Table, row()),
+    ok = greptimedb_rs:stream_write(NineColumns, bounded_rows(30001, 1)),
+    ok = greptimedb_rs:stream_close(NineColumns),
+    ?assertEqual(
+        {ok, [[30001, <<"value">>], [30002, <<"value">>]]},
+        greptimedb_rs:query(
+            Client,
+            <<"SELECT reading, payload FROM bounded_stream ",
+                "WHERE reading >= 30000 ORDER BY reading">>
+        )
+    ),
+    counts({1, 0}).
+
+bounded_rows(Offset, N) ->
+    [
+        #{
+            timestamp => 1700000000000 + I,
+            fields => #{
+                <<"reading">> => I, <<"payload">> => <<"value">>
+            }
+        }
+     || I <- lists:seq(Offset + 1, Offset + N)
+    ].
+
 %% Hold initial response headers to exercise the SDK's transport timeout.
 t_request_timeout(Config) ->
     Server = ?config(server, Config),
@@ -791,6 +1005,148 @@ t_request_timeout(Config) ->
         {ok, [[7]]}, greptimedb_rs:query(QueryClient, <<"SELECT reading FROM ", Table/binary>>)
     ),
     lists:foreach(fun no_result/1, [Query, Insert]).
+
+t_stream_response_drain(Config) ->
+    Server = ?config(server, Config),
+    Client = client(Server, 1, 2, 10000, true),
+    Tables = [<<"response_drain_a">>, <<"response_drain_b">>],
+    Streams = [response_stream(Client, Table) || Table <- Tables],
+    Tag = make_ref(),
+    Parent = self(),
+    lists:foreach(
+        fun(I) ->
+            lists:foreach(
+                fun(Stream) ->
+                    response_write(Stream, I, Parent, Tag)
+                end,
+                Streams
+            )
+        end,
+        lists:seq(1, 4096)
+    ),
+    lists:foreach(fun(Stream) -> ok = greptimedb_rs:stream_close(Stream) end, Streams),
+    lists:foreach(
+        fun(Table) ->
+            ?assertEqual(
+                {ok, [[4096, 8390656]]},
+                greptimedb_rs:query(Client, <<"SELECT count(*), sum(reading) FROM ", Table/binary>>)
+            )
+        end,
+        Tables
+    ),
+    receive
+        {Tag, _, Result} -> ct:fail({duplicate_callback, Result})
+    after 200 -> ok
+    end,
+    counts({1, 0}).
+
+response_write(Stream, I, Parent, Tag) when I rem 2 =:= 0 ->
+    {ok, _} = greptimedb_rs:stream_write_async(
+        Stream,
+        [response_row(I)],
+        {fun(Result) -> Parent ! {Tag, I, Result} end, []}
+    ),
+    receive
+        {Tag, I, ok} -> ok;
+        {Tag, Other, Result} -> ct:fail({unexpected_callback, Other, Result})
+    after 5000 -> ct:fail(callback_timeout)
+    end;
+response_write(Stream, I, _Parent, _Tag) ->
+    ok = greptimedb_rs:stream_write(Stream, [response_row(I)]).
+
+t_stream_response_error(Config) ->
+    Client = client(?config(server, Config), 1, 1, 5000, true),
+    Table = <<"response_error">>,
+    Stream = response_stream(Client, Table),
+    warm_responses(Stream),
+    wait(
+        fun() ->
+            greptimedb_rs:query(Client, <<"SELECT count(*) FROM ", Table/binary>>) =:= {ok, [[512]]}
+        end,
+        5000
+    ),
+    %% The active stream still refers to the dropped table's regions.
+    {ok, _} = greptimedb_rs:query(Client, <<"DROP TABLE ", Table/binary>>),
+    Result = response_burst(Stream),
+    ?assertMatch({error, _}, Result),
+    ?assertNotEqual({error, timeout}, Result),
+    {ok, _} = greptimedb_rs:query(
+        Client,
+        <<"CREATE TABLE ", Table/binary, " (ts TIMESTAMP TIME INDEX, reading INT64 NOT NULL)">>
+    ),
+    recover_stream(Client, Table).
+
+t_stream_response_faults(Config) ->
+    Server = ?config(server, Config),
+    lists:foreach(
+        fun(Fault) ->
+            Client = client(Server, 1, 1, 1000, false),
+            Table = atom_to_binary(Fault),
+            Stream = response_stream(Client, Table),
+            warm_responses(Stream),
+            ok = greptimedb_test_server:pause(Server),
+            Request = start_request(fun() -> response_burst(Stream) end),
+            wait(fun() -> greptimedb_test_server:headers(Server) > 0 end, 1000),
+            case Fault of
+                response_timeout -> ok;
+                response_disconnect -> ok = greptimedb_test_server:disconnect(Server);
+                response_restart -> ok = greptimedb_test_server:restart(Server)
+            end,
+            {Result, _} = result(Request, 3000),
+            ?assertMatch({error, _}, Result),
+            case Fault of
+                response_timeout -> ?assertEqual({error, timeout}, Result);
+                _ -> ok
+            end,
+            counts({1, 0}),
+            ok = greptimedb_test_server:release(Server),
+            wait_connected(Client),
+            recover_stream(Client, Table),
+            no_result(Request),
+            kill_callers([Request]),
+            ok = greptimedb_rs:stop_client(Client)
+        end,
+        [response_timeout, response_disconnect, response_restart]
+    ).
+
+response_stream(Client, Table) ->
+    {ok, _} = greptimedb_rs:query(
+        Client,
+        <<"CREATE TABLE ", Table/binary, " (ts TIMESTAMP TIME INDEX, reading INT64 NOT NULL)">>
+    ),
+    {ok, Stream} = greptimedb_rs:stream_start(Client, Table, row()),
+    Stream.
+
+response_row(I) ->
+    #{timestamp => 1700000000000 + I, fields => #{<<"reading">> => I}}.
+
+warm_responses(Stream) ->
+    lists:foreach(
+        fun(I) -> ok = greptimedb_rs:stream_write(Stream, [response_row(I)]) end,
+        lists:seq(1, 512)
+    ).
+
+response_burst(Stream) ->
+    response_burst(Stream, lists:seq(10001, 10008)).
+
+response_burst(_Stream, []) ->
+    ct:fail(expected_stream_failure);
+response_burst(Stream, [I | Rest]) ->
+    case greptimedb_rs:stream_write(Stream, [response_row(I)]) of
+        ok -> response_burst(Stream, Rest);
+        Error -> Error
+    end.
+
+recover_stream(Client, Table) ->
+    {ok, Stream} = greptimedb_rs:stream_start(Client, Table, row()),
+    ok = greptimedb_rs:stream_write(Stream, [response_row(20000)]),
+    ok = greptimedb_rs:stream_close(Stream),
+    ?assertEqual(
+        {ok, [[20000]]},
+        greptimedb_rs:query(
+            Client, <<"SELECT reading FROM ", Table/binary, " WHERE reading = 20000">>
+        )
+    ).
 
 t_request_timeout_expiry(Config) ->
     Server = ?config(server, Config),

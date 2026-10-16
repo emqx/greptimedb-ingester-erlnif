@@ -61,7 +61,37 @@ connect(_Opts) ->
 disconnect(_Client) ->
     not_loaded(?LINE).
 
-submit(_Client, _Command, _Args, _Token, _DeadlineUs) ->
+submit(Client, Command, Args, Token, DeadlineUs) ->
+    case small_submission(Args, Token) of
+        true -> submit_small(Client, Command, Args, Token, DeadlineUs);
+        false -> submit_dirty(Client, Command, Args, Token, DeadlineUs)
+    end.
+
+%% Check structure without copying binary contents, then bound their total
+%% size with constant-time byte_size/1 before copying input on a normal scheduler.
+small_submission(Args, Token) ->
+    case small_token(Token) andalso bounded_submission(Args) of
+        false -> false;
+        Binaries -> small_binaries(Binaries, 16384)
+    end.
+
+small_binaries([], _) ->
+    true;
+small_binaries([Binary | Rest], Budget) ->
+    Size = byte_size(Binary),
+    Size =< Budget andalso small_binaries(Rest, Budget - Size).
+
+small_token(Token) when is_reference(Token) -> true;
+small_token({Generation, Ref}) -> is_reference(Generation) andalso is_reference(Ref);
+small_token(_) -> false.
+
+bounded_submission(_Args) ->
+    not_loaded(?LINE).
+
+submit_small(_Client, _Command, _Args, _Token, _DeadlineUs) ->
+    not_loaded(?LINE).
+
+submit_dirty(_Client, _Command, _Args, _Token, _DeadlineUs) ->
     not_loaded(?LINE).
 
 cancel(_Operation) ->

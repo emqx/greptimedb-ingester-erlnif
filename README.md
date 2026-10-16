@@ -67,7 +67,7 @@ Timeouts cancel local work and do not undo writes already accepted by the server
 
 ### Shared runtime
 
-All pools share one Tokio runtime. Defaults are two Tokio workers, one owner thread for non-`Send` SDK tasks, and two codec workers for row conversion and large query result encoding.
+All pools share one Tokio runtime. Queries, inserts and streaming requests run as `Send` tasks on Tokio workers. Defaults are two Tokio workers, one runtime lifecycle thread, and two codec workers for row conversion and large query result encoding. Structurally bounded small submissions (at most 128 rows and 16 KiB of binary data) avoid a dirty CPU scheduler handoff. Small inserts and streaming batches against schemas of at most eight short column names can convert inline in their Tokio task; other conversions use codec workers. The lifecycle thread handles shutdown and writer draining.
 
 Configure worker counts before starting the application:
 
@@ -320,3 +320,39 @@ make regression GREPTIME_BIN=/path/to/greptime
 ```
 
 The Common Test suite starts and stops its own local database and transparent HTTP/2 fault proxy. Results use the standard Common Test report. Existing TCP, TLS and authentication suites run with `make ct-docker`.
+
+### Performance regression benchmark
+
+On Linux, run the ten query, synchronous/asynchronous insert and streaming scenarios
+against a local GreptimeDB executable:
+
+```bash
+make benchmark GREPTIME_BIN=/path/to/greptime
+```
+
+To compare with a separately built baseline, set `BASELINE_APP` to its application
+directory containing `ebin/` and `priv/`:
+
+```bash
+BASELINE_APP=/path/to/baseline/_build/default/lib/greptimedb_rs \
+  make benchmark GREPTIME_BIN=/path/to/greptime
+```
+
+The benchmark runs three rounds with alternating version order and a fresh VM and
+database for every scenario. Each run checks results and stored row counts. Stream
+timing includes finish and acknowledgements; concurrent stream callers share one
+writer. CSV output includes throughput, P50/P95/P99, client/server CPU time, sampled
+RSS and thread counts. Logs and build hashes are retained in the printed output directory.
+
+Optional environment settings: `BENCH_ROUNDS` (1–10, default 3), `BENCH_CASE`
+(for example `stream5000`), `BENCH_POOL_SIZE` (default 4), `BENCH_RUNTIME_WORKERS`
+and `BENCH_CODEC_WORKERS` (both default 2), and `BENCH_OUT` (a fresh output directory).
+`BENCH_APP` can select an already built current application when invoking
+`bash scripts/benchmark.sh` directly. Worker settings apply to the shared-runtime
+version; the baseline retains its runtime implementation.
+
+CPU time measures equal completed work. RSS includes BEAM, NIF and prebuilt input
+data; `ready_rss_kb` is measured after input preparation, while `pool_idle_rss_kb`
+is measured before it. Peak RSS is sampled every 20ms. Compare round medians and
+latency distributions; short runs on shared machines are not a strict CI performance
+gate. This benchmark runs manually; the correctness regression suite runs in CI.

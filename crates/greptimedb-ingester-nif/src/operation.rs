@@ -1,6 +1,6 @@
 //! Tracks cancellation and reclamation of individual native requests.
 //!
-//! State is shared by the runtime owner and codec workers; this module creates no threads.
+//! State is shared by request tasks and codec workers; this module creates no threads.
 //! The resource monitor cancels requests when their Erlang connection process exits.
 //! Codec job guards keep cancelled requests active until their conversion/encoding work ends.
 
@@ -13,7 +13,7 @@ use tokio::sync::{watch, Notify};
 static OPERATIONS: AtomicUsize = AtomicUsize::new(0);
 
 pub struct Operation {
-    // The owner task and conversion jobs need both the latest cancellation state
+    // Request tasks and conversion jobs need both the latest cancellation state
     // and an async wakeup. Receivers added after cancellation can read true.
     pub cancel: watch::Sender<bool>,
     pub active: AtomicBool,
