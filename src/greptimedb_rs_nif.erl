@@ -17,13 +17,17 @@
 -module(greptimedb_rs_nif).
 
 -export([
+    runtime_start/2,
+    runtime_stop/1,
+    runtime_stop/2,
     connect/1,
     disconnect/1,
-    execute/2,
-    insert/3,
-    stream_start/3,
-    stream_write/2,
-    stream_close/1,
+    submit/5,
+    cancel/1,
+    operation_active/1,
+    resource_counts/0,
+    codec_counts/0,
+    discard_writer/1,
     fips_status/0,
     cached_fips_status/0
 ]).
@@ -42,25 +46,67 @@ init() ->
 %% =================================================================================================
 %% NIFs
 
+runtime_start(_Workers, _CodecWorkers) ->
+    not_loaded(?LINE).
+
+runtime_stop(Runtime) ->
+    runtime_stop(Runtime, 5000).
+
+runtime_stop(_Runtime, _Timeout) ->
+    not_loaded(?LINE).
+
 connect(_Opts) ->
     not_loaded(?LINE).
 
 disconnect(_Client) ->
     not_loaded(?LINE).
 
-execute(_Client, _Sql) ->
+submit(Client, Command, Args, Token, DeadlineUs) ->
+    case small_submission(Args, Token) of
+        true -> submit_small(Client, Command, Args, Token, DeadlineUs);
+        false -> submit_dirty(Client, Command, Args, Token, DeadlineUs)
+    end.
+
+%% Check structure without copying binary contents, then bound their total
+%% size with constant-time byte_size/1 before copying input on a normal scheduler.
+small_submission(Args, Token) ->
+    case small_token(Token) andalso bounded_submission(Args) of
+        false -> false;
+        Binaries -> small_binaries(Binaries, 16384)
+    end.
+
+small_binaries([], _) ->
+    true;
+small_binaries([Binary | Rest], Budget) ->
+    Size = byte_size(Binary),
+    Size =< Budget andalso small_binaries(Rest, Budget - Size).
+
+small_token(Token) when is_reference(Token) -> true;
+small_token({Generation, Ref}) -> is_reference(Generation) andalso is_reference(Ref);
+small_token(_) -> false.
+
+bounded_submission(_Args) ->
     not_loaded(?LINE).
 
-insert(_Client, _Table, _Rows) ->
+submit_small(_Client, _Command, _Args, _Token, _DeadlineUs) ->
     not_loaded(?LINE).
 
-stream_start(_Client, _Table, _FirstRow) ->
+submit_dirty(_Client, _Command, _Args, _Token, _DeadlineUs) ->
     not_loaded(?LINE).
 
-stream_write(_Writer, _Rows) ->
+cancel(_Operation) ->
     not_loaded(?LINE).
 
-stream_close(_Writer) ->
+operation_active(_Operation) ->
+    not_loaded(?LINE).
+
+codec_counts() ->
+    not_loaded(?LINE).
+
+resource_counts() ->
+    not_loaded(?LINE).
+
+discard_writer(_Writer) ->
     not_loaded(?LINE).
 
 fips_status() ->

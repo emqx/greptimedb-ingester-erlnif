@@ -155,7 +155,11 @@ end_per_testcase(_TestCase, Config) ->
             greptimedb_rs:query(Client, DropTableSql),
 
             %% Ensure client is stopped to prevent 'already_started' in next test
-            catch greptimedb_rs:stop_client(Client),
+            try
+                greptimedb_rs:stop_client(Client)
+            catch
+                _:_ -> ok
+            end,
             ok
     end.
 
