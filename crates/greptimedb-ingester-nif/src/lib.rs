@@ -773,7 +773,7 @@ impl Submitted {
             check_operation(deadline, &control).err(),
         );
         let large_reply = matches!(&result, Ok(Value::Batches(batches))
-                if batches.iter().map(|batch| batch.num_rows()).sum::<usize>() > 256);
+                if !small_query_reply(batches));
         let (mut output, token, encoded) = if large_reply {
             let fallback = OwnedEnv::new();
             let fallback_token = output.run(|env| fallback.save(token.load(env)));
@@ -798,6 +798,46 @@ impl Submitted {
             (atoms::greptimedb_nif(), token.load(env), encoded.load(env)).encode(env)
         });
     }
+}
+
+fn small_query_reply(batches: &[arrow::record_batch::RecordBatch]) -> bool {
+    use arrow::datatypes::DataType;
+
+    if batches.len() > 256 {
+        return false;
+    }
+    let mut remaining_rows = 256;
+    let mut remaining_bytes = 16 * 1024;
+    for batch in batches {
+        if batch.num_columns() > 8 || batch.num_rows() > remaining_rows {
+            return false;
+        }
+        remaining_rows -= batch.num_rows();
+        for column in batch.columns() {
+            // Flat arrays have a bounded number of buffers to inspect. Shared
+            // buffer capacity may overestimate bytes and safely select codec work.
+            let dtype = column.data_type();
+            if !(dtype.is_primitive()
+                || matches!(
+                    dtype,
+                    DataType::Null
+                        | DataType::Boolean
+                        | DataType::Utf8
+                        | DataType::LargeUtf8
+                        | DataType::Binary
+                        | DataType::LargeBinary
+                ))
+            {
+                return false;
+            }
+            let bytes = column.get_array_memory_size();
+            if bytes > remaining_bytes {
+                return false;
+            }
+            remaining_bytes -= bytes;
+        }
+    }
+    true
 }
 
 fn encode_reply(
@@ -1061,6 +1101,50 @@ rustler::init!("greptimedb_rs_nif", load = load);
 mod tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn small_query_reply_bounds_rows_columns_bytes_and_batches() {
+        use arrow::array::{ArrayRef, BinaryArray, Int64Array, ListArray};
+        use arrow::buffer::{Buffer, OffsetBuffer};
+        use arrow::datatypes::Int64Type;
+        use arrow::record_batch::RecordBatch;
+
+        let numeric = |rows, columns| {
+            RecordBatch::try_from_iter((0..columns).map(|i| {
+                (
+                    format!("c{i}"),
+                    Arc::new(Int64Array::from(vec![1; rows])) as ArrayRef,
+                )
+            }))
+            .unwrap()
+        };
+        assert!(small_query_reply(&[numeric(256, 1)]));
+        assert!(!small_query_reply(&[numeric(257, 1)]));
+        assert!(!small_query_reply(&[numeric(128, 1), numeric(129, 1)]));
+        assert!(small_query_reply(&[numeric(1, 8)]));
+        assert!(!small_query_reply(&[numeric(1, 9)]));
+
+        let binary = |bytes| {
+            let array = BinaryArray::new(
+                OffsetBuffer::new(vec![0, bytes as i32].into()),
+                Buffer::from(vec![0u8; bytes]),
+                None,
+            );
+            RecordBatch::try_from_iter([("payload", Arc::new(array) as ArrayRef)]).unwrap()
+        };
+        let overhead = binary(0).column(0).get_array_memory_size();
+        assert!(small_query_reply(&[binary(16 * 1024 - overhead)]));
+        assert!(!small_query_reply(&[binary(16 * 1024 - overhead + 1)]));
+        assert!(!small_query_reply(&[binary(8 * 1024), binary(8 * 1024)]));
+
+        let empty = RecordBatch::new_empty(Arc::new(arrow::datatypes::Schema::empty()));
+        assert!(small_query_reply(&vec![empty.clone(); 256]));
+        assert!(!small_query_reply(&vec![empty; 257]));
+        let nested = ListArray::from_iter_primitive::<Int64Type, _, _>([Some(vec![Some(1)])]);
+        let nested =
+            RecordBatch::try_from_iter([("nested", Arc::new(nested) as ArrayRef)]).unwrap();
+        assert!(!small_query_reply(&[nested]));
+    }
 
     #[test]
     fn poisoned_client_slot_closes_and_cancels_without_finishing_early() {

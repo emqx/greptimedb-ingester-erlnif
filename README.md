@@ -80,6 +80,12 @@ application:ensure_all_started(greptimedb_rs).
 
 Both settings accept 1–64 and take effect on application restart. The codec pool accepts at most `2 * codec_workers` queued and running jobs; additional operations wait asynchronously within their deadline. Running codec work finishes before its client slot is released after cancellation.
 
+Query replies encode inline only within a budget of 256 rows in total, eight
+columns per batch and 16 KiB of estimated Arrow array memory. The budget check
+examines at most 256 batches and only flat array types; other replies use codec
+workers. Shared buffer capacity can conservatively select the codec path even
+when the returned values are small.
+
 Application startup returns an error when native runtime creation fails. A poisoned native client state lock closes that client and cancels its active request while retaining codec work until reclamation. The affected pool connection must be recreated. Async callback exceptions are logged as `greptimedb_callback_failed`; the worker continues processing requests.
 
 Stopping a pool cancels its active request and attempts to finish previously submitted
@@ -340,8 +346,9 @@ BASELINE_APP=/path/to/baseline/_build/default/lib/greptimedb_rs \
 
 The benchmark runs three rounds with alternating version order and a fresh VM and
 database for every scenario. Each run checks results and stored row counts. Stream
-timing includes finish and acknowledgements; concurrent stream callers share one
-writer. CSV output includes throughput, P50/P95/P99, client/server CPU time, sampled
+timing includes finish and acknowledgements. Stream callers use the pool's writers
+(four by default, one per connection), all sharing one Tokio runtime. CSV output
+includes throughput, P50/P95/P99, client/server CPU time, sampled
 RSS and thread counts. Logs and build hashes are retained in the printed output directory.
 
 Optional environment settings: `BENCH_ROUNDS` (1–10, default 3), `BENCH_CASE`

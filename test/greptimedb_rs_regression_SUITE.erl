@@ -16,7 +16,9 @@ groups() ->
             {lifecycle, [], [
                 t_queued, t_caller_cancel, t_pool_stop, t_socket_exit, t_library_stop, t_owner_exit
             ]},
-            {codec, [], [t_codec_cancel, t_codec_timeout, t_codec_stop, t_query_cancel]},
+            {codec, [], [
+                t_codec_cancel, t_codec_timeout, t_codec_stop, t_query_cancel, t_query_reply_bounds
+            ]},
             {failures, [], [
                 t_startup_failure,
                 t_startup_pressure,
@@ -460,6 +462,89 @@ t_codec_stop(Config) ->
 
 t_query_cancel(Config) ->
     codec(query_cancel, Config).
+
+t_query_reply_bounds(Config) ->
+    Client = client(?config(server, Config), 1, 1, 10000, true),
+    Table = <<"regression_reply_bounds">>,
+    {ok, _} = greptimedb_rs:query(
+        Client,
+        <<"CREATE TABLE regression_reply_bounds (ts TIMESTAMP TIME INDEX, reading BIGINT)">>
+    ),
+    Rows = [(row())#{timestamp := 1700000000000 + I} || I <- lists:seq(1, 257)],
+    {ok, 257} = greptimedb_rs:insert(Client, Table, Rows),
+    lists:foreach(
+        fun(N) ->
+            SQL = iolist_to_binary([
+                "SELECT reading FROM regression_reply_bounds LIMIT ", integer_to_binary(N)
+            ]),
+            ?assertEqual({ok, lists:duplicate(N, [7])}, greptimedb_rs:query(Client, SQL)),
+            ?assertEqual(
+                {ok, lists:duplicate(N, [7])},
+                async(fun(Cb) -> greptimedb_rs:query_async(Client, SQL, Cb) end)
+            )
+        end,
+        [256, 257]
+    ),
+    lists:foreach(
+        fun(N) ->
+            SQL = iolist_to_binary([
+                "SELECT ", lists:join(",", [integer_to_binary(I) || I <- lists:seq(1, N)])
+            ]),
+            ?assertEqual({ok, [lists:seq(1, N)]}, greptimedb_rs:query(Client, SQL))
+        end,
+        [8, 9]
+    ),
+    lists:foreach(
+        fun(Size) ->
+            SQL = iolist_to_binary(["SELECT repeat('x',", integer_to_binary(Size), ")"]),
+            {ok, [[Payload]]} = greptimedb_rs:query(Client, SQL),
+            ?assert(Payload =:= binary:copy(<<"x">>, Size))
+        end,
+        [16383, 16384, 16385]
+    ),
+    %% A large single-cell result must use codec workers through both public APIs.
+    SQL = <<"SELECT repeat('x',67108864)">>,
+    lists:foreach(
+        fun(Mode) ->
+            {Result, Peak} = query_codec_activity(fun() ->
+                reply_query(Mode, Client, SQL)
+            end),
+            {ok, [[Payload]]} = Result,
+            ?assert(Payload =:= binary:copy(<<"x">>, 67108864)),
+            ?assert(Peak > 0)
+        end,
+        [sync, async]
+    ),
+    counts({1, 0}),
+    ?assertEqual({1, 2, 0, 0, 0}, greptimedb_rs_nif:codec_counts()).
+
+reply_query(sync, Client, SQL) ->
+    greptimedb_rs:query(Client, SQL);
+reply_query(async, Client, SQL) ->
+    async(fun(Cb) -> greptimedb_rs:query_async(Client, SQL, Cb) end).
+
+query_codec_activity(Call) ->
+    Parent = self(),
+    Ref = make_ref(),
+    Sampler = spawn_link(fun() -> query_codec_activity(Parent, Ref, 0) end),
+    Result =
+        try
+            Call()
+        after
+            Sampler ! stop
+        end,
+    receive
+        {Ref, Peak} -> {Result, Peak}
+    after 1000 -> error(codec_sampler_timeout)
+    end.
+
+query_codec_activity(Parent, Ref, Peak) ->
+    {_, _, Active, _, _} = greptimedb_rs_nif:codec_counts(),
+    Next = max(Peak, Active),
+    receive
+        stop -> Parent ! {Ref, Next}
+    after 1 -> query_codec_activity(Parent, Ref, Next)
+    end.
 
 codec(Mode, Config) ->
     Server = ?config(server, Config),
