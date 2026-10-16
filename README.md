@@ -63,6 +63,11 @@ RPC timeouts are controlled by the operation deadline rather than the SDK's defa
 
 The deadline starts when the public API accepts the call and includes library queueing, schema discovery, RPC and response consumption. Query/insert/write timeouts return `{error, timeout}` or invoke the existing asynchronous callback with that result. Stream start and close retain their existing best effort public return semantics.
 
+The deadline also includes input submission, but copying terms into `OwnedEnv`
+is synchronous and cannot be interrupted. Large inputs can delay timeout delivery
+until the NIF returns, even on a dirty CPU scheduler. Callers should bound each
+submitted batch; the timeout is not a hard wall-clock bound for input copying.
+
 Timeouts cancel local work and do not undo writes already accepted by the server. Uncertain writes are not automatically retried. After a streaming write timeout or error, establish a new writer using `stream_start/3` before writing again.
 
 ### Shared runtime

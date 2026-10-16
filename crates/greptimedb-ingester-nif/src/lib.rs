@@ -360,6 +360,9 @@ struct Input {
 impl Input {
     fn new(rows: Term, small: bool) -> Self {
         let env = OwnedEnv::new();
+        // Saving terms copies them synchronously before this NIF returns.
+        // Large inputs can delay the connection process's deadline handling;
+        // cancellation cannot interrupt this copy. Callers should bound batch size.
         let rows = env.save(rows);
         Self { env, rows, small }
     }
