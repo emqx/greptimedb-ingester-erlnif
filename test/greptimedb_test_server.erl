@@ -10,6 +10,7 @@
     pause_headers/1,
     pause_requests/1,
     held_frames/1,
+    request_resets/1,
     release/1,
     disconnect/1,
     headers/1,
@@ -79,6 +80,9 @@ pause_requests(Server) ->
 held_frames(Server) ->
     gen_server:call(Server, held_frames).
 
+request_resets(Server) ->
+    gen_server:call(Server, request_resets).
+
 release(Server) ->
     gen_server:call(Server, release).
 
@@ -128,6 +132,8 @@ init([Binary, Directory]) ->
         http => HttpPort,
         sockets => [],
         held => [],
+        delayed_streams => #{},
+        request_resets => 0,
         headers => #{},
         paused => none
     },
@@ -146,9 +152,11 @@ handle_call(pause, _, State) ->
 handle_call(pause_headers, _, State) ->
     {reply, ok, State#{paused := headers, headers := #{}}};
 handle_call(pause_requests, _, State) ->
-    {reply, ok, State#{paused := requests}};
+    {reply, ok, State#{paused := requests, delayed_streams := #{}, request_resets := 0}};
 handle_call(held_frames, _, State) ->
     {reply, length(maps:get(held, State)), State};
+handle_call(request_resets, _, State) ->
+    {reply, maps:get(request_resets, State), State};
 handle_call(headers, _, State) ->
     {reply, map_size(maps:get(headers, State)), State};
 handle_call(release, _, State) ->
@@ -163,9 +171,21 @@ handle_call(restart, _, State) ->
     stop_backend(State),
     {reply, ok, start_backend(close_sockets(State))};
 %% Delay request DATA but keep resets flowing, exposing premature cancellation.
-handle_call({request, Socket, 0, Packet}, _, #{paused := requests} = State) ->
-    {reply, ok, State#{held := [{Socket, Packet} | maps:get(held, State)]}};
-handle_call({request, Socket, _, Packet}, _, State) ->
+handle_call({request, Socket, Stream, 0, Packet}, _, #{paused := requests} = State) ->
+    Streams = (maps:get(delayed_streams, State))#{{Socket, Stream} => true},
+    {reply, ok, State#{
+        held := [{Socket, Packet} | maps:get(held, State)], delayed_streams := Streams
+    }};
+handle_call({request, Socket, Stream, 3, Packet}, _, State) ->
+    gen_tcp:send(Socket, Packet),
+    Resets = maps:get(request_resets, State),
+    Increment =
+        case maps:is_key({Socket, Stream}, maps:get(delayed_streams, State)) of
+            true -> 1;
+            false -> 0
+        end,
+    {reply, ok, State#{request_resets := Resets + Increment}};
+handle_call({request, Socket, _, _, Packet}, _, State) ->
     gen_tcp:send(Socket, Packet),
     {reply, ok, State};
 %% Keep connection control frames flowing while holding RPC responses.
@@ -305,7 +325,7 @@ wait_exit(Port, Log, Timeout) ->
 
 close_sockets(State) ->
     lists:foreach(fun gen_tcp:close/1, maps:get(sockets, State)),
-    State#{sockets := [], held := [], paused := none}.
+    State#{sockets := [], held := [], paused := none, delayed_streams := #{}, request_resets := 0}.
 
 accept(Listener, RpcPort, Server) ->
     case gen_tcp:accept(Listener) of
@@ -366,7 +386,7 @@ frames(Source, Destination, Direction, Server) ->
             Packet = <<Header/binary, Payload/binary>>,
             case Direction of
                 request ->
-                    gen_server:call(Server, {request, Destination, Type, Packet});
+                    gen_server:call(Server, {request, Destination, Stream, Type, Packet});
                 response ->
                     gen_server:call(Server, {frame, Destination, Stream, Type, Flags, Packet})
             end,

@@ -100,8 +100,9 @@ can force termination earlier (currently about 300ms per connection). Call
 `stream_close/1` explicitly before stopping when more time is needed; its existing
 public return value still suppresses finish errors.
 
-Normal application shutdown finishes remaining stream writers concurrently before
-closing the runtime. The application setting `shutdown_timeout` provides one total
+Normal application shutdown finishes idle stream writers alongside active stream
+operations, including writers returned by those operations, before closing the
+runtime. The application setting `shutdown_timeout` provides one total
 deadline starting when native shutdown is signalled (default `5000`ms, range
 `1`–`30000`ms). In-flight stream write/close operations share this deadline;
 queries and inserts are cancelled. Expiry cancels unfinished drains; failed writes

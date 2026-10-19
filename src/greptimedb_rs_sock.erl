@@ -363,12 +363,16 @@ finish_unstarted(_, State) ->
     State.
 
 %% Earlier starts may still finish after a queued close has expired or been abandoned.
-invalidate_starts(_Ref, _Table, #state{current = undefined} = State) ->
-    State;
 invalidate_starts(Ref, Table, State) ->
-    Earlier = lists:takewhile(
-        fun(Waiting) -> Waiting =/= Ref end, queue:to_list(State#state.waiting)
-    ),
+    Earlier =
+        case
+            lists:splitwith(
+                fun(Waiting) -> Waiting =/= Ref end, queue:to_list(State#state.waiting)
+            )
+        of
+            {Before, [_ | _]} -> Before;
+            {_, []} -> []
+        end,
     Pending = lists:foldl(
         fun(StartRef, Acc) ->
             case maps:find(StartRef, Acc) of

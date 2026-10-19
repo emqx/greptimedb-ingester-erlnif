@@ -38,6 +38,10 @@ groups() ->
                 t_rejected_close,
                 t_close_during_start,
                 t_close_after_queued_start,
+                t_close_dispatch_timeout,
+                t_close_dispatch_cancel,
+                t_close_dequeued_expiry,
+                t_close_during_conversion,
                 t_submit_rejection,
                 t_pool_stop_flush,
                 t_pool_stop_flush_busy,
@@ -53,7 +57,9 @@ groups() ->
                 t_owner_exit_no_flush,
                 t_owner_error_no_flush,
                 t_library_stop_active_close,
-                t_library_stop_active_write
+                t_library_stop_active_write,
+                t_library_stop_idle_with_stalled_close,
+                t_library_stop_write_with_stalled_close
             ]}
         ].
 
@@ -114,9 +120,16 @@ init_per_testcase(Testcase, Config) ->
     ),
     ShutdownTimeout =
         case Testcase of
-            t_library_stop_flush_timeout -> 200;
+            T when
+                T =:= t_library_stop_idle_with_stalled_close;
+                T =:= t_library_stop_write_with_stalled_close
+            ->
+                1000;
+            t_library_stop_flush_timeout ->
+                200;
             T when T =:= t_owner_exit_no_flush; T =:= t_owner_error_no_flush -> 10000;
-            _ -> 5000
+            _ ->
+                5000
         end,
     application:set_env(greptimedb_rs, shutdown_timeout, ShutdownTimeout),
     {ok, _} = application:ensure_all_started(greptimedb_rs),
@@ -1493,6 +1506,150 @@ close_during_start(Mode, Config) ->
     ?assertEqual(ok, greptimedb_rs:stream_close(Fresh)),
     counts({1, 0}).
 
+t_close_dispatch_timeout(Config) ->
+    close_dispatch(timeout, Config).
+
+t_close_dispatch_cancel(Config) ->
+    close_dispatch(cancel, Config).
+
+%% A real deadline/DOWN must be handled before the budget's self-sent continue.
+close_dispatch(Mode, Config) ->
+    Server = ?config(server, Config),
+    {Client, Conn, Stream} = close_client(Server),
+    ok = greptimedb_rs:stream_close(Stream),
+    ok = greptimedb_test_server:pause_headers(Server),
+    Query = start_request(fun() -> greptimedb_rs:query(Client, <<"SELECT 1">>) end),
+    wait(fun() -> map_size(element(8, sys:get_state(Conn))) =:= 1 end, 1000),
+    Barrier = dispatch_barrier(),
+    lists:foreach(
+        fun(I) ->
+            Callback =
+                case I of
+                    100 -> Barrier;
+                    _ -> fun(_) -> ok end
+                end,
+            {ok, _} = greptimedb_rs:stream_write_async(Stream, [row()], {Callback, []})
+        end,
+        lists:seq(1, 100)
+    ),
+    wait(fun() -> map_size(element(8, sys:get_state(Conn))) =:= 101 end, 1000),
+    Start = start_request(fun() ->
+        greptimedb_rs:stream_start(Client, <<"regression_close">>, row())
+    end),
+    wait(fun() -> map_size(element(8, sys:get_state(Conn))) =:= 102 end, 1000),
+    Timeout =
+        case Mode of
+            timeout -> 400;
+            cancel -> 10000
+        end,
+    Close = queued_short_close(Client, Timeout),
+    wait(fun() -> map_size(element(8, sys:get_state(Conn))) =:= 103 end, 1000),
+    {CloseRef, CloseReq} = queued_close_request(Conn),
+    ok = greptimedb_test_server:release(Server),
+    receive
+        {dispatch_barrier, Conn, {error, no_writer}} -> ok
+    after 2000 -> error(missing_barrier)
+    end,
+    Message =
+        case Mode of
+            timeout ->
+                {deadline, CloseRef};
+            cancel ->
+                {ClosePid, _} = Close,
+                exit(ClosePid, kill),
+                {'DOWN', maps:get(monitor, CloseReq), process, ClosePid, killed}
+        end,
+    wait_for_message(Conn, Message),
+    Conn ! resume_dispatch,
+    case Mode of
+        timeout -> {ok, _} = result(Close, 1000);
+        cancel -> ok
+    end,
+    {{ok, _}, _} = result(Start, 2000),
+    {{ok, [[1]]}, _} = result(Query, 1000),
+    ?assertEqual(#{}, element(4, sys:get_state(Conn))),
+    ?assertEqual({error, no_writer}, greptimedb_rs:stream_write(Stream, [row()])),
+    counts({1, 0}).
+
+%% Expiry after dequeue must leave subsequent starts valid.
+t_close_dequeued_expiry(Config) ->
+    Server = ?config(server, Config),
+    {Client, Conn, Stream} = close_client(Server),
+    ok = greptimedb_rs:stream_close(Stream),
+    ok = greptimedb_test_server:pause_headers(Server),
+    {ok, _} = greptimedb_rs:query_async(Client, <<"SELECT 1">>, {dispatch_barrier(), []}),
+    wait(fun() -> map_size(element(8, sys:get_state(Conn))) =:= 1 end, 1000),
+    Close = queued_short_close(Client, 400),
+    wait(fun() -> map_size(element(8, sys:get_state(Conn))) =:= 2 end, 1000),
+    {CloseRef, _} = queued_close_request(Conn),
+    Start = start_request(fun() ->
+        greptimedb_rs:stream_start(Client, <<"regression_close">>, row())
+    end),
+    wait(fun() -> map_size(element(8, sys:get_state(Conn))) =:= 3 end, 1000),
+    ok = greptimedb_test_server:release(Server),
+    receive
+        {dispatch_barrier, Conn, {ok, [[1]]}} -> ok
+    after 2000 -> error(missing_barrier)
+    end,
+    wait_for_message(Conn, {deadline, CloseRef}),
+    Conn ! resume_dispatch,
+    {ok, _} = result(Close, 1000),
+    {{ok, _}, _} = result(Start, 2000),
+    ?assertEqual(1, map_size(element(4, sys:get_state(Conn)))),
+    ?assertEqual(ok, greptimedb_rs:stream_write(Stream, [row()])),
+    ?assertEqual(ok, greptimedb_rs:stream_close(Stream)),
+    counts({1, 0}).
+
+dispatch_barrier() ->
+    Parent = self(),
+    fun(Result) ->
+        Parent ! {dispatch_barrier, self(), Result},
+        receive
+            resume_dispatch -> ok
+        after 2000 -> error(dispatch_barrier_timeout)
+        end
+    end.
+
+%% Reserving a writer during conversion must still honor a queued close's invalidation.
+t_close_during_conversion(Config) ->
+    Server = ?config(server, Config),
+    {Client, Conn, Stream} = close_client(Server),
+    Reader = client(Server, healthy, 1, 10000, true),
+    ok = greptimedb_rs:stream_write(Stream, [response_row(1)]),
+    wait(fun() -> stream_row_count(Reader, <<"regression_close">>) =:= 1 end, 2000),
+    ok = greptimedb_test_server:pause_requests(Server),
+    Rows = lists:duplicate(600000, response_row(2)),
+    Write = start_request(fun() -> greptimedb_rs:stream_write(Stream, Rows) end),
+    wait(fun() -> element(3, greptimedb_rs_nif:codec_counts()) > 0 end, 2000),
+    Close = queued_short_close(Client, 1),
+    {ok, _} = result(Close, 1000),
+    ?assertEqual(#{}, element(4, sys:get_state(Conn))),
+    ok = greptimedb_test_server:release(Server),
+    {{error, _}, _} = result(Write, 2000),
+    ?assertEqual(1, stream_row_count(Reader, <<"regression_close">>)),
+    counts({1, 0}).
+
+queued_short_close(Client, Timeout) ->
+    Opts = maps:get(conn_opts, Client),
+    Short = Client#{conn_opts := Opts#{stream_timeout := Timeout}},
+    start_request(fun() ->
+        greptimedb_rs:stream_close({stream_client, Short, <<"regression_close">>})
+    end).
+
+queued_close_request(Conn) ->
+    Pending = element(8, sys:get_state(Conn)),
+    [Close] = [{Ref, Req} || {Ref, #{cmd := stream_close} = Req} <- maps:to_list(Pending)],
+    Close.
+
+wait_for_message(Conn, Message) ->
+    wait(
+        fun() ->
+            {messages, Messages} = process_info(Conn, messages),
+            lists:member(Message, Messages)
+        end,
+        1000
+    ).
+
 %% Stopping a pool must finish batches already accepted by its stream writers.
 t_pool_stop_flush(Config) ->
     pool_stop_flush(idle, Config).
@@ -1795,6 +1952,87 @@ t_library_stop_active_close(Config) ->
 
 t_library_stop_active_write(Config) ->
     library_stop_active(write, Config).
+
+t_library_stop_idle_with_stalled_close(Config) ->
+    library_stop_mixed(idle, Config).
+
+t_library_stop_write_with_stalled_close(Config) ->
+    library_stop_mixed(write, Config).
+
+%% A stalled server must not defer finishing idle or subsequently returned writers.
+library_stop_mixed(Mode, Config) ->
+    Server = ?config(server, Config),
+    Directory = filename:join(?config(priv_dir, Config), "slow_" ++ atom_to_list(Mode)),
+    ok = file:make_dir(Directory),
+    {ok, Slow} = greptimedb_test_server:start(os:getenv("GREPTIME_BIN"), Directory),
+    try
+        {SlowClient, SlowStream} = shutdown_stream(Slow, 1),
+        {Client, Stream} = shutdown_stream(Server, 2),
+        Close = start_request(fun() -> greptimedb_rs:stream_close(SlowStream) end),
+        counts({1, 1}),
+        Write =
+            case Mode of
+                idle ->
+                    undefined;
+                write ->
+                    lists:foreach(
+                        fun(I) -> ok = greptimedb_rs:stream_write(Stream, [response_row(I)]) end,
+                        [3, 4, 5]
+                    ),
+                    Request = start_request(fun() ->
+                        greptimedb_rs:stream_write(Stream, [response_row(6)])
+                    end),
+                    counts({1, 2}),
+                    Request
+            end,
+        Stop = start_request(fun() -> application:stop(greptimedb_rs) end),
+        timer:sleep(100),
+        ok = greptimedb_test_server:release(Server),
+        %% SDK finish releases its bulk RPC after receiving pending acknowledgements.
+        %% Observe that release before the slow stream's 1000ms deadline expires.
+        wait(fun() -> greptimedb_test_server:request_resets(Server) > 0 end, 500),
+        case Write of
+            undefined -> ok;
+            _ -> {ok, _} = result(Write, 500)
+        end,
+        no_result(Stop),
+        {ok, Elapsed} = result(Stop, 2000),
+        ?assert(Elapsed >= 900000 andalso Elapsed < 2000000),
+        counts({0, 0}),
+        {ok, _} = result(Close, 1000),
+        ok = greptimedb_test_server:release(Slow),
+        ok = greptimedb_rs:stop_client(SlowClient),
+        ok = greptimedb_rs:stop_client(Client),
+        {ok, _} = application:ensure_all_started(greptimedb_rs),
+        Reader = client(Server, healthy, 1, 10000, true),
+        Minimum =
+            case Mode of
+                idle -> 2;
+                write -> 5
+            end,
+        ?assert(stream_row_count(Reader, <<"regression_mixed_shutdown">>) >= Minimum)
+    after
+        greptimedb_test_server:release(Server),
+        greptimedb_test_server:stop(Slow)
+    end.
+
+shutdown_stream(Server, Name) ->
+    Client = client(Server, Name, 1, 10000, false),
+    Reader = client(Server, healthy, 1, 10000, true),
+    Table = <<"regression_mixed_shutdown">>,
+    {ok, _} = greptimedb_rs:query(Client, <<"DROP TABLE IF EXISTS ", Table/binary>>),
+    {ok, _} = greptimedb_rs:query(
+        Client,
+        <<"CREATE TABLE ", Table/binary, " (ts TIMESTAMP TIME INDEX, reading INT64)">>
+    ),
+    {ok, Stream} = greptimedb_rs:stream_start(Client, Table, row()),
+    ok = greptimedb_rs:stream_write(Stream, [response_row(1)]),
+    wait(fun() -> stream_row_count(Reader, Table) =:= 1 end, 2000),
+    ok = greptimedb_rs:stop_client(Reader),
+    ok = greptimedb_test_server:pause_requests(Server),
+    ok = greptimedb_rs:stream_write(Stream, [response_row(2)]),
+    wait(fun() -> greptimedb_test_server:held_frames(Server) > 0 end, 1000),
+    {Client, Stream}.
 
 %% In-flight stream work must not discard older batches during graceful shutdown.
 library_stop_active(Mode, Config) ->

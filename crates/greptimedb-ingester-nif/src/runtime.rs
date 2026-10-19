@@ -12,13 +12,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
-use futures::FutureExt;
+use futures::{stream::FuturesUnordered, FutureExt, StreamExt};
 
 use crate::codec::CodecPool;
 use greptimedb_ingester::BulkStreamWriter;
 use rustler::{Env, LocalPid, Monitor, Resource};
 use tokio::runtime::{Builder, Handle};
-use tokio::sync::watch;
+use tokio::sync::{watch, Notify};
 use tokio::time::Instant;
 use tokio_util::task::TaskTracker;
 
@@ -28,6 +28,27 @@ static NEXT_WRITER: AtomicUsize = AtomicUsize::new(0);
 
 pub struct Context {
     writers: Mutex<HashMap<usize, BulkStreamWriter>>,
+    writers_changed: Notify,
+}
+
+pub(crate) struct WriterReservation<'a> {
+    context: &'a Context,
+    id: usize,
+    writer: Option<BulkStreamWriter>,
+}
+
+impl WriterReservation<'_> {
+    pub(crate) fn into_writer(mut self) -> Option<BulkStreamWriter> {
+        self.writer.take()
+    }
+}
+
+impl Drop for WriterReservation<'_> {
+    fn drop(&mut self) {
+        if let Some(writer) = self.writer.take() {
+            self.context.insert_writer(self.id, writer);
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -75,23 +96,44 @@ impl Context {
         }
     }
 
-    async fn finish_writers(&self, stopping: &mut watch::Receiver<Shutdown>) {
-        let Shutdown::Graceful(deadline) = *stopping.borrow() else {
-            return;
-        };
-        if Instant::now() >= deadline {
-            return;
-        }
-        let writers: Vec<_> = self.writers().drain().map(|(_, writer)| writer).collect();
-        let finish = futures::future::join_all(
-            writers
-                .into_iter()
-                .map(|writer| AssertUnwindSafe(writer.finish()).catch_unwind()),
-        );
-        tokio::select! {
-            biased;
-            _ = wait_for_shutdown(stopping, true) => {},
-            _ = finish => {},
+    pub(crate) fn insert_writer(&self, id: usize, writer: BulkStreamWriter) {
+        self.writers().insert(id, writer);
+        self.writers_changed.notify_one();
+    }
+
+    pub(crate) fn reserve_writer(&self, id: usize) -> Option<WriterReservation<'_>> {
+        self.writers().remove(&id).map(|writer| WriterReservation {
+            context: self,
+            id,
+            writer: Some(writer),
+        })
+    }
+
+    async fn finish_writers(&self, stopping: &mut watch::Receiver<Shutdown>, tasks: &TaskTracker) {
+        let mut finishing = FuturesUnordered::new();
+        let mut tasks_done = false;
+        loop {
+            let Shutdown::Graceful(deadline) = *stopping.borrow() else {
+                return;
+            };
+            if Instant::now() >= deadline {
+                return;
+            }
+            let writers: Vec<_> = self.writers().drain().map(|(_, writer)| writer).collect();
+            for writer in writers {
+                finishing.push(AssertUnwindSafe(writer.finish()).catch_unwind());
+            }
+            if tasks_done && finishing.is_empty() {
+                return;
+            }
+            // Returned writers must drain without waiting for unrelated stalled requests.
+            tokio::select! {
+                biased;
+                _ = wait_for_shutdown(stopping, true) => return,
+                _ = tasks.wait(), if !tasks_done => tasks_done = true,
+                _ = finishing.next(), if !finishing.is_empty() => {},
+                _ = self.writers_changed.notified() => {},
+            }
         }
     }
 }
@@ -120,6 +162,7 @@ impl RuntimeOwner {
         let (shutdown, mut stopping) = watch::channel(Shutdown::Running);
         let context = Arc::new(Context {
             writers: Mutex::new(HashMap::new()),
+            writers_changed: Notify::new(),
         });
         let owner_context = context.clone();
         RUNTIMES.fetch_add(1, Ordering::AcqRel);
@@ -130,8 +173,10 @@ impl RuntimeOwner {
                 runtime.block_on(async {
                     let _ = stopping.changed().await;
                     owner_send_tasks.close();
+                    context
+                        .finish_writers(&mut stopping, &owner_send_tasks)
+                        .await;
                     owner_send_tasks.wait().await;
-                    context.finish_writers(&mut stopping).await;
                 });
                 // Resources can outlive shutdown; release aborted or expired writers too.
                 let writers = std::mem::take(&mut *context.writers());

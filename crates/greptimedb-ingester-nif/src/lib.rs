@@ -1038,7 +1038,7 @@ async fn perform_stream(
                 .map_err(native)?;
             writer.alloc_rows_buffer(5000, 1024).map_err(native)?;
             let id = runtime::writer_id();
-            context.writers().insert(id, writer);
+            context.insert_writer(id, writer);
             Ok(Value::Writer(ResourceArc::new(StreamWriterResource {
                 id,
                 schema,
@@ -1048,6 +1048,15 @@ async fn perform_stream(
             })))
         }
         Request::StreamWrite(resource, input) => {
+            // Reserve before conversion so shutdown only takes idle writers. If conversion
+            // is interrupted, return the untouched writer for draining older batches.
+            let reserved = context.reserve_writer(resource.id).ok_or_else(|| {
+                if client.runtime.is_stopping() {
+                    Failure::Closed
+                } else {
+                    Failure::Native("Writer is closed".into())
+                }
+            })?;
             let schema = resource.schema.clone();
             let rows = if input.small
                 && schema.columns().len() <= 8
@@ -1067,9 +1076,11 @@ async fn perform_stream(
                     .await?
             };
             check()?;
-            let mut writer = context
-                .writers()
-                .remove(&resource.id)
+            if resource.closed.load(Ordering::Acquire) {
+                return Err(Failure::Native("Writer is closed".into()));
+            }
+            let mut writer = reserved
+                .into_writer()
                 .ok_or_else(|| Failure::Native("Writer is closed".into()))?;
             let result = writer.write_rows_async(rows).await.map_err(native);
             if result.is_ok()
@@ -1083,7 +1094,7 @@ async fn perform_stream(
                 let _ = writer.flush_completed_responses();
             }
             if !resource.closed.load(Ordering::Acquire) {
-                context.writers().insert(resource.id, writer);
+                context.insert_writer(resource.id, writer);
             }
             result?;
             Ok(Value::Ok)
