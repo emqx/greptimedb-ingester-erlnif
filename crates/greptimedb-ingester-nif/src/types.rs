@@ -73,11 +73,32 @@ pub fn term_to_value(val: &Term, dtype: ColumnDataType) -> rustler::NifResult<Va
         ColumnDataType::TimestampMicrosecond => convert_int!(val, TimestampMicrosecond, i64, i64),
         ColumnDataType::TimestampNanosecond => convert_int!(val, TimestampNanosecond, i64, i64),
         // Legacy JSON (jsonb) column: the value is a JSON document encoded as a
-        // string; the server converts it to jsonb binary. JSON2 columns never
-        // reach this function: they are handled as native `JsonValue` in
+        // string; the server converts it to jsonb binary. Encode it as
+        // `Value::String` (not `Value::Json`): the bulk row builder maps JSON
+        // columns to a `BinaryBuilder`, which only accepts `String`/`Binary`.
+        // `Value::Json` would be treated as a type mismatch and silently
+        // become NULL in release builds. JSON2 columns never reach this
+        // function: they are handled as native `JsonValue` in
         // `util::terms_to_proto_rows_with_columns`.
-        ColumnDataType::Json => convert_direct!(val, Json, String),
+        ColumnDataType::Json => match val.decode::<Option<String>>() {
+            Ok(value) => Ok(legacy_json_value(value)),
+            Err(_) => Err(rustler::Error::RaiseTerm(Box::new(
+                "Invalid value for type String".to_string(),
+            ))),
+        },
         _ => Ok(Value::Null),
+    }
+}
+
+/// Converts a legacy JSON document into the representation used by both row
+/// inserts and bulk streams.
+///
+/// Legacy JSON must be sent as a string. Using `Value::Json` here would break
+/// bulk writes because `RowBatchBuilder` maps JSON columns to a binary builder.
+fn legacy_json_value(value: Option<String>) -> Value {
+    match value {
+        Some(value) => Value::String(value),
+        None => Value::Null,
     }
 }
 
@@ -194,4 +215,86 @@ fn array_value_to_term<'a>(env: Env<'a>, array: &ArrayRef, index: usize) -> Term
             )
         ]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use greptimedb_ingester::bulk::RecordBatchWithTimestamp;
+    use greptimedb_ingester::{Column, Row, Rows, SemanticType};
+
+    fn legacy_json_schema() -> Vec<Column> {
+        vec![
+            Column {
+                name: "ts".to_string(),
+                data_type: ColumnDataType::TimestampMillisecond,
+                semantic_type: SemanticType::Timestamp,
+                data_type_extension: None,
+            },
+            Column {
+                name: "payload".to_string(),
+                data_type: ColumnDataType::Json,
+                semantic_type: SemanticType::Field,
+                data_type_extension: None,
+            },
+        ]
+    }
+
+    fn bulk_payload_array(rows: Rows) -> BinaryArray {
+        let batches: Vec<RecordBatchWithTimestamp> = rows.try_into().expect("build record batch");
+        assert_eq!(batches.len(), 1);
+        batches[0]
+            .batch()
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("JSON column uses BinaryBuilder")
+            .clone()
+    }
+
+    #[test]
+    fn legacy_json_uses_string_for_bulk_rows() {
+        let json = r#"{"name":"alice","nested":{"ok":true}}"#.to_string();
+        assert!(matches!(
+            legacy_json_value(Some(json.clone())),
+            Value::String(value) if value == json
+        ));
+        assert!(matches!(legacy_json_value(None), Value::Null));
+
+        let schema = legacy_json_schema();
+        let mut rows = Rows::new(&schema, 1).expect("create bulk rows");
+        rows.add_row(Row::from_values(vec![
+            Value::TimestampMillisecond(1),
+            legacy_json_value(Some(json.clone())),
+        ]))
+        .expect("add legacy JSON row");
+
+        let payloads = bulk_payload_array(rows);
+        assert!(!payloads.is_null(0));
+        assert_eq!(payloads.value(0), json.as_bytes());
+    }
+
+    #[test]
+    fn legacy_json_null_stays_null_in_bulk_rows() {
+        let schema = legacy_json_schema();
+        let mut rows = Rows::new(&schema, 1).expect("create bulk rows");
+        rows.add_row(Row::from_values(vec![
+            Value::TimestampMillisecond(1),
+            legacy_json_value(None),
+        ]))
+        .expect("add legacy JSON null row");
+
+        let payloads = bulk_payload_array(rows);
+        assert!(payloads.is_null(0));
+    }
+
+    #[test]
+    fn legacy_json_row_insert_uses_string_value() {
+        let json = r#"{"name":"alice"}"#.to_string();
+        let value = value_to_proto_value(legacy_json_value(Some(json.clone())));
+        assert!(matches!(
+            value.value_data,
+            Some(ValueData::StringValue(ref value)) if value == &json
+        ));
+    }
 }

@@ -32,12 +32,18 @@ groups() ->
         t_insert_sync_new_field_null_first,
         t_insert_sync_new_field_all_null,
         t_insert_sync_new_duplicate_key_prefers_field,
+        t_insert_sync_json2_auto_create,
+        t_insert_sync_json2_existing_table,
+        t_insert_sync_json2_new_field_existing_table,
         t_query_sync,
         t_insert_async,
         t_insert_async_existing_table,
         t_insert_async_schema_conflict,
         t_insert_async_new_field_existing_table,
+        t_insert_async_json2,
         t_query_async,
+        t_stream_legacy_json,
+        t_stream_rejects_json2,
         t_stream_write,
         t_stream_write_async
     ],
@@ -939,6 +945,123 @@ t_insert_async_new_field_existing_table(Config) ->
     ?assertEqual([60.0], select_column(Client, Table, <<"humidity">>)),
     ok = greptimedb_rs:stop_client(Client).
 
+t_insert_sync_json2_auto_create(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ok = drop_table_if_exists(Client, Table),
+
+    Ts = erlang:system_time(millisecond),
+    Rows = [
+        #{
+            fields => #{
+                <<"payload">> =>
+                    {json2,
+                        <<"{\"name\":\"alice\",\"nested\":{\"ok\":true},\"items\":[1,\"two\",null]}">>}
+            },
+            timestamp => Ts
+        },
+        #{
+            fields => #{<<"payload">> => {json2, <<"null">>}},
+            timestamp => Ts + 1
+        }
+    ],
+    ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
+
+    timer:sleep(1000),
+    ok = assert_column_type_contains(Client, Table, <<"payload">>, <<"Json2">>, <<"FIELD">>),
+    ?assertEqual([<<"alice">>, nil], select_column(Client, Table, <<"payload.name">>)),
+    ?assertEqual([<<"two">>, nil], select_column(Client, Table, <<"payload.items[1]">>)),
+    ?assertEqual([[2]], select_count(Client, Table, <<"COUNT(*)">>)),
+    ?assertEqual([[1]], select_count(Client, Table, <<"COUNT(payload)">>)),
+
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_sync_json2_existing_table(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ok = create_json2_table(Client, Table),
+
+    Ts = erlang:system_time(millisecond),
+    Rows = [
+        #{
+            fields => #{<<"payload">> => <<"{\"name\":\"bob\",\"active\":true}">>},
+            timestamp => Ts
+        },
+        #{
+            fields => #{<<"payload">> => {json2, <<"{\"name\":\"carol\",\"active\":false}">>}},
+            timestamp => Ts + 1
+        },
+        #{
+            fields => #{<<"payload">> => nil},
+            timestamp => Ts + 2
+        }
+    ],
+    ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
+
+    timer:sleep(1000),
+    ok = assert_column_type_contains(Client, Table, <<"payload">>, <<"Json2">>, <<"FIELD">>),
+    ?assertEqual(
+        [<<"bob">>, <<"carol">>, nil], select_column(Client, Table, <<"payload.name">>)
+    ),
+    ?assertEqual([[3]], select_count(Client, Table, <<"COUNT(*)">>)),
+    ?assertEqual([[2]], select_count(Client, Table, <<"COUNT(payload)">>)),
+
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_sync_json2_new_field_existing_table(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ok = create_append_only_existing_table(Client, Table),
+
+    Ts = erlang:system_time(millisecond),
+    Rows = [
+        #{
+            fields => #{
+                <<"temperature">> => 26.0,
+                <<"payload">> => {json2, <<"{\"name\":\"dave\",\"nested\":{\"ok\":true}}">>}
+            },
+            timestamp => Ts
+        }
+    ],
+    ?assertMatch({ok, _}, greptimedb_rs:insert(Client, Table, Rows)),
+
+    timer:sleep(1000),
+    ok = assert_column_type_contains(Client, Table, <<"payload">>, <<"Json2">>, <<"FIELD">>),
+    ?assertEqual([<<"dave">>], select_column(Client, Table, <<"payload.name">>)),
+    ?assertEqual([26.0], select_column(Client, Table, <<"temperature">>)),
+
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_async_json2(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ok = drop_table_if_exists(Client, Table),
+
+    Ts = erlang:system_time(millisecond),
+    Rows = [
+        #{
+            fields => #{<<"payload">> => {json2, <<"{\"name\":\"async\",\"ok\":true}">>}},
+            timestamp => Ts
+        }
+    ],
+    Self = self(),
+    Ref = make_ref(),
+    Callback = {fun(P, R, Res) -> P ! {R, Res} end, [Self, Ref]},
+    {ok, _} = greptimedb_rs:insert_async(Client, Table, Rows, Callback),
+
+    receive
+        {Ref, {ok, _}} -> ok;
+        {Ref, Error} -> ct:fail({async_json2_insert_failed, Error})
+    after 5000 ->
+        ct:fail(async_json2_insert_timeout)
+    end,
+
+    timer:sleep(1000),
+    ok = assert_column_type_contains(Client, Table, <<"payload">>, <<"Json2">>, <<"FIELD">>),
+    ?assertEqual([<<"async">>], select_column(Client, Table, <<"payload.name">>)),
+
+    ok = greptimedb_rs:stop_client(Client).
+
 t_query_sync(Config) ->
     {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
     Table = ?table(Config),
@@ -1015,6 +1138,86 @@ t_query_async(Config) ->
         ct:fail(async_query_timeout)
     end,
     ok = greptimedb_rs:stop_client(Client).
+
+t_stream_legacy_json(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ok = drop_table_if_exists(Client, Table),
+
+    CreateTableSql = iolist_to_binary(
+        io_lib:format(
+            "CREATE TABLE ~s ("
+            "ts TIMESTAMP TIME INDEX, "
+            "payload JSON, "
+            "sensor_id INT64, "
+            "PRIMARY KEY (sensor_id)"
+            ") ENGINE=mito",
+            [Table]
+        )
+    ),
+    case greptimedb_rs:query(Client, CreateTableSql) of
+        {ok, _} ->
+            case describe_column(Client, Table, <<"payload">>) of
+                {<<"Json">>, _} ->
+                    ok = check_legacy_json_stream(Client, Table);
+                {<<"Json2">>, _} ->
+                    ok = greptimedb_rs:stop_client(Client),
+                    {skip, "this GreptimeDB version aliases JSON to JSON2"};
+                Other ->
+                    ok = greptimedb_rs:stop_client(Client),
+                    ct:fail({unexpected_legacy_json_type, Other})
+            end;
+        {error, Reason} ->
+            ok = greptimedb_rs:stop_client(Client),
+            {skip, {legacy_json_not_supported, Reason}}
+    end.
+
+check_legacy_json_stream(Client, Table) ->
+    Ts = erlang:system_time(millisecond),
+    Rows = [
+        #{
+            fields => #{<<"payload">> => <<"{\"name\":\"legacy-1\",\"value\":1}">>},
+            tags => #{<<"sensor_id">> => 1},
+            timestamp => Ts
+        },
+        #{
+            fields => #{<<"payload">> => <<"{\"name\":\"legacy-2\",\"value\":2}">>},
+            tags => #{<<"sensor_id">> => 2},
+            timestamp => Ts + 1
+        }
+    ],
+    {ok, Stream} = greptimedb_rs:stream_start(Client, Table, hd(Rows)),
+    ok = greptimedb_rs:stream_write(Stream, Rows),
+    ok = greptimedb_rs:stream_close(Stream),
+
+    timer:sleep(1000),
+    %% `COUNT(payload)` would be 0 if the bulk builder encoded the legacy JSON
+    %% values as NULL (the regression this test guards against).
+    ?assertEqual([[2]], select_count(Client, Table, <<"COUNT(payload)">>)),
+    ?assertEqual([[2]], select_count(Client, Table, <<"COUNT(*)">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+t_stream_rejects_json2(Config) ->
+    Table = ?table(Config),
+    {ok, ClientRef} = greptimedb_rs_nif:connect(?conn_opts(Config)),
+
+    CreateTableSql = iolist_to_binary(
+        io_lib:format(
+            "CREATE TABLE ~s ("
+            "ts TIMESTAMP TIME INDEX, "
+            "payload JSON2"
+            ") ENGINE=mito WITH (append_mode = 'true')",
+            [Table]
+        )
+    ),
+    {ok, _} = greptimedb_rs_nif:execute(ClientRef, CreateTableSql),
+
+    {error, Reason} = greptimedb_rs_nif:stream_start(ClientRef, Table, #{}),
+    ?assertNotEqual(
+        nomatch, binary:match(reason_to_binary(Reason), <<"does not support JSON2">>)
+    ),
+
+    ok = greptimedb_rs_nif:disconnect(ClientRef).
 
 t_stream_write(Config) ->
     {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
@@ -1285,6 +1488,45 @@ create_existing_table(Client, Table) ->
         Error -> ct:fail({create_table_failed, Table, Error})
     end.
 
+drop_table_if_exists(Client, Table) ->
+    DropSql = iolist_to_binary(io_lib:format("DROP TABLE IF EXISTS ~s", [Table])),
+    case greptimedb_rs:query(Client, DropSql) of
+        {ok, _} -> ok;
+        Error -> ct:fail({drop_table_failed, Table, Error})
+    end.
+
+create_json2_table(Client, Table) ->
+    ok = drop_table_if_exists(Client, Table),
+    CreateSql = iolist_to_binary(
+        io_lib:format(
+            "CREATE TABLE ~s ("
+            "ts TIMESTAMP TIME INDEX, "
+            "payload JSON2"
+            ") ENGINE=mito WITH (append_mode = 'true')",
+            [Table]
+        )
+    ),
+    case greptimedb_rs:query(Client, CreateSql) of
+        {ok, _} -> ok;
+        Error -> ct:fail({create_json2_table_failed, Table, Error})
+    end.
+
+create_append_only_existing_table(Client, Table) ->
+    ok = drop_table_if_exists(Client, Table),
+    CreateSql = iolist_to_binary(
+        io_lib:format(
+            "CREATE TABLE ~s ("
+            "ts TIMESTAMP TIME INDEX, "
+            "temperature DOUBLE"
+            ") ENGINE=mito WITH (append_mode = 'true')",
+            [Table]
+        )
+    ),
+    case greptimedb_rs:query(Client, CreateSql) of
+        {ok, _} -> ok;
+        Error -> ct:fail({create_append_only_table_failed, Table, Error})
+    end.
+
 assert_column(Client, Table, Column, Type, SemanticType) ->
     case describe_column(Client, Table, Column) of
         not_found ->
@@ -1297,6 +1539,33 @@ assert_column(Client, Table, Column, Type, SemanticType) ->
                 Table,
                 Column,
                 {expected, Type, SemanticType},
+                {got, OtherType, OtherSemanticType}
+            })
+    end.
+
+assert_column_type_contains(Client, Table, Column, TypeFragment, SemanticType) ->
+    case describe_column(Client, Table, Column) of
+        not_found ->
+            ct:fail({column_missing_from_table, Table, Column});
+        {Type, SemanticType} ->
+            case binary:match(Type, TypeFragment) of
+                nomatch ->
+                    ct:fail({
+                        unexpected_column_type,
+                        Table,
+                        Column,
+                        {expected_fragment, TypeFragment},
+                        {got, Type}
+                    });
+                _ ->
+                    ok
+            end;
+        {OtherType, OtherSemanticType} ->
+            ct:fail({
+                unexpected_column_definition,
+                Table,
+                Column,
+                {expected, TypeFragment, SemanticType},
                 {got, OtherType, OtherSemanticType}
             })
     end.
@@ -1316,6 +1585,11 @@ select_column(Client, Table, Column) ->
     ),
     {ok, Rows} = greptimedb_rs:query(Client, Sql),
     [Value || [Value] <- Rows].
+
+select_count(Client, Table, Expression) ->
+    Sql = iolist_to_binary(io_lib:format("SELECT ~s FROM ~s", [Expression, Table])),
+    {ok, Rows} = greptimedb_rs:query(Client, Sql),
+    Rows.
 
 get_host_addr(Env) ->
     case os:getenv(Env) of

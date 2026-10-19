@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, HashSet};
 use crate::atoms;
 use crate::types;
 use greptimedb_ingester::api::v1::column_data_type_extension::TypeExt;
-use greptimedb_ingester::api::v1::{ColumnDataType, ColumnSchema, Row as ProtoRow, SemanticType};
+use greptimedb_ingester::api::v1::{
+    ColumnDataType, ColumnSchema, Row as ProtoRow, SemanticType, Value as ProtoValue,
+};
 use greptimedb_ingester::helpers::schema::{field, json2_field, tag, timestamp};
 use greptimedb_ingester::helpers::values::{json2_value, none_value};
 use greptimedb_ingester::{Row, Rows, TableSchema, Value};
@@ -114,6 +116,16 @@ fn json2_str(term: Term) -> rustler::NifResult<Option<String>> {
     })
 }
 
+/// Encodes a JSON document for a JSON2 column.
+///
+/// JSON2 values must be sent as structured `JsonValue` messages; the server
+/// rejects plain strings for JSON2 columns.
+fn json2_proto_value(json: &str) -> rustler::NifResult<ProtoValue> {
+    json2_value(json).map_err(|e| {
+        rustler::Error::RaiseTerm(Box::new(format!("Invalid json2 value for column: {e}")))
+    })
+}
+
 /// Encodes `rows_term` against an explicit column list.
 ///
 /// This is the single row encoder used by both the "table exists" path (with the
@@ -173,11 +185,7 @@ pub fn terms_to_proto_rows_with_columns<'a>(
             let val = if let Some(t) = val_term {
                 if *is_json2 {
                     match json2_str(t)? {
-                        Some(json) => json2_value(&json).map_err(|e| {
-                            rustler::Error::RaiseTerm(Box::new(format!(
-                                "Invalid json2 value for column: {e}"
-                            )))
-                        })?,
+                        Some(json) => json2_proto_value(&json)?,
                         None => none_value(),
                     }
                 } else {
@@ -245,14 +253,7 @@ pub fn merge_inferred_columns<'a>(
     }
 
     for (name, dtype) in new_fields {
-        if dtype == ColumnDataType::Json {
-            // Inferred JSON2 column: declare it with the native JSON type
-            // extension and the `greptime.json2` column options, so an
-            // auto-created table gets a real JSON2 column.
-            merged.push(json2_field(&name));
-        } else {
-            merged.push(field(&name, dtype));
-        }
+        merged.push(inferred_column(&name, dtype));
     }
     for (name, dtype) in new_tags {
         if dtype == ColumnDataType::Json {
@@ -264,6 +265,19 @@ pub fn merge_inferred_columns<'a>(
     }
 
     Ok(merged)
+}
+
+/// Builds the column definition for a field inferred from input rows.
+///
+/// Inferred JSON is always written as JSON2: it is declared with the native
+/// JSON type extension and the `greptime.json2` column options, so an
+/// auto-created table gets a real JSON2 column.
+fn inferred_column(name: &str, dtype: ColumnDataType) -> ColumnSchema {
+    if dtype == ColumnDataType::Json {
+        json2_field(name)
+    } else {
+        field(name, dtype)
+    }
 }
 
 /// Collects the keys of `map` that are neither in `known` nor already in `out`.
@@ -393,5 +407,134 @@ fn term_to_string(term: Term) -> rustler::NifResult<String> {
         Ok(a)
     } else {
         term.decode::<String>()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use greptimedb_ingester::api::v1::value::ValueData;
+    use greptimedb_ingester::api::v1::{
+        json_object, json_value, JsonValue, RowInsertRequest, RowInsertRequests, Rows as ProtoRows,
+    };
+    use greptimedb_ingester::helpers::values::timestamp_millisecond_value;
+
+    fn object_entries(value: &ProtoValue) -> &[json_object::Entry] {
+        let Some(ValueData::JsonValue(value)) = &value.value_data else {
+            panic!("expected structured JsonValue, got {:?}", value.value_data);
+        };
+        let Some(json_value::Value::Object(object)) = &value.value else {
+            panic!("expected JSON object, got {:?}", value.value);
+        };
+        &object.entries
+    }
+
+    fn entry<'a>(entries: &'a [json_object::Entry], key: &str) -> &'a JsonValue {
+        entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .and_then(|entry| entry.value.as_ref())
+            .unwrap_or_else(|| panic!("missing JSON entry `{key}`"))
+    }
+
+    #[test]
+    fn inferred_json_field_is_json2() {
+        let inferred = inferred_column("payload", ColumnDataType::Json);
+        assert!(is_json2_column(&inferred));
+        assert_eq!(inferred.column_name, "payload");
+
+        // A plain legacy JSON field must not be mistaken for JSON2.
+        assert!(!is_json2_column(&field("payload", ColumnDataType::Json)));
+        assert!(!is_json2_column(&field("payload", ColumnDataType::String)));
+    }
+
+    #[test]
+    fn json2_proto_value_encodes_nested_json() {
+        let value =
+            json2_proto_value(r#"{"name":"alice","nested":{"ok":true},"items":[1,"two",null]}"#)
+                .expect("encode JSON2 value");
+        let entries = object_entries(&value);
+        assert_eq!(entries.len(), 3);
+
+        assert!(matches!(
+            entry(entries, "name").value,
+            Some(json_value::Value::Str(ref value)) if value == "alice"
+        ));
+        assert!(matches!(
+            entry(entries, "nested").value,
+            Some(json_value::Value::Object(ref object))
+                if matches!(
+                    object.entries.first().and_then(|entry| entry.value.as_ref()),
+                    Some(JsonValue {
+                        value: Some(json_value::Value::Boolean(true)),
+                    })
+                )
+        ));
+        assert!(matches!(
+            entry(entries, "items").value,
+            Some(json_value::Value::Array(ref array))
+                if array.items.len() == 3
+                    && matches!(
+                        array.items[0].value,
+                        Some(json_value::Value::Uint(1))
+                    )
+                    && matches!(
+                        array.items[1].value,
+                        Some(json_value::Value::Str(ref value)) if value == "two"
+                    )
+                    && array.items[2].value.is_none()
+        ));
+    }
+
+    #[test]
+    fn json2_null_becomes_sql_null() {
+        let value = json2_proto_value("null").expect("encode JSON2 null");
+        assert!(value.value_data.is_none());
+    }
+
+    #[test]
+    fn json2_row_insert_request_uses_structured_value() {
+        let request = RowInsertRequests {
+            inserts: vec![RowInsertRequest {
+                table_name: "json2_test".to_string(),
+                rows: Some(ProtoRows {
+                    schema: vec![
+                        timestamp("ts", ColumnDataType::TimestampMillisecond),
+                        inferred_column("payload", ColumnDataType::Json),
+                    ],
+                    rows: vec![ProtoRow {
+                        values: vec![
+                            timestamp_millisecond_value(1),
+                            json2_proto_value(r#"{"ok":true}"#).expect("encode JSON2 value"),
+                        ],
+                    }],
+                }),
+            }],
+        };
+
+        let rows = request.inserts[0].rows.as_ref().expect("row insert rows");
+        assert!(is_json2_column(&rows.schema[1]));
+        assert!(matches!(
+            rows.rows[0].values[1].value_data.as_ref(),
+            Some(ValueData::JsonValue(_))
+        ));
+    }
+
+    #[test]
+    fn json2_rejects_invalid_json_and_non_object_top_level_values() {
+        for invalid in [
+            "",
+            "{",
+            r#"{"a":1} trailing"#,
+            "[]",
+            "1",
+            "true",
+            "\"text\"",
+        ] {
+            assert!(
+                json2_proto_value(invalid).is_err(),
+                "expected `{invalid}` to be rejected"
+            );
+        }
     }
 }
