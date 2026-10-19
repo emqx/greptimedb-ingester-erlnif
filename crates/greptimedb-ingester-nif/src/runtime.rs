@@ -23,8 +23,15 @@ use tokio::time::Instant;
 use tokio_util::task::TaskTracker;
 
 static RUNTIMES: AtomicUsize = AtomicUsize::new(0);
-static SHARED: Mutex<Option<Arc<RuntimeOwner>>> = Mutex::new(None);
+static SHARED: Mutex<SharedState> = Mutex::new(SharedState::Stopped);
 static NEXT_WRITER: AtomicUsize = AtomicUsize::new(0);
+
+enum SharedState {
+    Stopped,
+    Starting,
+    Running(Arc<RuntimeOwner>),
+    Stopping(Arc<RuntimeOwner>),
+}
 
 pub struct Context {
     writers: Mutex<HashMap<usize, BulkStreamWriter>>,
@@ -281,6 +288,22 @@ impl Drop for RuntimeResource {
     }
 }
 
+struct StartGuard {
+    previous: Option<Arc<RuntimeOwner>>,
+}
+
+impl Drop for StartGuard {
+    fn drop(&mut self) {
+        let mut shared = shared_state();
+        if matches!(*shared, SharedState::Starting) {
+            *shared = self
+                .previous
+                .take()
+                .map_or(SharedState::Stopped, SharedState::Running);
+        }
+    }
+}
+
 pub fn start(workers: usize, codec_workers: usize) -> Result<Arc<RuntimeOwner>, String> {
     if !(1..=64).contains(&workers) {
         return Err("runtime_workers must be between 1 and 64".into());
@@ -288,14 +311,23 @@ pub fn start(workers: usize, codec_workers: usize) -> Result<Arc<RuntimeOwner>, 
     if !(1..=64).contains(&codec_workers) {
         return Err("codec_workers must be between 1 and 64".into());
     }
-    let mut shared = shared_state();
-    if let Some(previous) = shared.as_ref() {
-        if !previous.is_stopping() {
-            return Err("runtime already started".into());
-        }
+    let mut starting = {
+        let mut shared = shared_state();
+        let previous = match &*shared {
+            SharedState::Stopped => None,
+            SharedState::Running(previous) if previous.is_stopping() => Some(previous.clone()),
+            SharedState::Running(_) => return Err("runtime already started".into()),
+            SharedState::Starting => return Err("runtime is starting".into()),
+            SharedState::Stopping(_) => return Err("runtime is stopping".into()),
+        };
+        *shared = SharedState::Starting;
+        StartGuard { previous }
+    };
+    // Reserve startup before unlocking; connections must not wait for joins or creation.
+    if let Some(previous) = starting.previous.as_ref() {
         previous.stop(None);
     }
-    // Catch initialization panics before they unwind through the shared-state lock.
+    starting.previous = None;
     let runtime = catch_unwind(AssertUnwindSafe(|| {
         RuntimeOwner::new(workers, codec_workers)
     }))
@@ -309,16 +341,16 @@ pub fn start(workers: usize, codec_workers: usize) -> Result<Arc<RuntimeOwner>, 
     })?
     .map_err(|e| e.to_string())?;
     let runtime = Arc::new(runtime);
-    *shared = Some(runtime.clone());
+    *shared_state() = SharedState::Running(runtime.clone());
+    drop(starting);
     Ok(runtime)
 }
 
 pub fn shared() -> Result<Arc<RuntimeOwner>, String> {
-    shared_state()
-        .as_ref()
-        .filter(|runtime| !runtime.is_stopping())
-        .cloned()
-        .ok_or_else(|| "greptimedb_rs runtime is not running".into())
+    match &*shared_state() {
+        SharedState::Running(runtime) if !runtime.is_stopping() => Ok(runtime.clone()),
+        _ => Err("greptimedb_rs runtime is not running".into()),
+    }
 }
 
 pub fn stop(resource: &RuntimeResource) {
@@ -326,23 +358,27 @@ pub fn stop(resource: &RuntimeResource) {
 }
 
 pub fn stop_with_timeout(resource: &RuntimeResource, timeout: Duration) {
-    let mut shared = shared_state();
-    resource.0.stop(Some(timeout));
-    if shared
-        .as_ref()
-        .is_some_and(|runtime| Arc::ptr_eq(runtime, &resource.0))
     {
-        *shared = None;
+        let mut shared = shared_state();
+        if matches!(&*shared, SharedState::Running(runtime) if Arc::ptr_eq(runtime, &resource.0)) {
+            *shared = SharedState::Stopping(resource.0.clone());
+        }
+    }
+    resource.0.stop(Some(timeout));
+    let mut shared = shared_state();
+    if matches!(&*shared, SharedState::Stopping(runtime) if Arc::ptr_eq(runtime, &resource.0)) {
+        *shared = SharedState::Stopped;
     }
 }
 
-fn shared_state() -> MutexGuard<'static, Option<Arc<RuntimeOwner>>> {
+fn shared_state() -> MutexGuard<'static, SharedState> {
     match SHARED.lock() {
         Ok(shared) => shared,
         Err(poisoned) => {
-            let mut shared = poisoned.into_inner();
-            if let Some(previous) = shared.take() {
-                previous.stop(None);
+            let shared = poisoned.into_inner();
+            if let SharedState::Running(runtime) = &*shared {
+                // Fail closed without joining under the state lock. Startup reclaims it.
+                runtime.signal_shutdown(None);
             }
             SHARED.clear_poison();
             shared

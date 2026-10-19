@@ -22,6 +22,7 @@ groups() ->
             {failures, [], [
                 t_startup_failure,
                 t_startup_pressure,
+                t_startup_concurrent,
                 t_callback_exception,
                 t_callback_timeout,
                 t_conversion_errors,
@@ -59,7 +60,8 @@ groups() ->
                 t_library_stop_active_close,
                 t_library_stop_active_write,
                 t_library_stop_idle_with_stalled_close,
-                t_library_stop_write_with_stalled_close
+                t_library_stop_write_with_stalled_close,
+                t_library_stop_connect_io
             ]}
         ].
 
@@ -120,6 +122,8 @@ init_per_testcase(Testcase, Config) ->
     ),
     ShutdownTimeout =
         case Testcase of
+            t_library_stop_connect_io ->
+                2500;
             T when
                 T =:= t_library_stop_idle_with_stalled_close;
                 T =:= t_library_stop_write_with_stalled_close
@@ -144,7 +148,7 @@ end_per_testcase(_, Config) ->
                 _:_ -> ok
             end
         end,
-        [1, 2, healthy]
+        [1, 2, healthy, during_stop]
     ),
     application:stop(greptimedb_rs),
     greptimedb_test_server:disconnect(?config(server, Config)),
@@ -648,6 +652,38 @@ t_startup_pressure(Config) ->
         {{unix, linux}, Executable} when is_list(Executable) -> startup_child(pressure, Config);
         _ -> {skip, "Requires Linux prlimit"}
     end.
+
+%% Unlocking runtime creation must not admit multiple owners or let stale stops clear one.
+t_startup_concurrent(Config) ->
+    ok = application:stop(greptimedb_rs),
+    Requests = [
+        start_request(fun() ->
+            receive
+                start_runtime -> ok
+            after 2000 -> error(start_barrier_timeout)
+            end,
+            greptimedb_rs_nif:runtime_start(2, 2)
+        end)
+     || _ <- lists:seq(1, 12)
+    ],
+    lists:foreach(fun({Pid, _}) -> Pid ! start_runtime end, Requests),
+    Results = [Result || Request <- Requests, {Result, _} <- [result(Request, 2000)]],
+    [Runtime] = [Ref || Ref <- Results, is_reference(Ref)],
+    ?assertEqual(11, length([Error || {error, _} = Error <- Results])),
+    counts({1, 0}),
+    ok = greptimedb_rs_nif:runtime_stop(Runtime),
+    counts({0, 0}),
+    Fresh = greptimedb_rs_nif:runtime_start(2, 2),
+    ?assert(is_reference(Fresh)),
+    ok = greptimedb_rs_nif:runtime_stop(Runtime),
+    counts({1, 0}),
+    ?assertEqual({2, 4, 0, 0, 0}, greptimedb_rs_nif:codec_counts()),
+    ?assertMatch({error, _}, greptimedb_rs_nif:runtime_start(2, 2)),
+    ok = greptimedb_rs_nif:runtime_stop(Fresh),
+    counts({0, 0}),
+    {ok, _} = application:ensure_all_started(greptimedb_rs),
+    Client = client(?config(server, Config), 1, 1, 2000, true),
+    ?assertEqual({ok, [[1]]}, greptimedb_rs:query(Client, <<"SELECT 1">>)).
 
 startup_child(Scenario, Config) ->
     Argument = #{
@@ -1958,6 +1994,67 @@ t_library_stop_idle_with_stalled_close(Config) ->
 
 t_library_stop_write_with_stalled_close(Config) ->
     library_stop_mixed(write, Config).
+
+%% New pool connections must fail promptly instead of occupying every dirty I/O scheduler.
+t_library_stop_connect_io(Config) ->
+    case erlang:system_info(dirty_io_schedulers) of
+        1 -> {skip, "Requires at least two dirty I/O schedulers"};
+        Schedulers -> library_stop_connect_io(Schedulers, Config)
+    end.
+
+library_stop_connect_io(Schedulers, Config) ->
+    Server = ?config(server, Config),
+    {Client, Stream} = shutdown_stream(Server, 1),
+    Close = start_request(fun() -> greptimedb_rs:stream_close(Stream) end),
+    counts({1, 1}),
+    Owner = whereis(greptimedb_rs_runtime),
+    Stop = start_request(fun() -> application:stop(greptimedb_rs) end),
+    wait(
+        fun() ->
+            process_info(Owner, current_function) =:=
+                {current_function, {greptimedb_rs_nif, runtime_stop, 2}}
+        end,
+        1000
+    ),
+    Connect = start_request(fun() ->
+        greptimedb_rs:start_client(#{
+            endpoints => [greptimedb_test_server:endpoint(Server)],
+            dbname => <<"public">>,
+            pool_name => {regression, during_stop},
+            pool_size => Schedulers
+        })
+    end),
+    timer:sleep(100),
+    File = filename:join(?config(priv_dir, Config), "connect-stop-dirty-io.data"),
+    Io = start_request(fun() -> file:write_file(File, <<"ok">>) end),
+    {ok, IoElapsed} = result(Io, 1000),
+    ?assert(IoElapsed < 500000),
+    {{error, _}, ConnectElapsed} = result(Connect, 1000),
+    ?assert(ConnectElapsed < 500000),
+    Attempts = [
+        start_request(fun() -> greptimedb_rs_nif:runtime_start(2, 2) end)
+     || _ <- lists:seq(1, Schedulers)
+    ],
+    lists:foreach(
+        fun(Request) ->
+            {{error, _}, Elapsed} = result(Request, 1000),
+            ?assert(Elapsed < 500000)
+        end,
+        Attempts
+    ),
+    no_result(Stop),
+    {ok, StopElapsed} = result(Stop, 4000),
+    ?assert(StopElapsed >= 2300000 andalso StopElapsed < 4000000),
+    ct:log("Runtime stop: ~p us; concurrent pool start: ~p us; file I/O: ~p us", [
+        StopElapsed, ConnectElapsed, IoElapsed
+    ]),
+    {ok, _} = result(Close, 1000),
+    counts({0, 0}),
+    ok = greptimedb_rs:stop_client(Client),
+    ok = greptimedb_test_server:release(Server),
+    {ok, _} = application:ensure_all_started(greptimedb_rs),
+    Fresh = client(Server, 1, 1, 2000, true),
+    ?assertEqual({ok, [[1]]}, greptimedb_rs:query(Fresh, <<"SELECT 1">>)).
 
 %% A stalled server must not defer finishing idle or subsequently returned writers.
 library_stop_mixed(Mode, Config) ->

@@ -91,7 +91,12 @@ examines at most 256 batches and only flat array types; other replies use codec
 workers. Shared buffer capacity can conservatively select the codec path even
 when the returned values are small.
 
-Application startup returns an error when native runtime creation fails. A poisoned native client state lock closes that client and cancels its active request while retaining codec work until reclamation. The affected pool connection must be recreated. Async callback exceptions are logged as `greptimedb_callback_failed`; the worker continues processing requests.
+Application startup returns an error when native runtime creation fails. Connections
+attempted during runtime startup or shutdown fail promptly rather than waiting for
+native threads to start or exit. A poisoned native client state lock closes that
+client and cancels its active request while retaining codec work until reclamation.
+The affected pool connection must be recreated. Async callback exceptions are logged
+as `greptimedb_callback_failed`; the worker continues processing requests.
 
 Stopping a pool rejects new requests, cancels active queries and inserts, and lets
 active stream writes/closes finish before flushing remaining writers. These waits
