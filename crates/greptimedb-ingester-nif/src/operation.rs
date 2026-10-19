@@ -13,6 +13,7 @@ use tokio::sync::{watch, Notify};
 static OPERATIONS: AtomicUsize = AtomicUsize::new(0);
 
 pub struct Operation {
+    pub finish_stream: bool,
     // Request tasks and conversion jobs need both the latest cancellation state
     // and an async wakeup. Receivers added after cancellation can read true.
     pub cancel: watch::Sender<bool>,
@@ -22,11 +23,12 @@ pub struct Operation {
 }
 
 impl Operation {
-    pub fn new() -> (Arc<Self>, watch::Receiver<bool>) {
+    pub fn new(finish_stream: bool) -> (Arc<Self>, watch::Receiver<bool>) {
         let (cancel, receiver) = watch::channel(false);
         OPERATIONS.fetch_add(1, Ordering::AcqRel);
         (
             Arc::new(Self {
+                finish_stream,
                 cancel,
                 active: AtomicBool::new(true),
                 codec_jobs: AtomicUsize::new(0),

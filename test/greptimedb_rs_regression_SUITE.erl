@@ -41,6 +41,11 @@ groups() ->
                 t_submit_rejection,
                 t_pool_stop_flush,
                 t_pool_stop_flush_busy,
+                t_pool_stop_active_close,
+                t_pool_stop_active_write,
+                t_pool_stop_active_codec,
+                t_pool_stop_active_timeout,
+                t_pool_stop_active_killed,
                 t_pool_stop_flush_timeout,
                 t_pool_stop_flush_killed,
                 t_library_stop_flush,
@@ -1543,6 +1548,109 @@ pool_stop_flush(Mode, Config) ->
         Tables
     ),
     counts({1, 0}).
+
+t_pool_stop_active_close(Config) ->
+    pool_stop_active(close, Config).
+
+t_pool_stop_active_write(Config) ->
+    pool_stop_active(write, Config).
+
+t_pool_stop_active_codec(Config) ->
+    pool_stop_active(codec, Config).
+
+t_pool_stop_active_timeout(Config) ->
+    pool_stop_active(close, timeout, Config).
+
+t_pool_stop_active_killed(Config) ->
+    pool_stop_active(write, killed, Config).
+
+%% Previously accepted batches must survive stopping during a later stream operation.
+pool_stop_active(Mode, Config) ->
+    pool_stop_active(Mode, release, Config).
+
+pool_stop_active(Mode, Fault, Config) ->
+    Server = ?config(server, Config),
+    Timeout =
+        case Fault of
+            timeout -> 200;
+            _ -> 10000
+        end,
+    Client = client(Server, 1, 1, Timeout, false),
+    Healthy = client(Server, healthy, 1, 10000, true),
+    Table = iolist_to_binary([
+        "regression_pool_active_", atom_to_binary(Mode), "_", atom_to_binary(Fault)
+    ]),
+    {ok, _} = greptimedb_rs:query(
+        Client,
+        <<"CREATE TABLE ", Table/binary, " (ts TIMESTAMP TIME INDEX, reading INT64)">>
+    ),
+    {ok, Stream} = greptimedb_rs:stream_start(Client, Table, row()),
+    ok = greptimedb_rs:stream_write(Stream, [response_row(1)]),
+    wait(fun() -> stream_row_count(Healthy, Table) =:= 1 end, 2000),
+    ok = greptimedb_test_server:pause_requests(Server),
+    ok = greptimedb_rs:stream_write(Stream, [response_row(2)]),
+    wait(fun() -> greptimedb_test_server:held_frames(Server) > 0 end, 1000),
+    Active =
+        case Mode of
+            close ->
+                start_request(fun() -> greptimedb_rs:stream_close(Stream) end);
+            write ->
+                %% Four unacknowledged batches exhaust the SDK's in-flight window.
+                lists:foreach(
+                    fun(I) -> ok = greptimedb_rs:stream_write(Stream, [response_row(I)]) end,
+                    [3, 4, 5]
+                ),
+                start_request(fun() -> greptimedb_rs:stream_write(Stream, [response_row(6)]) end);
+            codec ->
+                Rows = lists:duplicate(300000, response_row(3)),
+                start_request(fun() -> greptimedb_rs:stream_write(Stream, Rows) end)
+        end,
+    wait(
+        fun() ->
+            case Mode of
+                codec -> element(3, greptimedb_rs_nif:codec_counts()) > 0;
+                _ -> greptimedb_rs_nif:resource_counts() =:= {1, 1}
+            end
+        end,
+        2000
+    ),
+    Stop = start_request(fun() -> greptimedb_rs:stop_client(Client) end),
+    case Fault of
+        release ->
+            %% Restore the network before ecpool's 300ms limit.
+            timer:sleep(100),
+            ok = greptimedb_test_server:release(Server);
+        _ ->
+            File = filename:join(?config(priv_dir, Config), "active-stop-dirty-io.data"),
+            Io = start_request(fun() -> file:write_file(File, <<"stop">>) end),
+            {ok, _} = result(Io, 1000),
+            ?assertEqual({ok, [[1]]}, greptimedb_rs:query(Healthy, <<"SELECT 1">>))
+    end,
+    {ok, Elapsed} = result(Stop, 1000),
+    {Reply, _} = result(Active, 1000),
+    ?assert(lists:member(Reply, [ok, {error, closed}])),
+    Minimum =
+        case Mode of
+            write -> 5;
+            _ -> 2
+        end,
+    Count = stream_row_count(Healthy, Table),
+    ct:log("Pool stop during ~p: ~p us, ~p persisted rows", [Mode, Elapsed, Count]),
+    case Fault of
+        release ->
+            ?assert(Count >= Minimum),
+            ?assert(Elapsed >= 90000 andalso Elapsed < 300000);
+        _ ->
+            ?assert(Elapsed >= 150000 andalso Elapsed < 1000000),
+            ok = greptimedb_test_server:release(Server)
+    end,
+    counts({1, 0}),
+    no_result(Active),
+    ?assertEqual({ok, [[1]]}, greptimedb_rs:query(Healthy, <<"SELECT 1">>)).
+
+stream_row_count(Client, Table) ->
+    {ok, [[Count]]} = greptimedb_rs:query(Client, <<"SELECT count(*) FROM ", Table/binary>>),
+    Count.
 
 %% An unresponsive stream must not prevent pool shutdown or occupy dirty I/O.
 t_pool_stop_flush_timeout(Config) ->

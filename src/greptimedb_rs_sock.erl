@@ -176,9 +176,10 @@ handle_info(_, State) ->
     {noreply, State}.
 
 terminate(_Reason, #state{client = ClientRef, pending = Pending} = State) ->
+    Deadline = local_deadline(?CMD_STREAM_CLOSE, State),
     case ClientRef of
         undefined -> ok;
-        _ -> apply_nif(disconnect, [ClientRef])
+        _ -> apply_nif(drain, [ClientRef])
     end,
     maps:foreach(
         fun(_, Req) ->
@@ -192,14 +193,17 @@ terminate(_Reason, #state{client = ClientRef, pending = Pending} = State) ->
         end,
         Pending
     ),
-    flush_writers(State),
+    flush_writers(State, Deadline),
+    case ClientRef of
+        undefined -> ok;
+        _ -> apply_nif(disconnect, [ClientRef])
+    end,
     maps:foreach(fun(_, Writer) -> apply_nif(discard_writer, [Writer]) end, State#state.writers),
     ok.
 
-flush_writers(#state{writers = Writers}) when map_size(Writers) =:= 0 ->
+flush_writers(#state{writers = Writers}, _Deadline) when map_size(Writers) =:= 0 ->
     ok;
-flush_writers(State) ->
-    Deadline = local_deadline(?CMD_STREAM_CLOSE, State),
+flush_writers(State, Deadline) ->
     case await_current(State, Deadline) of
         ok ->
             Token = make_ref(),

@@ -8,6 +8,8 @@
     backend/1,
     pause/1,
     pause_headers/1,
+    pause_requests/1,
+    held_frames/1,
     release/1,
     disconnect/1,
     headers/1,
@@ -70,6 +72,12 @@ pause(Server) ->
 
 pause_headers(Server) ->
     gen_server:call(Server, pause_headers).
+
+pause_requests(Server) ->
+    gen_server:call(Server, pause_requests).
+
+held_frames(Server) ->
+    gen_server:call(Server, held_frames).
 
 release(Server) ->
     gen_server:call(Server, release).
@@ -137,6 +145,10 @@ handle_call(pause, _, State) ->
     {reply, ok, State#{paused := body, headers := #{}}};
 handle_call(pause_headers, _, State) ->
     {reply, ok, State#{paused := headers, headers := #{}}};
+handle_call(pause_requests, _, State) ->
+    {reply, ok, State#{paused := requests}};
+handle_call(held_frames, _, State) ->
+    {reply, length(maps:get(held, State)), State};
 handle_call(headers, _, State) ->
     {reply, map_size(maps:get(headers, State)), State};
 handle_call(release, _, State) ->
@@ -150,11 +162,17 @@ handle_call(disconnect, _, State) ->
 handle_call(restart, _, State) ->
     stop_backend(State),
     {reply, ok, start_backend(close_sockets(State))};
+%% Delay request DATA but keep resets flowing, exposing premature cancellation.
+handle_call({request, Socket, 0, Packet}, _, #{paused := requests} = State) ->
+    {reply, ok, State#{held := [{Socket, Packet} | maps:get(held, State)]}};
+handle_call({request, Socket, _, Packet}, _, State) ->
+    gen_tcp:send(Socket, Packet),
+    {reply, ok, State};
 %% Keep connection control frames flowing while holding RPC responses.
 %% Body mode forwards initial headers; headers mode holds those too.
 
 handle_call({frame, Socket, Stream, Type, Flags, Packet}, _, #{paused := Paused} = State) when
-    Paused =/= none andalso Stream =/= 0 andalso
+    (Paused =:= body orelse Paused =:= headers) andalso Stream =/= 0 andalso
         (Type =:= 0 orelse Type =:= 1 orelse Type =:= 9)
 ->
     Headers = (maps:get(headers, State))#{{Socket, Stream} => true},
@@ -348,7 +366,7 @@ frames(Source, Destination, Direction, Server) ->
             Packet = <<Header/binary, Payload/binary>>,
             case Direction of
                 request ->
-                    gen_tcp:send(Destination, Packet);
+                    gen_server:call(Server, {request, Destination, Type, Packet});
                 response ->
                     gen_server:call(Server, {frame, Destination, Stream, Type, Flags, Packet})
             end,

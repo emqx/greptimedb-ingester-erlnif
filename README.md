@@ -93,8 +93,9 @@ when the returned values are small.
 
 Application startup returns an error when native runtime creation fails. A poisoned native client state lock closes that client and cancels its active request while retaining codec work until reclamation. The affected pool connection must be recreated. Async callback exceptions are logged as `greptimedb_callback_failed`; the worker continues processing requests.
 
-Stopping a pool cancels its active request and attempts to finish previously submitted
-stream batches before releasing writers. This wait uses `stream_timeout`, but ecpool
+Stopping a pool rejects new requests, cancels active queries and inserts, and lets
+active stream writes/closes finish before flushing remaining writers. These waits
+share one `stream_timeout` deadline; expiry cancels unfinished work. ecpool
 can force termination earlier (currently about 300ms per connection). Call
 `stream_close/1` explicitly before stopping when more time is needed; its existing
 public return value still suppresses finish errors.

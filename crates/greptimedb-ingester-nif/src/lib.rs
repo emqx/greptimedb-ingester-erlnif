@@ -88,6 +88,17 @@ impl GreptimeResource {
             operation.cancel();
         }
     }
+
+    fn drain(&self) {
+        self.closed.store(true, Ordering::Release);
+        let operation = self.lock_operation().clone();
+        if let Some(operation) = operation {
+            // Dropping a stream future can destroy its writer and older pending batches.
+            if !operation.finish_stream {
+                operation.cancel();
+            }
+        }
+    }
 }
 
 impl Resource for StreamWriterResource {}
@@ -274,6 +285,12 @@ fn connect(opts: Term) -> NifResult<Term> {
 #[rustler::nif]
 fn disconnect(resource: ResourceArc<GreptimeResource>) -> Atom {
     resource.close();
+    atoms::ok()
+}
+
+#[rustler::nif]
+fn drain(resource: ResourceArc<GreptimeResource>) -> Atom {
+    resource.drain();
     atoms::ok()
 }
 
@@ -657,7 +674,7 @@ fn submit_impl<'a>(
     let closing = matches!(&request, Request::StreamCloseAll(_));
     let writer = request.writer();
     let finish_stream = writer.is_some() || closing;
-    let (operation, cancelled) = Operation::new();
+    let (operation, cancelled) = Operation::new(finish_stream);
     let running = Running {
         client: client.clone(),
         operation: operation.clone(),
@@ -668,7 +685,7 @@ fn submit_impl<'a>(
         .ok_or(rustler::Error::BadArg)?;
     let rejected = {
         let mut slot = client.lock_operation();
-        // Disconnect cancels active work before termination drains the remaining writers.
+        // A draining connection only admits the final writer flush.
         if (client.closed.load(Ordering::Acquire) && !closing) || client.runtime.is_stopping() {
             Some(atoms::closed())
         } else if slot.is_some() {
@@ -1152,9 +1169,9 @@ mod tests {
     #[test]
     fn poisoned_client_slot_closes_and_cancels_without_finishing_early() {
         let owner = RuntimeResource(runtime::start(1, 1).expect("start test runtime"));
-        for occupied in [false, true] {
+        for (occupied, finish_stream) in [(false, false), (true, false), (true, true)] {
             let sdk = Client::with_urls(["127.0.0.1:4001"]);
-            let (operation, _cancelled) = Operation::new();
+            let (operation, _cancelled) = Operation::new(finish_stream);
             let client = GreptimeResource {
                 db: Database::new_with_dbname("public", sdk.clone()),
                 client: sdk,
@@ -1166,6 +1183,10 @@ mod tests {
                 operation: Mutex::new(occupied.then(|| operation.clone())),
                 closed: AtomicBool::new(false),
             };
+            client.drain();
+            assert!(client.closed.load(Ordering::Acquire));
+            assert_eq!(*operation.cancel.borrow(), occupied && !finish_stream);
+            assert!(operation.active.load(Ordering::Acquire));
             let _ = catch_unwind(AssertUnwindSafe(|| {
                 let _slot = client.operation.lock().expect("unpoisoned test slot");
                 panic!("poison client slot");

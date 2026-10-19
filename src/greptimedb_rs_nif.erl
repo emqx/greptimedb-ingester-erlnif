@@ -22,6 +22,7 @@
     runtime_stop/2,
     connect/1,
     disconnect/1,
+    drain/1,
     submit/5,
     cancel/1,
     operation_active/1,
@@ -59,6 +60,9 @@ connect(_Opts) ->
     not_loaded(?LINE).
 
 disconnect(_Client) ->
+    not_loaded(?LINE).
+
+drain(_Client) ->
     not_loaded(?LINE).
 
 submit(Client, Command, Args, Token, DeadlineUs) ->
