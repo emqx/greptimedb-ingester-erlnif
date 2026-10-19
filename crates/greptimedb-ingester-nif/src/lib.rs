@@ -221,7 +221,10 @@ fn execute(env: Env, resource: ResourceArc<GreptimeResource>, sql: String) -> Ni
     }
 }
 
-async fn fetch_table_schema(db: &Database, table_name: &str) -> Result<TableSchema, String> {
+async fn fetch_table_schema(
+    db: &Database,
+    table_name: &str,
+) -> Result<(TableSchema, std::collections::HashSet<String>), String> {
     let sql = format!("DESCRIBE {table_name}");
     let mut stream = db.query(&sql).await.map_err(|e| e.to_string())?;
 
@@ -229,6 +232,11 @@ async fn fetch_table_schema(db: &Database, table_name: &str) -> Result<TableSche
         .name(table_name)
         .build()
         .map_err(|e| e.to_string())?;
+    // Names of columns whose server-side type is JSON2. DESCRIBE only reports
+    // the type name (e.g. "Json2"), so the JSON2-ness is tracked separately and
+    // the proto `ColumnSchema` is enriched with the native-JSON extension when
+    // the insert request is built.
+    let mut json2_columns = std::collections::HashSet::new();
 
     while let Some(batch_res) = futures::StreamExt::next(&mut stream).await {
         let batch = batch_res.map_err(|e| e.to_string())?;
@@ -280,6 +288,13 @@ async fn fetch_table_schema(db: &Database, table_name: &str) -> Result<TableSche
                 "TimestampMillisecond" => ColumnDataType::TimestampMillisecond,
                 "TimestampMicrosecond" => ColumnDataType::TimestampMicrosecond,
                 "TimestampNanosecond" => ColumnDataType::TimestampNanosecond,
+                // Legacy JSON (jsonb) column.
+                "Json" => ColumnDataType::Json,
+                // JSON2 column (DESCRIBE reports "Json2").
+                _ if type_str.starts_with("Json2") => {
+                    json2_columns.insert(name.to_string());
+                    ColumnDataType::Json
+                }
                 _ => return Err(format!("Unknown column type: {type_str}")),
             };
 
@@ -292,7 +307,7 @@ async fn fetch_table_schema(db: &Database, table_name: &str) -> Result<TableSche
         }
     }
 
-    Ok(table_schema)
+    Ok((table_schema, json2_columns))
 }
 
 #[rustler::nif(schedule = "DirtyIo")]
@@ -311,11 +326,10 @@ fn insert<'a>(
     use greptimedb_ingester::api::v1::{RowInsertRequest, RowInsertRequests, Rows};
 
     // 1. Try Fetch Schema from Server
-    let table_schema_res: Result<TableSchema, String> =
-        runtime.block_on(fetch_table_schema(&resource.db, &table));
+    let table_schema_res = runtime.block_on(fetch_table_schema(&resource.db, &table));
 
-    let (schema, rows) = match table_schema_res {
-        Ok(s) => {
+    let (schema, rows, auto_created_with_json2) = match table_schema_res {
+        Ok((s, json2_columns)) => {
             // Table exists: keep the server's columns and their types, then merge in
             // the columns inferred from the input rows. GreptimeDB adds unknown
             // columns automatically, so new input fields are no longer dropped.
@@ -323,25 +337,35 @@ fn insert<'a>(
             let server_columns: Vec<ColumnSchema> = s
                 .columns()
                 .iter()
-                .map(|c| ColumnSchema {
-                    column_name: c.name.clone(),
-                    datatype: c.data_type as i32,
-                    semantic_type: c.semantic_type as i32,
-                    ..Default::default()
+                .map(|c| {
+                    if json2_columns.contains(&c.name) {
+                        // JSON2 column: native JSON type extension and the
+                        // `greptime.json2` column options.
+                        greptimedb_ingester::helpers::schema::json2_field(&c.name)
+                    } else {
+                        ColumnSchema {
+                            column_name: c.name.clone(),
+                            datatype: c.data_type as i32,
+                            semantic_type: c.semantic_type as i32,
+                            ..Default::default()
+                        }
+                    }
                 })
                 .collect();
 
             let schema = util::merge_inferred_columns(server_columns, &rows_term)?;
             let rows = util::terms_to_proto_rows_with_columns(&schema, rows_term)?;
 
-            (schema, rows)
+            (schema, rows, false)
         }
         Err(_) => {
             // Table might not exist, infer schema locally
-            util::terms_to_schema_and_rows(
+            let (schema, rows) = util::terms_to_schema_and_rows(
                 rows_term,
                 resource.ts_column.as_deref().unwrap_or("ts"),
-            )?
+            )?;
+            let has_json2 = schema.iter().any(util::is_json2_column);
+            (schema, rows, has_json2)
         }
     };
 
@@ -355,16 +379,26 @@ fn insert<'a>(
 
     // 3. Insert using Database
     let result: Result<u32, String> = runtime.block_on(async {
+        let mut hints: Vec<(&str, &str)> = Vec::new();
         if let Some(ttl) = &resource.ttl {
+            hints.push(("ttl", ttl.as_str()));
+        }
+        if auto_created_with_json2 {
+            // JSON2 columns require append-only tables; without the hint the
+            // auto-created table would default to `merge_mode = 'last_row'`
+            // and the server would reject the JSON2 column.
+            hints.push(("append_mode", "true"));
+        }
+        if hints.is_empty() {
             resource
                 .db
-                .insert_with_hints(insert_request, &[("ttl", ttl.as_str())])
+                .insert(insert_request)
                 .await
                 .map_err(|e| e.to_string())
         } else {
             resource
                 .db
-                .insert(insert_request)
+                .insert_with_hints(insert_request, &hints)
                 .await
                 .map_err(|e| e.to_string())
         }
@@ -386,12 +420,18 @@ fn stream_start<'a>(
     let runtime = &resource.runtime;
 
     // 1. Fetch Schema from Server
-    let table_template_res: Result<TableSchema, String> =
-        runtime.block_on(fetch_table_schema(&resource.db, &table));
-    let table_template = match table_template_res {
+    let table_template_res = runtime.block_on(fetch_table_schema(&resource.db, &table));
+    let (table_template, json2_columns) = match table_template_res {
         Ok(s) => s,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
+    if !json2_columns.is_empty() {
+        return Ok((
+            atoms::error(),
+            "stream (bulk) write does not support JSON2 columns; use insert/3 instead",
+        )
+            .encode(env));
+    }
 
     let schema_clone = table_template.clone();
 
@@ -411,11 +451,8 @@ fn stream_start<'a>(
             .map_err(|e| e.to_string())?;
 
         // Pre-allocate buffer for optimal performance
-        // capacity: 10000 rows (good for 5K-10K batch sizes)
-        // row_buffer_size: 1024 (recommended for row-to-column transformation)
-        writer
-            .alloc_rows_buffer(5000, 1024)
-            .map_err(|e| e.to_string())?;
+        // capacity: 5000 rows (good for 5K-10K batch sizes)
+        writer.alloc_rows_buffer(5000).map_err(|e| e.to_string())?;
 
         Ok(ResourceArc::new(StreamWriterResource {
             writer: tokio::sync::Mutex::new(Some(SendableBulkStreamWriter(writer))),

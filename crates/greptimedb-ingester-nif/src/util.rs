@@ -2,9 +2,10 @@ use std::collections::{BTreeMap, HashSet};
 
 use crate::atoms;
 use crate::types;
+use greptimedb_ingester::api::v1::column_data_type_extension::TypeExt;
 use greptimedb_ingester::api::v1::{ColumnDataType, ColumnSchema, Row as ProtoRow, SemanticType};
-use greptimedb_ingester::helpers::schema::{field, tag, timestamp};
-use greptimedb_ingester::helpers::values::none_value;
+use greptimedb_ingester::helpers::schema::{field, json2_field, tag, timestamp};
+use greptimedb_ingester::helpers::values::{json2_value, none_value};
 use greptimedb_ingester::{Row, Rows, TableSchema, Value};
 use rustler::{Encoder, Term, TermType};
 
@@ -13,7 +14,7 @@ pub fn terms_to_rows<'a>(
     rows_term: Vec<Term<'a>>,
 ) -> rustler::NifResult<Rows> {
     let column_schemas = table_schema.columns();
-    let mut greptime_rows = Rows::new(column_schemas, rows_term.len(), 1024)
+    let mut greptime_rows = Rows::new(column_schemas, rows_term.len())
         .map_err(|e| rustler::Error::Term(Box::new(e.to_string())))?;
 
     if rows_term.is_empty() {
@@ -69,6 +70,50 @@ pub fn terms_to_rows<'a>(
     Ok(greptime_rows)
 }
 
+/// Whether the column is a JSON2 column (datatype JSON with the native JSON
+/// type extension). Only such columns accept structured `JsonValue` values.
+pub fn is_json2_column(column: &ColumnSchema) -> bool {
+    column.datatype() == ColumnDataType::Json
+        && matches!(
+            column
+                .datatype_extension
+                .as_ref()
+                .and_then(|ext| ext.type_ext.as_ref()),
+            Some(TypeExt::JsonNativeType(_))
+        )
+}
+
+/// Extracts the JSON document string from a JSON2 field value term.
+///
+/// Accepted forms:
+/// - `nil`/`undefined` -> SQL NULL (`Ok(None)`);
+/// - `{json2, JsonBinary}` -> explicit JSON2 marker, used when the table does
+///   not exist yet so the column is auto-created with the JSON2 type;
+/// - a plain binary/string -> JSON document for a column that is already known
+///   to be JSON2 (its schema came from the server).
+fn json2_str(term: Term) -> rustler::NifResult<Option<String>> {
+    if is_null(term) {
+        return Ok(None);
+    }
+    if let Ok((tag_term, payload)) = term.decode::<(Term, Term)>() {
+        if let Ok(tag) = tag_term.decode::<rustler::types::atom::Atom>() {
+            if tag == atoms::json2() {
+                return payload.decode::<String>().map(Some).map_err(|_| {
+                    rustler::Error::RaiseTerm(Box::new(
+                        "Invalid json2 value: expected `{json2, JsonBinary}`".to_string(),
+                    ))
+                });
+            }
+        }
+    }
+    term.decode::<String>().map(Some).map_err(|_| {
+        rustler::Error::RaiseTerm(Box::new(
+            "Invalid json2 value: expected a JSON binary/string or `{json2, JsonBinary}`"
+                .to_string(),
+        ))
+    })
+}
+
 /// Encodes `rows_term` against an explicit column list.
 ///
 /// This is the single row encoder used by both the "table exists" path (with the
@@ -85,13 +130,14 @@ pub fn terms_to_proto_rows_with_columns<'a>(
     let env = rows_term[0].get_env();
 
     // Pre-compute keys and metadata for columns to avoid repetitive encoding/decoding
-    let col_meta: Vec<(SemanticType, Term<'a>, ColumnDataType)> = columns
+    let col_meta: Vec<(SemanticType, Term<'a>, ColumnDataType, bool)> = columns
         .iter()
         .map(|c| {
             (
                 SemanticType::try_from(c.semantic_type).unwrap_or(SemanticType::Field),
                 c.column_name.encode(env),
                 ColumnDataType::try_from(c.datatype).unwrap_or(ColumnDataType::String),
+                is_json2_column(c),
             )
         })
         .collect();
@@ -117,7 +163,7 @@ pub fn terms_to_proto_rows_with_columns<'a>(
 
         let mut values = Vec::with_capacity(col_meta.len());
 
-        for (semantic, key_term, dtype) in &col_meta {
+        for (semantic, key_term, dtype, is_json2) in &col_meta {
             let val_term = match semantic {
                 SemanticType::Field => fields_term.and_then(|map| map.map_get(*key_term).ok()),
                 SemanticType::Tag => tags_term.and_then(|map| map.map_get(*key_term).ok()),
@@ -125,7 +171,18 @@ pub fn terms_to_proto_rows_with_columns<'a>(
             };
 
             let val = if let Some(t) = val_term {
-                types::term_to_proto_value(&t, *dtype)?
+                if *is_json2 {
+                    match json2_str(t)? {
+                        Some(json) => json2_value(&json).map_err(|e| {
+                            rustler::Error::RaiseTerm(Box::new(format!(
+                                "Invalid json2 value for column: {e}"
+                            )))
+                        })?,
+                        None => none_value(),
+                    }
+                } else {
+                    types::term_to_proto_value(&t, *dtype)?
+                }
             } else {
                 none_value()
             };
@@ -188,9 +245,21 @@ pub fn merge_inferred_columns<'a>(
     }
 
     for (name, dtype) in new_fields {
-        merged.push(field(&name, dtype));
+        if dtype == ColumnDataType::Json {
+            // Inferred JSON2 column: declare it with the native JSON type
+            // extension and the `greptime.json2` column options, so an
+            // auto-created table gets a real JSON2 column.
+            merged.push(json2_field(&name));
+        } else {
+            merged.push(field(&name, dtype));
+        }
     }
     for (name, dtype) in new_tags {
+        if dtype == ColumnDataType::Json {
+            return Err(rustler::Error::RaiseTerm(Box::new(
+                "JSON2 columns must be fields, not tags".to_string(),
+            )));
+        }
         merged.push(tag(&name, dtype));
     }
 
@@ -283,6 +352,15 @@ pub fn terms_to_schema_and_rows<'a>(
 }
 
 fn infer_dtype(term: Term) -> ColumnDataType {
+    // `{json2, JsonBinary}` marks a JSON2 column when the schema is inferred
+    // (auto-created table).
+    if let Ok((tag_term, _)) = term.decode::<(Term, Term)>() {
+        if let Ok(tag) = tag_term.decode::<rustler::types::atom::Atom>() {
+            if tag == atoms::json2() {
+                return ColumnDataType::Json;
+            }
+        }
+    }
     match term.get_type() {
         TermType::Atom => {
             if term.decode::<bool>().is_ok() {

@@ -72,6 +72,11 @@ pub fn term_to_value(val: &Term, dtype: ColumnDataType) -> rustler::NifResult<Va
         ColumnDataType::TimestampMillisecond => convert_int!(val, TimestampMillisecond, i64, i64),
         ColumnDataType::TimestampMicrosecond => convert_int!(val, TimestampMicrosecond, i64, i64),
         ColumnDataType::TimestampNanosecond => convert_int!(val, TimestampNanosecond, i64, i64),
+        // Legacy JSON (jsonb) column: the value is a JSON document encoded as a
+        // string; the server converts it to jsonb binary. JSON2 columns never
+        // reach this function: they are handled as native `JsonValue` in
+        // `util::terms_to_proto_rows_with_columns`.
+        ColumnDataType::Json => convert_direct!(val, Json, String),
         _ => Ok(Value::Null),
     }
 }
