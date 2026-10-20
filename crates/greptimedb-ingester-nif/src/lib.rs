@@ -247,26 +247,13 @@ async fn fetch_table_schema(
             return Err("DESCRIBE result has unexpected number of columns".to_string());
         }
 
-        let names = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .ok_or("Failed to cast column 0 to StringArray")?;
-        let types = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .ok_or("Failed to cast column 1 to StringArray")?;
-        let semantic_types = batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .ok_or("Failed to cast column 5 to StringArray")?;
-
         for i in 0..batch.num_rows() {
-            let name = names.value(i);
-            let type_str = types.value(i);
-            let semantic_str = semantic_types.value(i);
+            let name = string_value(batch.column(0).as_ref(), i)
+                .ok_or("DESCRIBE returned a NULL column name")?;
+            let type_str = string_value(batch.column(1).as_ref(), i)
+                .ok_or("DESCRIBE returned a NULL column type")?;
+            let semantic_str = string_value(batch.column(5).as_ref(), i)
+                .ok_or("DESCRIBE returned a NULL semantic type")?;
 
             let dtype = match type_str {
                 "Int8" => ColumnDataType::Int8,
@@ -310,6 +297,185 @@ async fn fetch_table_schema(
     Ok((table_schema, json2_columns))
 }
 
+async fn fetch_column_defaults(
+    db: &Database,
+    table_name: &str,
+) -> Result<std::collections::HashMap<String, util::ColumnDefault>, String> {
+    let (db_catalog, _) = split_dbname(db.dbname());
+    let (catalog, schema_name, bare_table_name) = match table_name.rsplit_once('.') {
+        Some((schema_part, table)) => {
+            let (catalog, schema) = split_dbname(schema_part);
+            (catalog.or(db_catalog), schema, table)
+        }
+        None => {
+            let (catalog, schema) = split_dbname(db.dbname());
+            (catalog, schema, table_name)
+        }
+    };
+    let where_clause = match catalog {
+        Some(catalog) => format!(
+            "table_catalog = {} AND table_schema = {} AND table_name = {}",
+            sql_string_literal(catalog),
+            sql_string_literal(schema_name),
+            sql_string_literal(bare_table_name)
+        ),
+        None => format!(
+            "table_schema = {} AND table_name = {}",
+            sql_string_literal(schema_name),
+            sql_string_literal(bare_table_name)
+        ),
+    };
+    let sql = format!(
+        "SELECT column_name, column_default FROM information_schema.columns \
+         WHERE {where_clause} ORDER BY ordinal_position"
+    );
+    let mut stream = db.query(&sql).await.map_err(|e| e.to_string())?;
+    let mut default_values: std::collections::HashMap<String, util::ColumnDefault> =
+        std::collections::HashMap::new();
+    let mut seen_columns = 0;
+    while let Some(batch_res) = futures::StreamExt::next(&mut stream).await {
+        let batch = batch_res.map_err(|e| e.to_string())?;
+        if batch.num_columns() < 2 {
+            return Err(
+                "information_schema.columns result has unexpected number of columns".to_string(),
+            );
+        }
+        seen_columns += batch.num_rows();
+        for i in 0..batch.num_rows() {
+            let name = string_value(batch.column(0).as_ref(), i)
+                .ok_or("information_schema returned a NULL column name")?;
+            let Some(default) = string_value(batch.column(1).as_ref(), i) else {
+                continue;
+            };
+            let default = if default == "Null" {
+                util::ColumnDefault::Null
+            } else {
+                util::ColumnDefault::Value(default.to_string())
+            };
+            default_values.insert(name.to_string(), default);
+        }
+    }
+    if seen_columns == 0 {
+        return Err(format!(
+            "no column defaults found for table `{table_name}` in catalog/schema `{}`",
+            db.dbname()
+        ));
+    }
+
+    let null_columns: Vec<String> = default_values
+        .iter()
+        .filter(|(_, default)| matches!(default, util::ColumnDefault::Null))
+        .map(|(name, _)| name.clone())
+        .collect();
+    if !null_columns.is_empty() {
+        let ddl = fetch_create_table_ddl(db, table_name).await?;
+        let null_defaults = sql_null_defaults(&ddl, &null_columns)?;
+        for name in null_columns {
+            let is_sql_null = null_defaults
+                .get(&name)
+                .copied()
+                .ok_or_else(|| format!("could not disambiguate the default for column `{name}`"))?;
+            let default = if is_sql_null {
+                util::ColumnDefault::Null
+            } else {
+                util::ColumnDefault::Value("Null".to_string())
+            };
+            default_values.insert(name, default);
+        }
+    }
+
+    Ok(default_values)
+}
+
+async fn fetch_create_table_ddl(db: &Database, table_name: &str) -> Result<String, String> {
+    let sql = format!("SHOW CREATE TABLE {table_name}");
+    let mut stream = db.query(&sql).await.map_err(|e| e.to_string())?;
+    while let Some(batch_res) = futures::StreamExt::next(&mut stream).await {
+        let batch = batch_res.map_err(|e| e.to_string())?;
+        if batch.num_columns() >= 2 && batch.num_rows() > 0 {
+            if let Some(ddl) = string_value(batch.column(1).as_ref(), 0) {
+                return Ok(ddl.to_string());
+            }
+        }
+    }
+    Err(format!(
+        "SHOW CREATE TABLE returned no DDL for table `{table_name}`"
+    ))
+}
+
+fn sql_null_defaults(
+    ddl: &str,
+    columns: &[String],
+) -> Result<std::collections::HashMap<String, bool>, String> {
+    let mut result = std::collections::HashMap::new();
+    for line in ddl.lines() {
+        let trimmed = line.trim_start();
+        for name in columns {
+            let quoted = format!("\"{}\"", name.replace('"', "\"\""));
+            if !trimmed.starts_with(&quoted) {
+                continue;
+            }
+            let rest = &trimmed[quoted.len()..];
+            if !rest.starts_with(char::is_whitespace) {
+                continue;
+            }
+            let Some(position) = rest.find(" DEFAULT ") else {
+                continue;
+            };
+            let default = rest[position + " DEFAULT ".len()..].trim_start();
+            let is_sql_null = if default
+                .get(..4)
+                .is_some_and(|token| token.eq_ignore_ascii_case("NULL"))
+                && !default[4..]
+                    .chars()
+                    .next()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_')
+            {
+                true
+            } else if default.starts_with('\'') {
+                false
+            } else {
+                return Err(format!(
+                    "unsupported default rendering for column `{name}`: {default}"
+                ));
+            };
+            result.insert(name.clone(), is_sql_null);
+        }
+    }
+    for name in columns {
+        if !result.contains_key(name) {
+            return Err(format!(
+                "could not find a DEFAULT clause for column `{name}` in SHOW CREATE TABLE"
+            ));
+        }
+    }
+    Ok(result)
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn split_dbname(dbname: &str) -> (Option<&str>, &str) {
+    match dbname.split_once('-') {
+        Some((catalog, schema)) => (Some(catalog), schema),
+        None => (None, dbname),
+    }
+}
+
+fn string_value(array: &dyn arrow::array::Array, index: usize) -> Option<&str> {
+    use arrow::array::{Array, LargeStringArray, StringArray, StringViewArray};
+    if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+        (!array.is_null(index)).then(|| array.value(index))
+    } else if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
+        (!array.is_null(index)).then(|| array.value(index))
+    } else if let Some(array) = array.as_any().downcast_ref::<StringViewArray>() {
+        (!array.is_null(index)).then(|| array.value(index))
+    } else {
+        None
+    }
+}
+
 #[rustler::nif(schedule = "DirtyIo")]
 fn insert<'a>(
     env: Env<'a>,
@@ -328,7 +494,7 @@ fn insert<'a>(
     // 1. Try Fetch Schema from Server
     let table_schema_res = runtime.block_on(fetch_table_schema(&resource.db, &table));
 
-    let (schema, rows, auto_created_with_json2) = match table_schema_res {
+    let (inserts, auto_created_with_json2) = match table_schema_res {
         Ok((s, json2_columns)) => {
             // Table exists: keep the server's columns and their types, then merge in
             // the columns inferred from the input rows. GreptimeDB adds unknown
@@ -353,10 +519,25 @@ fn insert<'a>(
                 })
                 .collect();
 
-            let schema = util::merge_inferred_columns(server_columns, &rows_term)?;
-            let rows = util::terms_to_proto_rows_with_columns(&schema, rows_term)?;
-
-            (schema, rows, false)
+            let merged = util::merge_inferred_columns(server_columns, &rows_term)?;
+            let present = util::collect_present_columns(&rows_term)?;
+            let schema = util::retain_present_columns(&merged, &present);
+            let defaults = if util::rows_have_same_presence(&rows_term)? {
+                std::collections::HashMap::new()
+            } else {
+                runtime
+                    .block_on(fetch_column_defaults(&resource.db, &table))
+                    .map_err(|e| rustler::Error::RaiseTerm(Box::new(e)))?
+            };
+            let rows =
+                util::terms_to_proto_rows_with_columns_and_defaults(&schema, rows_term, &defaults)?;
+            (
+                vec![RowInsertRequest {
+                    table_name: table.clone(),
+                    rows: Some(Rows { schema, rows }),
+                }],
+                false,
+            )
         }
         Err(_) => {
             // Table might not exist, infer schema locally
@@ -365,17 +546,18 @@ fn insert<'a>(
                 resource.ts_column.as_deref().unwrap_or("ts"),
             )?;
             let has_json2 = schema.iter().any(util::is_json2_column);
-            (schema, rows, has_json2)
+            (
+                vec![RowInsertRequest {
+                    table_name: table.clone(),
+                    rows: Some(Rows { schema, rows }),
+                }],
+                has_json2,
+            )
         }
     };
 
     // 2. Construct Request
-    let insert_request = RowInsertRequests {
-        inserts: vec![RowInsertRequest {
-            table_name: table,
-            rows: Some(Rows { schema, rows }),
-        }],
-    };
+    let insert_request = RowInsertRequests { inserts };
 
     // 3. Insert using Database
     let result: Result<u32, String> = runtime.block_on(async {
@@ -513,6 +695,24 @@ fn stream_close(env: Env, resource: ResourceArc<StreamWriterResource>) -> NifRes
     match result {
         Ok(_) => Ok(atoms::ok().encode(env)),
         Err(e) => Ok((atoms::error(), e).encode(env)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn distinguishes_sql_null_from_string_null_in_ddl() {
+        let ddl = r#"CREATE TABLE IF NOT EXISTS "t" (
+  "s_sql_null" STRING NULL DEFAULT NULL,
+  "s_cap_null" STRING NULL DEFAULT 'Null',
+  TIME INDEX ("ts")
+)"#;
+        let columns = vec!["s_sql_null".to_string(), "s_cap_null".to_string()];
+        let defaults = sql_null_defaults(ddl, &columns).expect("parse defaults");
+        assert_eq!(defaults.get("s_sql_null"), Some(&true));
+        assert_eq!(defaults.get("s_cap_null"), Some(&false));
     }
 }
 

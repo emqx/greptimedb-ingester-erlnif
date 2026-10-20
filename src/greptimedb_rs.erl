@@ -169,23 +169,41 @@ query_async(Client, Sql, ResultCallback) ->
 
 %% @doc Start a stream for a specific table.
 %% Returns a StreamClient handle that binds the Table context to the Client.
-%% It attempts to initialize the stream on all workers (best effort).
--spec stream_start(client(), binary(), map()) -> {ok, stream_client()}.
+%% It initializes the stream on all workers and fails if any worker rejects it.
+-spec stream_start(client(), binary(), map()) -> {ok, stream_client()} | {error, term()}.
 stream_start(?pool_name(PoolName) = Client, Table, FirstRow) ->
     Workers = ecpool:workers(PoolName),
-    %% Attempt to pre-warm all workers. Ignore errors/ignored returns.
-    lists:foreach(
-        fun({_Name, Worker}) ->
-            try
-                {ok, Conn} = ecpool_worker:client(Worker),
-                greptimedb_rs_sock:sync_command(Conn, ?cmd_stream_start, [Table, FirstRow])
-            catch
-                _:_ -> ok
-            end
+    Result = lists:foldl(
+        fun
+            (_Worker, {error, _} = Error) ->
+                Error;
+            ({_Name, Worker}, ok) ->
+                try
+                    {ok, Conn} = ecpool_worker:client(Worker),
+                    case
+                        greptimedb_rs_sock:sync_command(Conn, ?cmd_stream_start, [
+                            Table, FirstRow
+                        ])
+                    of
+                        {ok, _} -> ok;
+                        ok -> ok;
+                        {error, Reason} -> {error, Reason};
+                        Other -> {error, Other}
+                    end
+                catch
+                    Class:CatchReason -> {error, {Class, CatchReason}}
+                end
         end,
+        ok,
         Workers
     ),
-    {ok, {stream_client, Client, Table}}.
+    case Result of
+        ok ->
+            {ok, {stream_client, Client, Table}};
+        {error, Reason} ->
+            _ = stream_close({stream_client, Client, Table}),
+            {error, Reason}
+    end.
 
 %% @doc Stop the stream for a specific table.
 %% Releases stream resources on all workers in the pool.
