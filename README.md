@@ -265,6 +265,15 @@ The library supports automatic mapping from Erlang terms to GreptimeDB types bas
 | `JSON` (legacy)  | Binary / String containing a JSON document  | `<<"{\"a\":1}">>`         |
 | `JSON2`          | `{json2, JsonBinary}` for new tables; plain JSON binary for existing JSON2 columns | `{json2, <<"{\"a\":1}">>}` |
 
+Row inserts encode supported columns using the existing table schema, even when
+other columns have unsupported types such as `DECIMAL`. Omit unsupported columns
+from the input; explicitly providing one, including a `nil` or `undefined` value,
+rejects the entire batch before it is sent. Omitted columns remain subject to
+database defaults and constraints. Bulk writes require a fully supported schema.
+
+Schema discovery errors are returned to the caller. Local type inference is used
+only when GreptimeDB confirms that the table does not exist.
+
 ## Known Limitations
 
 - **Sparse bulk timestamps**: bulk writes with timestamps spread across many

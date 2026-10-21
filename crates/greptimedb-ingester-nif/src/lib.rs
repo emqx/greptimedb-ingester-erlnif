@@ -267,7 +267,7 @@ fn execute(env: Env, resource: ResourceArc<GreptimeResource>, sql: String) -> Ni
 }
 
 struct FetchedTableSchema {
-    schema: TableSchema,
+    supported_schema: TableSchema,
     json2_columns: std::collections::HashSet<String>,
     fingerprint: String,
     unsupported_columns: std::collections::HashMap<String, String>,
@@ -293,7 +293,7 @@ async fn fetch_table_schema(
         Err(error) => return Err(error.to_string()),
     };
 
-    let mut table_schema = TableSchema::builder()
+    let mut supported_schema = TableSchema::builder()
         .name(table_name)
         .build()
         .map_err(|e| e.to_string())?;
@@ -365,9 +365,9 @@ async fn fetch_table_schema(
             };
 
             match semantic_str {
-                "TAG" => table_schema = table_schema.add_tag(name, dtype),
-                "FIELD" => table_schema = table_schema.add_field(name, dtype),
-                "TIMESTAMP" => table_schema = table_schema.add_timestamp(name, dtype),
+                "TAG" => supported_schema = supported_schema.add_tag(name, dtype),
+                "FIELD" => supported_schema = supported_schema.add_field(name, dtype),
+                "TIMESTAMP" => supported_schema = supported_schema.add_timestamp(name, dtype),
                 _ => {}
             }
         }
@@ -377,7 +377,7 @@ async fn fetch_table_schema(
         return Err(format!("no columns found for table `{table_name}`"));
     }
     Ok(Some(FetchedTableSchema {
-        schema: table_schema,
+        supported_schema,
         json2_columns,
         fingerprint,
         unsupported_columns,
@@ -628,7 +628,7 @@ fn insert<'a>(
 
     let (inserts, auto_created_with_json2) = match table_schema_res {
         Ok(Some(FetchedTableSchema {
-            schema: s,
+            supported_schema,
             json2_columns,
             fingerprint,
             unsupported_columns,
@@ -649,7 +649,7 @@ fn insert<'a>(
             // the columns inferred from the input rows. GreptimeDB adds unknown
             // columns automatically, so new input fields are no longer dropped.
             use greptimedb_ingester::api::v1::ColumnSchema;
-            let server_columns: Vec<ColumnSchema> = s
+            let server_columns: Vec<ColumnSchema> = supported_schema
                 .columns()
                 .iter()
                 .map(|c| {
@@ -800,7 +800,7 @@ fn stream_start<'a>(
         )
             .encode(env));
     }
-    let table_template = metadata.schema;
+    let table_template = metadata.supported_schema;
 
     let schema_clone = table_template.clone();
 

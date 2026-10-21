@@ -32,6 +32,8 @@ groups() ->
         t_insert_sync_altered_default_invalidates_cache,
         t_insert_sync_mixed_batch_last_row_order,
         t_insert_sync_mixed_batch_atomicity,
+        t_insert_unsupported_column_isolation,
+        t_schema_discovery_error_propagation,
         t_insert_sync_schema_conflict,
         t_insert_sync_new_field_existing_table,
         t_insert_sync_new_tag_existing_table,
@@ -41,8 +43,6 @@ groups() ->
         t_insert_sync_new_duplicate_key_prefers_field,
         t_insert_sync_json2_auto_create,
         t_insert_sync_json2_existing_table,
-        t_insert_sync_json2_with_unsupported_column,
-        t_insert_sync_schema_errors,
         t_insert_sync_json2_new_field_existing_table,
         t_query_sync,
         t_insert_async,
@@ -1417,7 +1417,7 @@ t_insert_sync_json2_existing_table(Config) ->
 
     ok = greptimedb_rs:stop_client(Client).
 
-t_insert_sync_json2_with_unsupported_column(Config) ->
+t_insert_unsupported_column_isolation(Config) ->
     {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
     Table = ?table(Config),
     Create = <<
@@ -1466,7 +1466,7 @@ t_insert_sync_json2_with_unsupported_column(Config) ->
     ),
     ok = greptimedb_rs:stop_client(Client).
 
-t_insert_sync_schema_errors(Config) ->
+t_schema_discovery_error_propagation(Config) ->
     {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
     Table = ?table(Config),
     ?assertMatch(
