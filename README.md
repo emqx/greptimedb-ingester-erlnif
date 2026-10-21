@@ -4,7 +4,7 @@ High-performance Erlang client for [GreptimeDB](https://greptime.com/), built on
 
 ## Features
 
-- **High Performance**: Direct binding to the Rust Ingester SDK with per-connection Tokio runtime for optimal isolation and throughput.
+- **High Performance**: Direct binding to the Rust Ingester SDK with one shared Tokio runtime and asynchronous network tasks.
 - **Async & Sync API**: Flexible API supporting both blocking calls and non-blocking async callbacks.
 - **Stream Ingestion**: Efficient streaming support for high-throughput data ingestion.
 - **Connection Pooling**: Robust connection management implemented in Erlang using ecpool.
@@ -41,7 +41,7 @@ Initialize the client with your GreptimeDB endpoint configuration.
 Opts = #{
     endpoints => [<<"127.0.0.1:4001">>], % List of gRPC endpoints
     dbname => <<"public">>,
-    pool_size => 8,       % Optional: Number of backend connections
+    pool_size => 8,       % Optional: Number of pooled client instances
     pool_type => random   % Optional: 'random' or 'round_robin'
 },
 {ok, Client} = greptimedb_rs:start_client(Opts).
@@ -53,6 +53,68 @@ Opts = #{
 
 - `ts_column` (optional): Timestamp column name used when auto-creating tables. Default is `<<"ts">>`.
 - `ttl` (optional): TTL hint for auto-created tables. Example: `<<"3 days">>`.
+
+**Operation Timeouts:**
+
+- `request_timeout`: Positive milliseconds for query and insert; default `10000`.
+- `stream_timeout`: Positive milliseconds for stream start, write and close; default `30000`.
+
+RPC timeouts are controlled by the operation deadline rather than the SDK's default 10-second request timeout. The SDK retains its connection establishment timeout. The streaming writer's internal timeout follows `stream_timeout`; the operation deadline also includes queueing and conversion time.
+
+The deadline starts when the public API accepts the call and includes library queueing, schema discovery, RPC and response consumption. Query/insert/write timeouts return `{error, timeout}` or invoke the existing asynchronous callback with that result. Stream start and close retain their existing best effort public return semantics.
+
+The deadline also includes input submission, but copying terms into `OwnedEnv`
+is synchronous and cannot be interrupted. Large inputs can delay timeout delivery
+until the NIF returns, even on a dirty CPU scheduler. Callers should bound each
+submitted batch; the timeout is not a hard wall-clock bound for input copying.
+
+Timeouts cancel local work and do not undo writes already accepted by the server. Uncertain writes are not automatically retried. After a streaming write timeout or error, establish a new writer using `stream_start/3` before writing again.
+
+### Shared runtime
+
+All pools share one Tokio runtime. Queries, inserts and streaming requests run as `Send` tasks on Tokio workers. Defaults are two Tokio workers, one runtime lifecycle thread, and two codec workers for row conversion and large query result encoding. Structurally bounded small submissions (at most 128 rows and 16 KiB of binary data) avoid a dirty CPU scheduler handoff. Small inserts and streaming batches against schemas of at most eight short column names can convert inline in their Tokio task; other conversions use codec workers. The lifecycle thread handles shutdown and writer draining.
+
+Configure worker counts before starting the application:
+
+```erlang
+application:load(greptimedb_rs),
+application:set_env(greptimedb_rs, runtime_workers, 2),
+application:set_env(greptimedb_rs, codec_workers, 2),
+application:ensure_all_started(greptimedb_rs).
+```
+
+Both settings accept 1–64 and take effect on application restart. The codec pool accepts at most `2 * codec_workers` queued and running jobs; additional operations wait asynchronously within their deadline. Running codec work finishes before its client slot is released after cancellation.
+
+Query replies encode inline only within a budget of 256 rows in total, eight
+columns per batch and 16 KiB of estimated Arrow array memory. The budget check
+examines at most 256 batches and only flat array types; other replies use codec
+workers. Shared buffer capacity can conservatively select the codec path even
+when the returned values are small.
+
+Application startup returns an error when native runtime creation fails. Connections
+attempted during runtime startup or shutdown fail promptly rather than waiting for
+native threads to start or exit. A poisoned native client state lock closes that
+client and cancels its active request while retaining codec work until reclamation.
+The affected pool connection must be recreated. Async callback exceptions are logged
+as `greptimedb_callback_failed`; the worker continues processing requests.
+
+Stopping a pool rejects new requests, cancels active queries and inserts, and lets
+active stream writes/closes finish before flushing remaining writers. These waits
+share one `stream_timeout` deadline; expiry cancels unfinished work. ecpool
+can force termination earlier (currently about 300ms per connection). Call
+`stream_close/1` explicitly before stopping when more time is needed; its existing
+public return value still suppresses finish errors.
+
+Normal application shutdown finishes idle stream writers alongside active stream
+operations, including writers returned by those operations, before closing the
+runtime. The application setting `shutdown_timeout` provides one total
+deadline starting when native shutdown is signalled (default `5000`ms, range
+`1`–`30000`ms). In-flight stream write/close operations share this deadline;
+queries and inserts are cancelled. Expiry cancels unfinished drains; failed writes
+are not retried.
+Running codec jobs still need to finish safely, so this setting does not impose a
+hard limit on total shutdown time. Abnormal runtime owner exits skip writer draining.
+Clients with `auto_reconnect` can reconnect after a runtime owner restart.
 
 **Connection with Authentication:**
 
@@ -237,7 +299,7 @@ For optimal performance, consider these best practices:
 
 3. **Use Atom Keys**: Always use atom keys (`:timestamp`, `:ts`, `:tags`, `:fields`) in row maps. Binary keys are no longer supported and atom keys provide ~50% faster map lookups.
 
-4. **Connection Pooling**: Each connection has its own Tokio runtime for better isolation and resource management. Use `pool_size` to match your concurrency needs (default: 8).
+4. **Connection Pooling**: Each pool worker owns a client instance; all pools share the library Tokio runtime. `pool_size` controls client concurrency (default: 8); the SDK manages the underlying TCP/gRPC connections.
 
 5. **Stream for Bulk Ingestion**: For continuous high-volume writes, use streaming API (`stream_start/3`, `stream_write/2`) which maintains persistent connections and reduces connection overhead.
 
@@ -260,3 +322,56 @@ Stop the client to close all connections.
 ```erlang
 greptimedb_rs:stop_client(Client).
 ```
+
+## Development checks
+
+`make fmt` formats Erlang code and checks Rust formatting. `make lint` runs Elvis
+against Erlang sources, headers, tests and `rebar.config`; rules are in
+`elvis.config`. GitHub CI checks both formatting and Elvis rules.
+
+## Regression tests
+
+Run the real network fault, runtime lifecycle and codec cancellation tests using a GreptimeDB executable:
+
+```bash
+make regression GREPTIME_BIN=/path/to/greptime
+```
+
+The Common Test suite starts and stops its own local database and transparent HTTP/2 fault proxy. Results use the standard Common Test report. Existing TCP, TLS and authentication suites run with `make ct-docker`.
+
+### Performance regression benchmark
+
+On Linux, run the ten query, synchronous/asynchronous insert and streaming scenarios
+against a local GreptimeDB executable:
+
+```bash
+make benchmark GREPTIME_BIN=/path/to/greptime
+```
+
+To compare with a separately built baseline, set `BASELINE_APP` to its application
+directory containing `ebin/` and `priv/`:
+
+```bash
+BASELINE_APP=/path/to/baseline/_build/default/lib/greptimedb_rs \
+  make benchmark GREPTIME_BIN=/path/to/greptime
+```
+
+The benchmark runs three rounds with alternating version order and a fresh VM and
+database for every scenario. Each run checks results and stored row counts. Stream
+timing includes finish and acknowledgements. Stream callers use the pool's writers
+(four by default, one per connection), all sharing one Tokio runtime. CSV output
+includes throughput, P50/P95/P99, client/server CPU time, sampled
+RSS and thread counts. Logs and build hashes are retained in the printed output directory.
+
+Optional environment settings: `BENCH_ROUNDS` (1–10, default 3), `BENCH_CASE`
+(for example `stream5000`), `BENCH_POOL_SIZE` (default 4), `BENCH_RUNTIME_WORKERS`
+and `BENCH_CODEC_WORKERS` (both default 2), and `BENCH_OUT` (a fresh output directory).
+`BENCH_APP` can select an already built current application when invoking
+`bash scripts/benchmark.sh` directly. Worker settings apply to the shared-runtime
+version; the baseline retains its runtime implementation.
+
+CPU time measures equal completed work. RSS includes BEAM, NIF and prebuilt input
+data; `ready_rss_kb` is measured after input preparation, while `pool_idle_rss_kb`
+is measured before it. Peak RSS is sampled every 20ms. Compare round medians and
+latency distributions; short runs on shared machines are not a strict CI performance
+gate. This benchmark runs manually; the correctness regression suite runs in CI.

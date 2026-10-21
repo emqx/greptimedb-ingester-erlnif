@@ -11,9 +11,11 @@ crate-type = ["cdylib"]
 
 [dependencies]
 arrow = { version = "54.2", features = ["prettyprint"] }
+crossbeam-channel = "0.5.15"
 futures = "0.3"
 greptime-proto = { git = "https://github.com/GreptimeTeam/greptime-proto.git", rev = "454c52634c3bac27de10bf0d85d5533eed1cf03f" }
-greptimedb-ingester = { git = "https://github.com/emqx/greptimedb-ingester-rust", rev = "43697c6aa29df5709c9cdc4337e08e043f4708d5" }
+greptimedb-ingester = { git = "https://github.com/emqx/greptimedb-ingester-rust", tag = "0.15.3-emqx.1" }
 log = "0.4"
 rustler = "0.37.0"
 tokio = { version = "1.40", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
