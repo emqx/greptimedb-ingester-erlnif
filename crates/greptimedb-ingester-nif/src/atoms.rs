@@ -25,4 +25,7 @@ rustler::atoms! {
     tags,
     timestamp,
     ts,
+
+    // Value type markers
+    json2,
 }
