@@ -1,9 +1,9 @@
 use arrow::array::{
     Array, ArrayRef, BinaryArray, BooleanArray, Date32Array, Date64Array, Float32Array,
     Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, LargeBinaryArray,
-    LargeStringArray, StringArray, TimestampMicrosecondArray, TimestampMillisecondArray,
-    TimestampNanosecondArray, TimestampSecondArray, UInt16Array, UInt32Array, UInt64Array,
-    UInt8Array,
+    LargeStringArray, StringArray, StringViewArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt16Array,
+    UInt32Array, UInt64Array, UInt8Array,
 };
 use arrow::datatypes::{DataType, TimeUnit};
 use arrow::record_batch::RecordBatch;
@@ -72,8 +72,59 @@ pub fn term_to_value(val: &Term, dtype: ColumnDataType) -> rustler::NifResult<Va
         ColumnDataType::TimestampMillisecond => convert_int!(val, TimestampMillisecond, i64, i64),
         ColumnDataType::TimestampMicrosecond => convert_int!(val, TimestampMicrosecond, i64, i64),
         ColumnDataType::TimestampNanosecond => convert_int!(val, TimestampNanosecond, i64, i64),
+        // Legacy JSON (jsonb) column: the value is a JSON document encoded as a
+        // string; the server converts it to jsonb binary. Encode it as
+        // `Value::String` (not `Value::Json`): the bulk row builder maps JSON
+        // columns to a `BinaryBuilder`, which only accepts `String`/`Binary`.
+        // `Value::Json` would be treated as a type mismatch and silently
+        // become NULL in release builds. JSON2 columns never reach this
+        // function: they are handled as native `JsonValue` in
+        // `util::terms_to_proto_rows_with_columns`.
+        ColumnDataType::Json => match val.decode::<Option<String>>() {
+            Ok(value) => legacy_json_value(value),
+            Err(_) => Err(rustler::Error::RaiseTerm(Box::new(
+                "Invalid value for type String".to_string(),
+            ))),
+        },
         _ => Ok(Value::Null),
     }
+}
+
+/// Converts a legacy JSON document into the representation used by both row
+/// inserts and bulk streams.
+///
+/// Legacy JSON must be sent as a string. Using `Value::Json` here would break
+/// bulk writes because `RowBatchBuilder` maps JSON columns to a binary builder.
+///
+/// The document is validated here because the bulk path copies the string into
+/// a JSON binary column without involving the server-side JSON parser; an
+/// invalid document would otherwise be persisted as corrupt jsonb bytes.
+fn legacy_json_value(value: Option<String>) -> rustler::NifResult<Value> {
+    match value {
+        Some(value) => {
+            validate_legacy_json(&value).map_err(|err| {
+                rustler::Error::RaiseTerm(Box::new(format!("Invalid legacy JSON value: {err}")))
+            })?;
+            Ok(Value::String(value))
+        }
+        None => Ok(Value::Null),
+    }
+}
+
+/// Validates a legacy JSON document without serde_json's default 128-level
+/// recursion limit. GreptimeDB accepts deeper documents, and parsing them
+/// recursively would risk overflowing the NIF thread stack, so the parser is
+/// run through serde_stacker.
+fn validate_legacy_json(value: &str) -> Result<(), serde_json::Error> {
+    use serde::Deserialize;
+
+    let mut de = serde_json::Deserializer::from_str(value);
+    de.disable_recursion_limit();
+    {
+        let stacker = serde_stacker::Deserializer::new(&mut de);
+        serde::de::IgnoredAny::deserialize(stacker)?;
+    }
+    de.end()
 }
 
 pub fn value_to_proto_value(value: Value) -> ProtoValue {
@@ -167,6 +218,9 @@ fn array_value_to_term<'a>(env: Env<'a>, array: &ArrayRef, index: usize) -> Term
             (DataType::Float64, Float64Array),
             (DataType::Utf8, StringArray),
             (DataType::LargeUtf8, LargeStringArray),
+            // GreptimeDB 1.2+ returns Arrow Utf8View for JSON2 sub-columns
+            // (e.g. `payload.name`), so decode it like any other string.
+            (DataType::Utf8View, StringViewArray),
             (DataType::Binary, BinaryArray),
             (DataType::LargeBinary, LargeBinaryArray),
             (DataType::Date32, Date32Array),
@@ -189,4 +243,106 @@ fn array_value_to_term<'a>(env: Env<'a>, array: &ArrayRef, index: usize) -> Term
             )
         ]
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use greptimedb_ingester::bulk::RecordBatchWithTimestamp;
+    use greptimedb_ingester::{Column, Row, Rows, SemanticType};
+
+    fn legacy_json_schema() -> Vec<Column> {
+        vec![
+            Column {
+                name: "ts".to_string(),
+                data_type: ColumnDataType::TimestampMillisecond,
+                semantic_type: SemanticType::Timestamp,
+                data_type_extension: None,
+            },
+            Column {
+                name: "payload".to_string(),
+                data_type: ColumnDataType::Json,
+                semantic_type: SemanticType::Field,
+                data_type_extension: None,
+            },
+        ]
+    }
+
+    fn bulk_payload_array(rows: Rows) -> BinaryArray {
+        let batches: Vec<RecordBatchWithTimestamp> = rows.try_into().expect("build record batch");
+        assert_eq!(batches.len(), 1);
+        batches[0]
+            .batch()
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .expect("JSON column uses BinaryBuilder")
+            .clone()
+    }
+
+    #[test]
+    fn legacy_json_uses_string_for_bulk_rows() {
+        let json = r#"{"name":"alice","nested":{"ok":true}}"#.to_string();
+        let value = legacy_json_value(Some(json.clone())).expect("valid JSON");
+        assert!(matches!(
+            &value,
+            Value::String(value) if value == &json
+        ));
+        assert!(matches!(
+            legacy_json_value(None).expect("null value"),
+            Value::Null
+        ));
+
+        let schema = legacy_json_schema();
+        let mut rows = Rows::new(&schema, 1).expect("create bulk rows");
+        rows.add_row(Row::from_values(vec![
+            Value::TimestampMillisecond(1),
+            value,
+        ]))
+        .expect("add legacy JSON row");
+
+        let payloads = bulk_payload_array(rows);
+        assert!(!payloads.is_null(0));
+        assert_eq!(payloads.value(0), json.as_bytes());
+    }
+
+    #[test]
+    fn legacy_json_null_stays_null_in_bulk_rows() {
+        let schema = legacy_json_schema();
+        let mut rows = Rows::new(&schema, 1).expect("create bulk rows");
+        rows.add_row(Row::from_values(vec![
+            Value::TimestampMillisecond(1),
+            legacy_json_value(None).expect("null value"),
+        ]))
+        .expect("add legacy JSON null row");
+
+        let payloads = bulk_payload_array(rows);
+        assert!(payloads.is_null(0));
+    }
+
+    #[test]
+    fn legacy_json_row_insert_uses_string_value() {
+        let json = r#"{"name":"alice"}"#.to_string();
+        let value =
+            value_to_proto_value(legacy_json_value(Some(json.clone())).expect("valid JSON"));
+        assert!(matches!(
+            value.value_data,
+            Some(ValueData::StringValue(ref value)) if value == &json
+        ));
+    }
+
+    #[test]
+    fn legacy_json_rejects_malformed_documents() {
+        assert!(legacy_json_value(Some("not-json".to_string())).is_err());
+        assert!(legacy_json_value(Some("{}trailing".to_string())).is_err());
+        assert!(legacy_json_value(Some("null".to_string())).is_ok());
+        assert!(legacy_json_value(Some("[1,2,3]".to_string())).is_ok());
+    }
+
+    #[test]
+    fn legacy_json_accepts_deeply_nested_documents() {
+        let depth = 150;
+        let doc = format!("{}1{}", "[".repeat(depth), "]".repeat(depth));
+        assert!(legacy_json_value(Some(doc)).is_ok());
+    }
 }

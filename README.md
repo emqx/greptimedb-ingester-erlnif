@@ -9,7 +9,12 @@ High-performance Erlang client for [GreptimeDB](https://greptime.com/), built on
 - **Stream Ingestion**: Efficient streaming support for high-throughput data ingestion.
 - **Connection Pooling**: Robust connection management implemented in Erlang using ecpool.
 - **SQL Execution**: Execute DDL and SQL queries directly.
-- **Full Type Support**: Supports all GreptimeDB data types including Int8-64, Float32/64, Boolean, String, Binary, Date, Datetime, and Timestamps with various precisions.
+- **Full Type Support**: Supports all GreptimeDB data types including Int8-64, Float32/64, Boolean, String, Binary, Date, Datetime, JSON/JSON2, and Timestamps with various precisions.
+
+## Compatibility
+
+This branch is tested against GreptimeDB **v1.2.1**. JSON2 support requires
+GreptimeDB v1.2.1 or newer; older server versions are not covered by CI.
 
 ## Installation
 
@@ -110,6 +115,33 @@ Row = #{
 }.
 ```
 
+#### JSON and JSON2 Fields
+
+Legacy `JSON` columns accept a binary or string containing a JSON document.
+JSON2 columns require GreptimeDB **v1.2.1 or newer** and use a structured
+`{json2, JsonBinary}` value when the table does not exist yet:
+
+```erlang
+Json2Row = #{
+    timestamp => os:system_time(millisecond),
+    fields => #{
+        <<"payload">> => {json2, <<"{\"name\":\"alice\",\"age\":30}">>}
+    }
+}.
+```
+
+For an existing JSON2 column, a plain JSON binary is also accepted.
+
+Important constraints:
+
+- JSON2 columns require append-only tables. Auto-created JSON2 tables get
+  `append_mode=true`; existing tables must already be append-only. This also
+  applies when adding a new JSON2 field to an existing table.
+- The streaming/bulk API does not support JSON2. Use `insert/3` or
+  `insert_async/4` instead.
+- JSON2 documents deeper than `serde_json`'s default 128-level recursion limit
+  are currently rejected on the client side.
+
 ### 4. Insert Data
 
 #### Synchronous Insert
@@ -155,6 +187,10 @@ Initialize a stream. The schema is automatically inferred from the `FirstRow` pr
 ```erlang
 {ok, Stream} = greptimedb_rs:stream_start(Client, Table, Row).
 ```
+
+`stream_start/3` returns `{error, Reason}` if any worker fails to initialize the
+stream. JSON2 tables are explicitly rejected by this path; use `insert/3`
+instead.
 
 ### 2. Write to Stream
 
@@ -226,6 +262,27 @@ The library supports automatic mapping from Erlang terms to GreptimeDB types bas
 | `Date`           | Integer (Days since epoch)                  | `19700`                   |
 | `Datetime`       | Integer (Milliseconds since epoch)          | `1678888888000`           |
 | `Timestamp`      | Integer (Units depend on column definition) | `1678888888000`           |
+| `JSON` (legacy)  | Binary / String containing a JSON document  | `<<"{\"a\":1}">>`         |
+| `JSON2`          | `{json2, JsonBinary}` for new tables; plain JSON binary for existing JSON2 columns | `{json2, <<"{\"a\":1}">>}` |
+
+## Known Limitations
+
+- **Sparse bulk timestamps**: bulk writes with timestamps spread across many
+  hourly windows use significantly more memory and latency in the current Rust
+  SDK. Tracked upstream in
+  [greptimedb-ingester-rust#63](https://github.com/GreptimeTeam/greptimedb-ingester-rust/issues/63).
+- **Native JSON2 type hints/defaults**: native JSON2 inserts can bypass JSON2
+  column defaults and, with `max_auto_expanded_paths=0`, a mismatched value can
+  panic the database worker. Tracked in
+  [erlnif#29](https://github.com/emqx/greptimedb-ingester-erlnif/issues/29).
+- **Legacy JSON validation cost**: legacy JSON documents are parsed for
+  validation with a depth-safe parser. Extremely deep or large documents can
+  still consume significant CPU and memory; the server's own limits apply.
+- **Cached mixed-batch defaults**: defaults are cached per connection and
+  revalidated against the current `DESCRIBE` fingerprint on every mixed batch.
+  Changes that alter the rendered default invalidate immediately. A change from
+  no default to an empty-string default can be invisible in `DESCRIBE` and may
+  take up to the 5-second cache TTL to observe.
 
 ## Performance Tips
 
