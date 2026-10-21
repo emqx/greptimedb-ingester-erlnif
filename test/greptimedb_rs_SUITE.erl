@@ -41,6 +41,8 @@ groups() ->
         t_insert_sync_new_duplicate_key_prefers_field,
         t_insert_sync_json2_auto_create,
         t_insert_sync_json2_existing_table,
+        t_insert_sync_json2_with_unsupported_column,
+        t_insert_sync_schema_errors,
         t_insert_sync_json2_new_field_existing_table,
         t_query_sync,
         t_insert_async,
@@ -1413,6 +1415,81 @@ t_insert_sync_json2_existing_table(Config) ->
     %% See above: COUNT(json2_column) includes SQL NULL rows on GreptimeDB 1.2.1.
     ?assertEqual([[2]], select_count(Client, Table, <<"COUNT(payload.name)">>)),
 
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_sync_json2_with_unsupported_column(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    Create = <<
+        "CREATE TABLE ",
+        Table/binary,
+        " (ts TIMESTAMP TIME INDEX, payload JSON2, extra DECIMAL(10,2))"
+        " WITH (append_mode='true')"
+    >>,
+    ?assertMatch({ok, _}, greptimedb_rs:query(Client, Create)),
+    Json = <<"{\"name\":\"bob\"}">>,
+    Row = fun(Ts, Fields) -> #{timestamp => Ts, fields => Fields} end,
+    ?assertEqual({ok, 1}, greptimedb_rs:insert(Client, Table, [Row(1, #{<<"payload">> => Json})])),
+    %% Adding a supported column also exercises the inferred-column fallback.
+    ?assertEqual(
+        {ok, 2},
+        greptimedb_rs:insert(Client, Table, [
+            Row(2, #{<<"payload">> => Json, <<"v">> => 2}),
+            Row(3, #{<<"v">> => 3})
+        ])
+    ),
+    Self = self(),
+    Ref = make_ref(),
+    Callback = {fun(Result) -> Self ! {Ref, Result} end, []},
+    ?assertMatch(
+        {ok, _},
+        greptimedb_rs:insert_async(Client, Table, [Row(4, #{<<"payload">> => Json})], Callback)
+    ),
+    receive
+        {Ref, Result} -> ?assertEqual({ok, 1}, Result)
+    after 5000 ->
+        ct:fail(async_write_timeout)
+    end,
+    %% An unsupported column in a later row must reject the entire batch.
+    ?assertEqual(
+        {error, <<"Unsupported type `Decimal(10, 2)` for column `extra`">>},
+        greptimedb_rs:insert(Client, Table, [
+            Row(5, #{<<"payload">> => Json}),
+            Row(6, #{<<"payload">> => Json, <<"extra">> => 1.25})
+        ])
+    ),
+    ?assertEqual(
+        {ok, [[1, <<"bob">>], [2, <<"bob">>], [3, nil], [4, <<"bob">>]]},
+        greptimedb_rs:query(
+            Client, <<"SELECT ts, payload.name FROM ", Table/binary, " ORDER BY ts">>
+        )
+    ),
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_sync_schema_errors(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ?assertMatch(
+        {ok, _},
+        greptimedb_rs:query(Client, <<
+            "CREATE TABLE ",
+            Table/binary,
+            " (ts TIMESTAMP TIME INDEX, v BIGINT, extra DECIMAL(10,2))"
+        >>)
+    ),
+    %% Bulk needs the complete schema and must not silently skip unsupported columns.
+    ?assertEqual(
+        {error, <<"Unsupported type `Decimal(10, 2)` for column `extra`">>},
+        greptimedb_rs:stream_start(Client, Table, #{})
+    ),
+    InvalidTable = <<Table/binary, "(">>,
+    {error, Reason} = greptimedb_rs:query(Client, <<"DESCRIBE ", InvalidTable/binary>>),
+    %% Preserve the schema-query error instead of attempting to encode these rows.
+    ?assertEqual(
+        {error, Reason},
+        greptimedb_rs:insert(Client, InvalidTable, [#{fields => not_a_map}])
+    ),
+    ?assertEqual([[0]], select_count(Client, Table, <<"COUNT(*)">>)),
     ok = greptimedb_rs:stop_client(Client).
 
 t_insert_sync_json2_new_field_existing_table(Config) ->

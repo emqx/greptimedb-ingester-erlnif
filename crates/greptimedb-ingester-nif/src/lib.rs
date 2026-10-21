@@ -266,12 +266,32 @@ fn execute(env: Env, resource: ResourceArc<GreptimeResource>, sql: String) -> Ni
     }
 }
 
+struct FetchedTableSchema {
+    schema: TableSchema,
+    json2_columns: std::collections::HashSet<String>,
+    fingerprint: String,
+    unsupported_columns: std::collections::HashMap<String, String>,
+}
+
 async fn fetch_table_schema(
     db: &Database,
     table_name: &str,
-) -> Result<(TableSchema, std::collections::HashSet<String>, String), String> {
+) -> Result<Option<FetchedTableSchema>, String> {
     let sql = format!("DESCRIBE {table_name}");
-    let mut stream = db.query(&sql).await.map_err(|e| e.to_string())?;
+    let mut stream = match db.query(&sql).await {
+        Ok(stream) => stream,
+        Err(greptimedb_ingester::Error::Server { status, .. })
+            if status
+                .metadata()
+                .get("x-greptime-err-code")
+                .is_some_and(|code| code == "4001") =>
+        {
+            // GreptimeDB's TableNotFound code; other NotFound errors may refer
+            // to a missing database or another resource.
+            return Ok(None);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
 
     let mut table_schema = TableSchema::builder()
         .name(table_name)
@@ -279,6 +299,7 @@ async fn fetch_table_schema(
         .map_err(|e| e.to_string())?;
     let mut json2_columns = std::collections::HashSet::new();
     let mut fingerprint = String::new();
+    let mut unsupported_columns = std::collections::HashMap::new();
     let mut seen_columns = 0;
 
     while let Some(batch_res) = futures::StreamExt::next(&mut stream).await {
@@ -334,7 +355,13 @@ async fn fetch_table_schema(
                     json2_columns.insert(name.to_string());
                     ColumnDataType::Json
                 }
-                _ => return Err(format!("Unknown column type: {type_str}")),
+                _ => {
+                    if semantic_str == "TIMESTAMP" {
+                        return Err(format!("Unsupported time index type: {type_str}"));
+                    }
+                    unsupported_columns.insert(name.to_string(), type_str.to_string());
+                    continue;
+                }
             };
 
             match semantic_str {
@@ -349,7 +376,12 @@ async fn fetch_table_schema(
     if seen_columns == 0 {
         return Err(format!("no columns found for table `{table_name}`"));
     }
-    Ok((table_schema, json2_columns, fingerprint))
+    Ok(Some(FetchedTableSchema {
+        schema: table_schema,
+        json2_columns,
+        fingerprint,
+        unsupported_columns,
+    }))
 }
 
 async fn fetch_column_defaults(
@@ -595,7 +627,24 @@ fn insert<'a>(
     let table_schema_res = runtime.block_on(fetch_table_schema(&resource.db, &table));
 
     let (inserts, auto_created_with_json2) = match table_schema_res {
-        Ok((s, json2_columns, fingerprint)) => {
+        Ok(Some(FetchedTableSchema {
+            schema: s,
+            json2_columns,
+            fingerprint,
+            unsupported_columns,
+        })) => {
+            if !unsupported_columns.is_empty() {
+                let present = util::collect_present_columns(&rows_term)?;
+                for (name, dtype) in &unsupported_columns {
+                    if present.contains(name) {
+                        return Ok((
+                            atoms::error(),
+                            format!("Unsupported type `{dtype}` for column `{name}`"),
+                        )
+                            .encode(env));
+                    }
+                }
+            }
             // Table exists: keep the server's columns and their types, then merge in
             // the columns inferred from the input rows. GreptimeDB adds unknown
             // columns automatically, so new input fields are no longer dropped.
@@ -665,8 +714,8 @@ fn insert<'a>(
                 };
             (inserts, false)
         }
-        Err(_) => {
-            // Table might not exist, infer schema locally
+        Ok(None) => {
+            // Only a confirmed missing table permits local schema inference.
             let (schema, rows) = util::terms_to_schema_and_rows(
                 rows_term,
                 resource.ts_column.as_deref().unwrap_or("ts"),
@@ -680,6 +729,7 @@ fn insert<'a>(
                 has_json2,
             )
         }
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
     };
 
     // 2. Construct Request
@@ -729,17 +779,28 @@ fn stream_start<'a>(
 
     // 1. Fetch Schema from Server
     let table_template_res = runtime.block_on(fetch_table_schema(&resource.db, &table));
-    let (table_template, json2_columns, _fingerprint) = match table_template_res {
-        Ok(s) => s,
+    let metadata = match table_template_res {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => {
+            return Ok((atoms::error(), format!("Table `{table}` not found")).encode(env));
+        }
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
-    if !json2_columns.is_empty() {
+    if !metadata.json2_columns.is_empty() {
         return Ok((
             atoms::error(),
             "stream (bulk) write does not support JSON2 columns; use insert/3 instead",
         )
             .encode(env));
     }
+    if let Some((name, dtype)) = metadata.unsupported_columns.iter().next() {
+        return Ok((
+            atoms::error(),
+            format!("Unsupported type `{dtype}` for column `{name}`"),
+        )
+            .encode(env));
+    }
+    let table_template = metadata.schema;
 
     let schema_clone = table_template.clone();
 
