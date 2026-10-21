@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use greptime_proto::v1::auth_header::AuthScheme;
 use greptime_proto::v1::Basic;
@@ -25,6 +25,50 @@ pub struct GreptimeResource {
     pub ts_column: Option<String>,
     pub ttl: Option<String>,
     pub runtime: Arc<Runtime>, // Per-connection runtime
+    defaults_cache: Mutex<DefaultsCache>,
+}
+
+struct CachedColumnDefaults {
+    fetched_at: Instant,
+    fingerprint: String,
+    values: std::collections::HashMap<String, util::ColumnDefault>,
+}
+
+struct DefaultsCache {
+    entries: std::collections::HashMap<String, CachedColumnDefaults>,
+    max_entries: usize,
+}
+
+impl DefaultsCache {
+    const MAX_ENTRIES: usize = 64;
+    const TTL: Duration = Duration::from_secs(5);
+
+    fn new() -> Self {
+        Self {
+            entries: std::collections::HashMap::new(),
+            max_entries: Self::MAX_ENTRIES,
+        }
+    }
+
+    fn evict_expired(&mut self) {
+        self.entries
+            .retain(|_, entry| entry.fetched_at.elapsed() < Self::TTL);
+    }
+
+    fn insert(&mut self, key: String, entry: CachedColumnDefaults) {
+        self.evict_expired();
+        if !self.entries.contains_key(&key) && self.entries.len() >= self.max_entries {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.fetched_at)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(key, entry);
+    }
 }
 
 // Wrapper to force Send/Sync on BulkStreamWriter
@@ -171,6 +215,7 @@ fn connect(opts: Term) -> NifResult<Term> {
         ts_column,
         ttl,
         runtime,
+        defaults_cache: Mutex::new(DefaultsCache::new()),
     });
     Ok((atoms::ok(), resource).encode(env))
 }
@@ -224,7 +269,7 @@ fn execute(env: Env, resource: ResourceArc<GreptimeResource>, sql: String) -> Ni
 async fn fetch_table_schema(
     db: &Database,
     table_name: &str,
-) -> Result<(TableSchema, std::collections::HashSet<String>), String> {
+) -> Result<(TableSchema, std::collections::HashSet<String>, String), String> {
     let sql = format!("DESCRIBE {table_name}");
     let mut stream = db.query(&sql).await.map_err(|e| e.to_string())?;
 
@@ -232,20 +277,18 @@ async fn fetch_table_schema(
         .name(table_name)
         .build()
         .map_err(|e| e.to_string())?;
-    // Names of columns whose server-side type is JSON2. DESCRIBE only reports
-    // the type name (e.g. "Json2"), so the JSON2-ness is tracked separately and
-    // the proto `ColumnSchema` is enriched with the native-JSON extension when
-    // the insert request is built.
     let mut json2_columns = std::collections::HashSet::new();
+    let mut fingerprint = String::new();
+    let mut seen_columns = 0;
 
     while let Some(batch_res) = futures::StreamExt::next(&mut stream).await {
         let batch = batch_res.map_err(|e| e.to_string())?;
 
-        // Ensure columns exist
         // 0: Field, 1: Type, 2: Null, 3: Key, 4: Default, 5: Semantic Type
         if batch.num_columns() < 6 {
             return Err("DESCRIBE result has unexpected number of columns".to_string());
         }
+        seen_columns += batch.num_rows();
 
         for i in 0..batch.num_rows() {
             let name = string_value(batch.column(0).as_ref(), i)
@@ -254,6 +297,15 @@ async fn fetch_table_schema(
                 .ok_or("DESCRIBE returned a NULL column type")?;
             let semantic_str = string_value(batch.column(5).as_ref(), i)
                 .ok_or("DESCRIBE returned a NULL semantic type")?;
+            let default = string_value(batch.column(4).as_ref(), i).unwrap_or_default();
+            fingerprint.push_str(name);
+            fingerprint.push('\u{1f}');
+            fingerprint.push_str(type_str);
+            fingerprint.push('\u{1f}');
+            fingerprint.push_str(semantic_str);
+            fingerprint.push('\u{1f}');
+            fingerprint.push_str(default);
+            fingerprint.push('\u{1e}');
 
             let dtype = match type_str {
                 "Int8" => ColumnDataType::Int8,
@@ -277,7 +329,7 @@ async fn fetch_table_schema(
                 "TimestampNanosecond" => ColumnDataType::TimestampNanosecond,
                 // Legacy JSON (jsonb) column.
                 "Json" => ColumnDataType::Json,
-                // JSON2 column (DESCRIBE reports "Json2").
+                // JSON2 column.
                 _ if type_str.starts_with("Json2") => {
                     json2_columns.insert(name.to_string());
                     ColumnDataType::Json
@@ -294,7 +346,10 @@ async fn fetch_table_schema(
         }
     }
 
-    Ok((table_schema, json2_columns))
+    if seen_columns == 0 {
+        return Err(format!("no columns found for table `{table_name}`"));
+    }
+    Ok((table_schema, json2_columns, fingerprint))
 }
 
 async fn fetch_column_defaults(
@@ -347,12 +402,10 @@ async fn fetch_column_defaults(
             let Some(default) = string_value(batch.column(1).as_ref(), i) else {
                 continue;
             };
-            let default = if default == "Null" {
-                util::ColumnDefault::Null
-            } else {
-                util::ColumnDefault::Value(default.to_string())
-            };
-            default_values.insert(name.to_string(), default);
+            default_values.insert(
+                name.to_string(),
+                util::ColumnDefault::Value(default.to_string()),
+            );
         }
     }
     if seen_columns == 0 {
@@ -364,7 +417,9 @@ async fn fetch_column_defaults(
 
     let null_columns: Vec<String> = default_values
         .iter()
-        .filter(|(_, default)| matches!(default, util::ColumnDefault::Null))
+        .filter(
+            |(_, default)| matches!(default, util::ColumnDefault::Value(value) if value == "Null"),
+        )
         .map(|(name, _)| name.clone())
         .collect();
     if !null_columns.is_empty() {
@@ -383,8 +438,53 @@ async fn fetch_column_defaults(
             default_values.insert(name, default);
         }
     }
-
     Ok(default_values)
+}
+
+fn cached_column_defaults(
+    resource: &GreptimeResource,
+    runtime: &Runtime,
+    table: &str,
+    fingerprint: &str,
+) -> Result<std::collections::HashMap<String, util::ColumnDefault>, String> {
+    let cache_key = format!("{}|{}", resource.db.dbname(), table);
+    {
+        let mut cache = resource
+            .defaults_cache
+            .lock()
+            .map_err(|_| "column defaults cache is poisoned".to_string())?;
+        cache.evict_expired();
+        if let Some(entry) = cache.entries.get(&cache_key) {
+            if entry.fingerprint == fingerprint {
+                return Ok(entry.values.clone());
+            }
+        }
+    }
+
+    let values = runtime.block_on(fetch_column_defaults(&resource.db, table))?;
+    // Do not cache ambiguous/empty defaults; they can change without changing
+    // the DESCRIBE-rendered default hint.
+    let ambiguous = values.values().any(|default| match default {
+        util::ColumnDefault::Null => true,
+        util::ColumnDefault::Value(value) => value.is_empty() || value == "Null",
+    });
+    if ambiguous {
+        return Ok(values);
+    }
+
+    let mut cache = resource
+        .defaults_cache
+        .lock()
+        .map_err(|_| "column defaults cache is poisoned".to_string())?;
+    cache.insert(
+        cache_key,
+        CachedColumnDefaults {
+            fetched_at: Instant::now(),
+            fingerprint: fingerprint.to_string(),
+            values: values.clone(),
+        },
+    );
+    Ok(values)
 }
 
 async fn fetch_create_table_ddl(db: &Database, table_name: &str) -> Result<String, String> {
@@ -495,7 +595,7 @@ fn insert<'a>(
     let table_schema_res = runtime.block_on(fetch_table_schema(&resource.db, &table));
 
     let (inserts, auto_created_with_json2) = match table_schema_res {
-        Ok((s, json2_columns)) => {
+        Ok((s, json2_columns, fingerprint)) => {
             // Table exists: keep the server's columns and their types, then merge in
             // the columns inferred from the input rows. GreptimeDB adds unknown
             // columns automatically, so new input fields are no longer dropped.
@@ -519,25 +619,51 @@ fn insert<'a>(
                 })
                 .collect();
 
-            let merged = util::merge_inferred_columns(server_columns, &rows_term)?;
-            let present = util::collect_present_columns(&rows_term)?;
-            let schema = util::retain_present_columns(&merged, &present);
-            let defaults = if util::rows_have_same_presence(&rows_term)? {
-                std::collections::HashMap::new()
-            } else {
-                runtime
-                    .block_on(fetch_column_defaults(&resource.db, &table))
-                    .map_err(|e| rustler::Error::RaiseTerm(Box::new(e)))?
-            };
-            let rows =
-                util::terms_to_proto_rows_with_columns_and_defaults(&schema, rows_term, &defaults)?;
-            (
-                vec![RowInsertRequest {
-                    table_name: table.clone(),
-                    rows: Some(Rows { schema, rows }),
-                }],
-                false,
-            )
+            let inserts =
+                if let Some(plan) = util::analyze_known_columns(&server_columns, &rows_term)? {
+                    let schema: Vec<ColumnSchema> = plan
+                        .column_indices
+                        .iter()
+                        .map(|&index| server_columns[index].clone())
+                        .collect();
+                    let defaults = if plan.all_same {
+                        std::collections::HashMap::new()
+                    } else {
+                        cached_column_defaults(&resource, runtime, &table, &fingerprint)
+                            .map_err(|e| rustler::Error::RaiseTerm(Box::new(e)))?
+                    };
+                    let rows = util::terms_to_proto_rows_from_plan(
+                        env,
+                        &server_columns,
+                        &plan.column_indices,
+                        &plan.row_terms,
+                        &plan.row_masks,
+                        plan.words,
+                        &defaults,
+                    )?;
+                    vec![RowInsertRequest {
+                        table_name: table.clone(),
+                        rows: Some(Rows { schema, rows }),
+                    }]
+                } else {
+                    let merged = util::merge_inferred_columns(server_columns, &rows_term)?;
+                    let present = util::collect_present_columns(&rows_term)?;
+                    let schema = util::retain_present_columns(&merged, &present);
+                    let defaults = if util::rows_have_same_presence(&rows_term)? {
+                        std::collections::HashMap::new()
+                    } else {
+                        cached_column_defaults(&resource, runtime, &table, &fingerprint)
+                            .map_err(|e| rustler::Error::RaiseTerm(Box::new(e)))?
+                    };
+                    let rows = util::terms_to_proto_rows_with_columns_and_defaults(
+                        &schema, rows_term, &defaults,
+                    )?;
+                    vec![RowInsertRequest {
+                        table_name: table.clone(),
+                        rows: Some(Rows { schema, rows }),
+                    }]
+                };
+            (inserts, false)
         }
         Err(_) => {
             // Table might not exist, infer schema locally
@@ -603,7 +729,7 @@ fn stream_start<'a>(
 
     // 1. Fetch Schema from Server
     let table_template_res = runtime.block_on(fetch_table_schema(&resource.db, &table));
-    let (table_template, json2_columns) = match table_template_res {
+    let (table_template, json2_columns, _fingerprint) = match table_template_res {
         Ok(s) => s,
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
@@ -701,6 +827,41 @@ fn stream_close(env: Env, resource: ResourceArc<StreamWriterResource>) -> NifRes
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn defaults_cache_evicts_expired_and_oldest_entries() {
+        let mut cache = DefaultsCache::new();
+        cache.max_entries = 2;
+        let entry = |fingerprint: &str, fetched_at: Instant| CachedColumnDefaults {
+            fetched_at,
+            fingerprint: fingerprint.to_string(),
+            values: std::collections::HashMap::new(),
+        };
+
+        cache.insert(
+            "expired".to_string(),
+            entry("expired", Instant::now() - Duration::from_secs(10)),
+        );
+        cache.evict_expired();
+        assert!(cache.entries.is_empty());
+
+        cache.insert(
+            "a".to_string(),
+            entry("a", Instant::now() - Duration::from_secs(4)),
+        );
+        cache.insert(
+            "b".to_string(),
+            entry("b", Instant::now() - Duration::from_secs(3)),
+        );
+        cache.insert(
+            "c".to_string(),
+            entry("c", Instant::now() - Duration::from_secs(2)),
+        );
+        assert_eq!(cache.entries.len(), 2);
+        assert!(!cache.entries.contains_key("a"));
+        assert!(cache.entries.contains_key("b"));
+        assert!(cache.entries.contains_key("c"));
+    }
 
     #[test]
     fn distinguishes_sql_null_from_string_null_in_ddl() {

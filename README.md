@@ -278,6 +278,11 @@ The library supports automatic mapping from Erlang terms to GreptimeDB types bas
 - **Legacy JSON validation cost**: legacy JSON documents are parsed for
   validation with a depth-safe parser. Extremely deep or large documents can
   still consume significant CPU and memory; the server's own limits apply.
+- **Cached mixed-batch defaults**: defaults are cached per connection and
+  revalidated against the current `DESCRIBE` fingerprint on every mixed batch.
+  Changes that alter the rendered default invalidate immediately. A change from
+  no default to an empty-string default can be invisible in `DESCRIBE` and may
+  take up to the 5-second cache TTL to observe.
 
 ## Performance Tips
 

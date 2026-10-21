@@ -26,6 +26,29 @@ pub enum ColumnDefault {
     Value(String),
 }
 
+pub struct RowTerms<'a> {
+    fields: Option<Term<'a>>,
+    tags: Option<Term<'a>>,
+    timestamp: Option<Term<'a>>,
+}
+
+pub struct KnownBatchPlan<'a> {
+    pub row_terms: Vec<RowTerms<'a>>,
+    pub row_masks: Vec<u64>,
+    pub words: usize,
+    pub all_same: bool,
+    pub column_indices: Vec<usize>,
+}
+
+type PlanColumnMeta<'a> = (
+    usize,
+    SemanticType,
+    Term<'a>,
+    ColumnDataType,
+    bool,
+    Option<Result<ProtoValue, String>>,
+);
+
 pub fn terms_to_rows<'a>(
     table_schema: &TableSchema,
     rows_term: Vec<Term<'a>>,
@@ -374,14 +397,7 @@ pub fn terms_to_proto_rows_with_columns_and_defaults<'a>(
             };
 
             let val = if let Some(t) = val_term {
-                if *is_json2 {
-                    match json2_str(t)? {
-                        Some(json) => json2_proto_value(&json)?,
-                        None => none_value(),
-                    }
-                } else {
-                    types::term_to_proto_value(&t, *dtype)?
-                }
+                encode_term_value(t, *dtype, *is_json2)?
             } else if let Some(default) = default {
                 match default {
                     Ok(value) => value.clone(),
@@ -397,6 +413,21 @@ pub fn terms_to_proto_rows_with_columns_and_defaults<'a>(
         rows.push(ProtoRow { values });
     }
     Ok(rows)
+}
+
+fn encode_term_value(
+    value: Term,
+    dtype: ColumnDataType,
+    is_json2: bool,
+) -> rustler::NifResult<ProtoValue> {
+    if is_json2 {
+        match json2_str(value)? {
+            Some(json) => json2_proto_value(&json),
+            None => Ok(none_value()),
+        }
+    } else {
+        types::term_to_proto_value(&value, dtype)
+    }
 }
 
 /// Merges the columns known by the server with the columns inferred from the
@@ -520,6 +551,168 @@ fn row_present_columns<'a>(
         }
     }
     Ok(present)
+}
+
+/// Builds a fast-path plan when every input key is already a server column.
+///
+/// The plan caches row terms, records column presence as a compact bitset, and
+/// computes union/uniformity in one pass. Unknown keys return `None` so the
+/// caller can use the inference-capable slow path.
+pub fn analyze_known_columns<'a>(
+    columns: &[ColumnSchema],
+    rows_term: &[Term<'a>],
+) -> rustler::NifResult<Option<KnownBatchPlan<'a>>> {
+    if rows_term.is_empty() {
+        return Ok(Some(KnownBatchPlan {
+            row_terms: Vec::new(),
+            row_masks: Vec::new(),
+            words: 0,
+            all_same: true,
+            column_indices: Vec::new(),
+        }));
+    }
+
+    let env = rows_term[0].get_env();
+    let atom_fields = atoms::fields().to_term(env);
+    let atom_tags = atoms::tags().to_term(env);
+    let atom_timestamp = atoms::timestamp().to_term(env);
+    let atom_ts = atoms::ts().to_term(env);
+    let name_to_index: HashMap<Vec<u8>, usize> = columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| (column.column_name.as_bytes().to_vec(), index))
+        .collect();
+    let words = columns.len().div_ceil(64);
+    let mut row_masks = vec![0u64; rows_term.len() * words];
+    let mut row_terms = Vec::with_capacity(rows_term.len());
+
+    for (row_index, row_term) in rows_term.iter().enumerate() {
+        let fields = row_term.map_get(atom_fields).ok();
+        let tags = row_term.map_get(atom_tags).ok();
+        let timestamp = row_term
+            .map_get(atom_timestamp)
+            .ok()
+            .or_else(|| row_term.map_get(atom_ts).ok());
+
+        for map in [fields, tags].into_iter().flatten() {
+            for (key, _) in map
+                .decode::<rustler::MapIterator>()
+                .map_err(|_| rustler::Error::BadArg)?
+            {
+                let known = if let Ok(binary) = key.decode::<rustler::Binary>() {
+                    name_to_index.get(binary.as_slice()).copied()
+                } else {
+                    let name = term_to_string(key)?;
+                    name_to_index.get(name.as_bytes()).copied()
+                };
+                let Some(column_index) = known else {
+                    return Ok(None);
+                };
+                row_masks[row_index * words + column_index / 64] |= 1 << (column_index % 64);
+            }
+        }
+
+        row_terms.push(RowTerms {
+            fields,
+            tags,
+            timestamp,
+        });
+    }
+
+    let mut union = vec![0u64; words];
+    let first = row_masks[..words].to_vec();
+    let mut all_same = true;
+    for row_index in 0..rows_term.len() {
+        let mask = &row_masks[row_index * words..(row_index + 1) * words];
+        all_same &= mask == first;
+        for (word, value) in mask.iter().enumerate() {
+            union[word] |= value;
+        }
+    }
+
+    let column_indices = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(index, column)| {
+            let timestamp =
+                SemanticType::try_from(column.semantic_type) == Ok(SemanticType::Timestamp);
+            let present = (union[index / 64] & (1 << (index % 64))) != 0;
+            (timestamp || present).then_some(index)
+        })
+        .collect();
+
+    Ok(Some(KnownBatchPlan {
+        row_terms,
+        row_masks,
+        words,
+        all_same,
+        column_indices,
+    }))
+}
+
+/// Encodes rows from a known-column `KnownBatchPlan`.
+pub fn terms_to_proto_rows_from_plan<'a>(
+    env: rustler::Env<'a>,
+    columns: &[ColumnSchema],
+    column_indices: &[usize],
+    row_terms: &[RowTerms<'a>],
+    row_masks: &[u64],
+    words: usize,
+    defaults: &HashMap<String, ColumnDefault>,
+) -> rustler::NifResult<Vec<ProtoRow>> {
+    if row_terms.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let col_meta: Vec<PlanColumnMeta<'a>> = column_indices
+        .iter()
+        .map(|&original_index| {
+            let column = &columns[original_index];
+            (
+                original_index,
+                SemanticType::try_from(column.semantic_type).unwrap_or(SemanticType::Field),
+                column.column_name.encode(env),
+                ColumnDataType::try_from(column.datatype).unwrap_or(ColumnDataType::String),
+                is_json2_column(column),
+                defaults
+                    .get(&column.column_name)
+                    .map(|default| parse_column_default(default, column)),
+            )
+        })
+        .collect();
+
+    let mut rows = Vec::with_capacity(row_terms.len());
+    for (row_index, row) in row_terms.iter().enumerate() {
+        let mask = &row_masks[row_index * words..(row_index + 1) * words];
+        let mut values = Vec::with_capacity(col_meta.len());
+        for (original_index, semantic, key_term, dtype, is_json2, default) in &col_meta {
+            let present = *semantic == SemanticType::Timestamp
+                || (words > 0 && (mask[original_index / 64] & (1 << (original_index % 64))) != 0);
+            let value = if present {
+                let val_term = match semantic {
+                    SemanticType::Field => row.fields.and_then(|map| map.map_get(*key_term).ok()),
+                    SemanticType::Tag => row.tags.and_then(|map| map.map_get(*key_term).ok()),
+                    SemanticType::Timestamp => row.timestamp,
+                };
+                match val_term {
+                    Some(term) => encode_term_value(term, *dtype, *is_json2)?,
+                    None => none_value(),
+                }
+            } else if let Some(default) = default {
+                match default {
+                    Ok(value) => value.clone(),
+                    Err(reason) => {
+                        return Err(rustler::Error::RaiseTerm(Box::new(reason.clone())));
+                    }
+                }
+            } else {
+                none_value()
+            };
+            values.push(value);
+        }
+        rows.push(ProtoRow { values });
+    }
+    Ok(rows)
 }
 
 /// Keeps the columns provided by a row group, plus timestamp columns.

@@ -28,6 +28,8 @@ groups() ->
         t_insert_sync_omitted_column_defaults,
         t_insert_sync_server_rendered_defaults,
         t_insert_sync_catalog_qualified_dbname,
+        t_insert_sync_recreated_table_defaults,
+        t_insert_sync_altered_default_invalidates_cache,
         t_insert_sync_mixed_batch_last_row_order,
         t_insert_sync_mixed_batch_atomicity,
         t_insert_sync_schema_conflict,
@@ -727,6 +729,106 @@ t_insert_sync_catalog_qualified_dbname(Config) ->
         greptimedb_rs:query(CatalogClient, Sql)
     ),
     ok = greptimedb_rs:stop_client(CatalogClient).
+
+t_insert_sync_recreated_table_defaults(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    Create = fun(Default) ->
+        DropSql = iolist_to_binary(io_lib:format("DROP TABLE IF EXISTS ~s", [Table])),
+        _ = greptimedb_rs:query(Client, DropSql),
+        CreateSql = iolist_to_binary(
+            io_lib:format(
+                "CREATE TABLE ~s ("
+                "ts TIMESTAMP TIME INDEX, "
+                "temperature DOUBLE, "
+                "default_label STRING NOT NULL DEFAULT '~s'"
+                ") ENGINE=mito",
+                [Table, Default]
+            )
+        ),
+        ?assertMatch({ok, _}, greptimedb_rs:query(Client, CreateSql))
+    end,
+    Insert = fun(Ts) ->
+        ?assertMatch(
+            {ok, _},
+            greptimedb_rs:insert(Client, Table, [
+                #{fields => #{<<"temperature">> => 1.0}, timestamp => Ts},
+                #{
+                    fields => #{<<"temperature">> => 2.0, <<"default_label">> => <<"explicit">>},
+                    timestamp => Ts + 1
+                }
+            ])
+        )
+    end,
+    Select = fun() ->
+        Sql = iolist_to_binary(
+            io_lib:format("SELECT default_label, temperature FROM ~s ORDER BY ts", [Table])
+        ),
+        {ok, Rows} = greptimedb_rs:query(Client, Sql),
+        Rows
+    end,
+
+    Create("one"),
+    Insert(erlang:system_time(millisecond)),
+    timer:sleep(500),
+    ?assertEqual([[<<"one">>, 1.0], [<<"explicit">>, 2.0]], Select()),
+
+    %% Recreate the table with a different default. The next mixed batch must
+    %% observe the current server default, not a value cached from the old table.
+    Create("two"),
+    Insert(erlang:system_time(millisecond)),
+    timer:sleep(500),
+    ?assertEqual([[<<"two">>, 1.0], [<<"explicit">>, 2.0]], Select()),
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_sync_altered_default_invalidates_cache(Config) ->
+    Opts = (?conn_opts(Config))#{pool_size => 1},
+    {ok, Client} = greptimedb_rs:start_client(Opts),
+    Table = ?table(Config),
+    CreateTableSql = iolist_to_binary(
+        io_lib:format(
+            "CREATE TABLE ~s ("
+            "ts TIMESTAMP TIME INDEX, "
+            "temperature DOUBLE, "
+            "default_label STRING NOT NULL DEFAULT 'one'"
+            ") ENGINE=mito",
+            [Table]
+        )
+    ),
+    ?assertMatch({ok, _}, greptimedb_rs:query(Client, CreateTableSql)),
+    Insert = fun(Ts) ->
+        ?assertMatch(
+            {ok, _},
+            greptimedb_rs:insert(Client, Table, [
+                #{fields => #{<<"temperature">> => 1.0}, timestamp => Ts},
+                #{
+                    fields => #{<<"temperature">> => 2.0, <<"default_label">> => <<"explicit">>},
+                    timestamp => Ts + 1
+                }
+            ])
+        )
+    end,
+    Ts = erlang:system_time(millisecond),
+    Insert(Ts),
+    AlterSql = iolist_to_binary(
+        io_lib:format("ALTER TABLE ~s MODIFY COLUMN default_label SET DEFAULT 'two'", [Table])
+    ),
+    ?assertMatch({ok, _}, greptimedb_rs:query(Client, AlterSql)),
+    Insert(Ts + 2),
+    timer:sleep(500),
+    Sql = iolist_to_binary(
+        io_lib:format("SELECT default_label, temperature FROM ~s ORDER BY ts", [Table])
+    ),
+    ?assertEqual(
+        {ok, [
+            [<<"one">>, 1.0],
+            [<<"explicit">>, 2.0],
+            [<<"two">>, 1.0],
+            [<<"explicit">>, 2.0]
+        ]},
+        greptimedb_rs:query(Client, Sql)
+    ),
+    ok = greptimedb_rs:stop_client(Client).
 
 t_insert_sync_mixed_batch_last_row_order(Config) ->
     {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
