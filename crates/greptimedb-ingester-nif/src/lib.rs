@@ -277,7 +277,7 @@ async fn fetch_table_schema(
     db: &Database,
     table_name: &str,
 ) -> Result<Option<FetchedTableSchema>, String> {
-    let sql = format!("DESCRIBE {table_name}");
+    let sql = format!("DESCRIBE {}", sql_identifier(table_name));
     let mut stream = match db.query(&sql).await {
         Ok(stream) => stream,
         Err(greptimedb_ingester::Error::Server { status, .. })
@@ -388,28 +388,18 @@ async fn fetch_column_defaults(
     db: &Database,
     table_name: &str,
 ) -> Result<std::collections::HashMap<String, util::ColumnDefault>, String> {
-    let (db_catalog, _) = split_dbname(db.dbname());
-    let (catalog, schema_name, bare_table_name) = match table_name.rsplit_once('.') {
-        Some((schema_part, table)) => {
-            let (catalog, schema) = split_dbname(schema_part);
-            (catalog.or(db_catalog), schema, table)
-        }
-        None => {
-            let (catalog, schema) = split_dbname(db.dbname());
-            (catalog, schema, table_name)
-        }
-    };
+    let (catalog, schema_name) = split_dbname(db.dbname());
     let where_clause = match catalog {
         Some(catalog) => format!(
             "table_catalog = {} AND table_schema = {} AND table_name = {}",
             sql_string_literal(catalog),
             sql_string_literal(schema_name),
-            sql_string_literal(bare_table_name)
+            sql_string_literal(table_name)
         ),
         None => format!(
             "table_schema = {} AND table_name = {}",
             sql_string_literal(schema_name),
-            sql_string_literal(bare_table_name)
+            sql_string_literal(table_name)
         ),
     };
     let sql = format!(
@@ -520,7 +510,7 @@ fn cached_column_defaults(
 }
 
 async fn fetch_create_table_ddl(db: &Database, table_name: &str) -> Result<String, String> {
-    let sql = format!("SHOW CREATE TABLE {table_name}");
+    let sql = format!("SHOW CREATE TABLE {}", sql_identifier(table_name));
     let mut stream = db.query(&sql).await.map_err(|e| e.to_string())?;
     while let Some(batch_res) = futures::StreamExt::next(&mut stream).await {
         let batch = batch_res.map_err(|e| e.to_string())?;
@@ -582,6 +572,10 @@ fn sql_null_defaults(
         }
     }
     Ok(result)
+}
+
+fn sql_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
 }
 
 fn sql_string_literal(value: &str) -> String {
