@@ -14,7 +14,8 @@ all() ->
         {group, tcp},
         {group, tls},
         {group, tls_ciphers},
-        t_connect_with_auth
+        t_connect_with_auth,
+        t_schema_discovery_error_propagation
     ].
 
 groups() ->
@@ -25,6 +26,8 @@ groups() ->
         t_insert_sync_custom_ts_column,
         t_insert_sync_ttl_hint,
         t_insert_sync_existing_table,
+        t_insert_sync_quoted_existing_table,
+        t_insert_sync_quoted_auto_create,
         t_insert_sync_omitted_column_defaults,
         t_insert_sync_server_rendered_defaults,
         t_insert_sync_catalog_qualified_dbname,
@@ -32,6 +35,8 @@ groups() ->
         t_insert_sync_altered_default_invalidates_cache,
         t_insert_sync_mixed_batch_last_row_order,
         t_insert_sync_mixed_batch_atomicity,
+        t_insert_unsupported_column_isolation,
+        t_stream_rejects_unsupported_columns,
         t_insert_sync_schema_conflict,
         t_insert_sync_new_field_existing_table,
         t_insert_sync_new_tag_existing_table,
@@ -1415,6 +1420,182 @@ t_insert_sync_json2_existing_table(Config) ->
 
     ok = greptimedb_rs:stop_client(Client).
 
+t_insert_unsupported_column_isolation(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    Create = <<
+        "CREATE TABLE ",
+        Table/binary,
+        " (ts TIMESTAMP TIME INDEX, payload JSON2, extra DECIMAL(10,2))"
+        " WITH (append_mode='true')"
+    >>,
+    ?assertMatch({ok, _}, greptimedb_rs:query(Client, Create)),
+    Json = <<"{\"name\":\"bob\"}">>,
+    Row = fun(Ts, Fields) -> #{timestamp => Ts, fields => Fields} end,
+    ?assertEqual({ok, 1}, greptimedb_rs:insert(Client, Table, [Row(1, #{<<"payload">> => Json})])),
+    %% Adding a supported column also exercises the inferred-column fallback.
+    ?assertEqual(
+        {ok, 2},
+        greptimedb_rs:insert(Client, Table, [
+            Row(2, #{<<"payload">> => Json, <<"v">> => 2}),
+            Row(3, #{<<"v">> => 3})
+        ])
+    ),
+    Self = self(),
+    Ref = make_ref(),
+    Callback = {fun(Result) -> Self ! {Ref, Result} end, []},
+    ?assertMatch(
+        {ok, _},
+        greptimedb_rs:insert_async(Client, Table, [Row(4, #{<<"payload">> => Json})], Callback)
+    ),
+    receive
+        {Ref, Result} -> ?assertEqual({ok, 1}, Result)
+    after 5000 ->
+        ct:fail(async_write_timeout)
+    end,
+    %% An unsupported column in a later row must reject the entire batch.
+    ?assertEqual(
+        {error, <<"Unsupported type `Decimal(10, 2)` for column `extra`">>},
+        greptimedb_rs:insert(Client, Table, [
+            Row(5, #{<<"payload">> => Json}),
+            Row(6, #{<<"payload">> => Json, <<"extra">> => 1.25})
+        ])
+    ),
+    ?assertEqual(
+        {ok, [[1, <<"bob">>], [2, <<"bob">>], [3, nil], [4, <<"bob">>]]},
+        greptimedb_rs:query(
+            Client, <<"SELECT ts, payload.name FROM ", Table/binary, " ORDER BY ts">>
+        )
+    ),
+    ok = greptimedb_rs:stop_client(Client).
+
+t_insert_sync_quoted_existing_table(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    try
+        lists:foreach(
+            fun(Suffix) ->
+                Table = <<(?table(Config))/binary, Suffix/binary>>,
+                Quoted = quote_table_identifier(Table),
+                try
+                    ?assertMatch(
+                        {ok, _},
+                        greptimedb_rs:query(Client, <<
+                            "CREATE TABLE ",
+                            Quoted/binary,
+                            " (ts TIMESTAMP TIME INDEX, v DOUBLE, label STRING DEFAULT 'Null')"
+                        >>)
+                    ),
+                    Ts = erlang:system_time(millisecond),
+                    %% Mixed presence forces default lookup and SHOW CREATE TABLE.
+                    ?assertEqual(
+                        {ok, 2},
+                        greptimedb_rs:insert(Client, Table, [
+                            #{
+                                fields => #{<<"v">> => 1.0, <<"label">> => <<"explicit">>},
+                                timestamp => Ts
+                            },
+                            #{fields => #{<<"v">> => 2.0}, timestamp => Ts + 1}
+                        ])
+                    ),
+                    ?assertEqual(
+                        {ok, [[1.0, <<"explicit">>], [2.0, <<"Null">>]]},
+                        greptimedb_rs:query(Client, <<
+                            "SELECT v, label FROM ", Quoted/binary, " ORDER BY ts"
+                        >>)
+                    )
+                after
+                    greptimedb_rs:query(Client, <<"DROP TABLE IF EXISTS ", Quoted/binary>>)
+                end
+            end,
+            [<<"-name">>, <<"-MiXeD">>, <<".name">>]
+        )
+    after
+        greptimedb_rs:stop_client(Client)
+    end.
+
+t_insert_sync_quoted_auto_create(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    try
+        lists:foreach(
+            fun(Suffix) ->
+                Table = <<(?table(Config))/binary, Suffix/binary>>,
+                Quoted = quote_table_identifier(Table),
+                Ts = erlang:system_time(millisecond),
+                try
+                    lists:foreach(
+                        fun(Offset) ->
+                            ?assertEqual(
+                                {ok, 1},
+                                greptimedb_rs:insert(Client, Table, [
+                                    #{fields => #{<<"v">> => Offset}, timestamp => Ts + Offset}
+                                ])
+                            )
+                        end,
+                        [1, 2]
+                    ),
+                    ?assertEqual(
+                        {ok, [[1], [2]]},
+                        greptimedb_rs:query(
+                            Client, <<"SELECT v FROM ", Quoted/binary, " ORDER BY ts">>
+                        )
+                    )
+                after
+                    greptimedb_rs:query(Client, <<"DROP TABLE IF EXISTS ", Quoted/binary>>)
+                end
+            end,
+            [<<"-name">>, <<"-MiXeD">>, <<".name">>]
+        ),
+        %% Quoting must reach table-name validation rather than fail SQL parsing.
+        InvalidTable = <<(?table(Config))/binary, "\"name">>,
+        {error, Reason} = greptimedb_rs:insert(Client, InvalidTable, [
+            #{fields => #{<<"v">> => 1}, timestamp => erlang:system_time(millisecond)}
+        ]),
+        ?assertNotEqual(nomatch, binary:match(Reason, <<"Invalid table name">>))
+    after
+        greptimedb_rs:stop_client(Client)
+    end.
+
+t_stream_rejects_unsupported_columns(Config) ->
+    {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
+    Table = ?table(Config),
+    ?assertMatch(
+        {ok, _},
+        greptimedb_rs:query(Client, <<
+            "CREATE TABLE ",
+            Table/binary,
+            " (ts TIMESTAMP TIME INDEX, v BIGINT, extra DECIMAL(10,2))"
+        >>)
+    ),
+    %% Bulk needs the complete schema and must not silently skip unsupported columns.
+    ?assertEqual(
+        {error, <<"Unsupported type `Decimal(10, 2)` for column `extra`">>},
+        greptimedb_rs:stream_start(Client, Table, #{})
+    ),
+    ?assertEqual([[0]], select_count(Client, Table, <<"COUNT(*)">>)),
+    ok = greptimedb_rs:stop_client(Client).
+
+t_schema_discovery_error_propagation(Config) ->
+    Host = get_host_addr("GREPTIMEDB_AUTH_ADDR"),
+    ConnOpts = #{
+        endpoints => [<<Host/binary, ":4001">>],
+        dbname => <<"public">>,
+        username => <<"greptime_user">>,
+        password => <<"incorrect_password">>
+    },
+    {ok, Client} = greptimedb_rs:start_client(ConnOpts),
+    try
+        Table = ?table(Config),
+        {error, Reason} = greptimedb_rs:query(Client, <<"DESCRIBE ", Table/binary>>),
+        ?assertNotEqual(nomatch, binary:match(Reason, <<"password">>)),
+        %% Return the authentication error before attempting to encode these rows.
+        ?assertEqual(
+            {error, Reason},
+            greptimedb_rs:insert(Client, Table, [#{fields => not_a_map}])
+        )
+    after
+        greptimedb_rs:stop_client(Client)
+    end.
+
 t_insert_sync_json2_new_field_existing_table(Config) ->
     {ok, Client} = greptimedb_rs:start_client(?conn_opts(Config)),
     Table = ?table(Config),
@@ -2108,6 +2289,10 @@ select_count(Client, Table, Expression) ->
     Sql = iolist_to_binary(io_lib:format("SELECT ~s FROM ~s", [Expression, Table])),
     {ok, Rows} = greptimedb_rs:query(Client, Sql),
     Rows.
+
+quote_table_identifier(Name) ->
+    Escaped = binary:replace(Name, <<"\"">>, <<"\"\"">>, [global]),
+    <<"\"", Escaped/binary, "\"">>.
 
 get_host_addr(Env) ->
     case os:getenv(Env) of

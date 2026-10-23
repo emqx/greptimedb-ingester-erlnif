@@ -266,19 +266,40 @@ fn execute(env: Env, resource: ResourceArc<GreptimeResource>, sql: String) -> Ni
     }
 }
 
+struct FetchedTableSchema {
+    supported_schema: TableSchema,
+    json2_columns: std::collections::HashSet<String>,
+    fingerprint: String,
+    unsupported_columns: std::collections::HashMap<String, String>,
+}
+
 async fn fetch_table_schema(
     db: &Database,
     table_name: &str,
-) -> Result<(TableSchema, std::collections::HashSet<String>, String), String> {
-    let sql = format!("DESCRIBE {table_name}");
-    let mut stream = db.query(&sql).await.map_err(|e| e.to_string())?;
+) -> Result<Option<FetchedTableSchema>, String> {
+    let sql = format!("DESCRIBE {}", sql_identifier(table_name));
+    let mut stream = match db.query(&sql).await {
+        Ok(stream) => stream,
+        Err(greptimedb_ingester::Error::Server { status, .. })
+            if status
+                .metadata()
+                .get("x-greptime-err-code")
+                .is_some_and(|code| code == "4001") =>
+        {
+            // GreptimeDB's TableNotFound code; other NotFound errors may refer
+            // to a missing database or another resource.
+            return Ok(None);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
 
-    let mut table_schema = TableSchema::builder()
+    let mut supported_schema = TableSchema::builder()
         .name(table_name)
         .build()
         .map_err(|e| e.to_string())?;
     let mut json2_columns = std::collections::HashSet::new();
     let mut fingerprint = String::new();
+    let mut unsupported_columns = std::collections::HashMap::new();
     let mut seen_columns = 0;
 
     while let Some(batch_res) = futures::StreamExt::next(&mut stream).await {
@@ -334,13 +355,19 @@ async fn fetch_table_schema(
                     json2_columns.insert(name.to_string());
                     ColumnDataType::Json
                 }
-                _ => return Err(format!("Unknown column type: {type_str}")),
+                _ => {
+                    if semantic_str == "TIMESTAMP" {
+                        return Err(format!("Unsupported time index type: {type_str}"));
+                    }
+                    unsupported_columns.insert(name.to_string(), type_str.to_string());
+                    continue;
+                }
             };
 
             match semantic_str {
-                "TAG" => table_schema = table_schema.add_tag(name, dtype),
-                "FIELD" => table_schema = table_schema.add_field(name, dtype),
-                "TIMESTAMP" => table_schema = table_schema.add_timestamp(name, dtype),
+                "TAG" => supported_schema = supported_schema.add_tag(name, dtype),
+                "FIELD" => supported_schema = supported_schema.add_field(name, dtype),
+                "TIMESTAMP" => supported_schema = supported_schema.add_timestamp(name, dtype),
                 _ => {}
             }
         }
@@ -349,35 +376,30 @@ async fn fetch_table_schema(
     if seen_columns == 0 {
         return Err(format!("no columns found for table `{table_name}`"));
     }
-    Ok((table_schema, json2_columns, fingerprint))
+    Ok(Some(FetchedTableSchema {
+        supported_schema,
+        json2_columns,
+        fingerprint,
+        unsupported_columns,
+    }))
 }
 
 async fn fetch_column_defaults(
     db: &Database,
     table_name: &str,
 ) -> Result<std::collections::HashMap<String, util::ColumnDefault>, String> {
-    let (db_catalog, _) = split_dbname(db.dbname());
-    let (catalog, schema_name, bare_table_name) = match table_name.rsplit_once('.') {
-        Some((schema_part, table)) => {
-            let (catalog, schema) = split_dbname(schema_part);
-            (catalog.or(db_catalog), schema, table)
-        }
-        None => {
-            let (catalog, schema) = split_dbname(db.dbname());
-            (catalog, schema, table_name)
-        }
-    };
+    let (catalog, schema_name) = split_dbname(db.dbname());
     let where_clause = match catalog {
         Some(catalog) => format!(
             "table_catalog = {} AND table_schema = {} AND table_name = {}",
             sql_string_literal(catalog),
             sql_string_literal(schema_name),
-            sql_string_literal(bare_table_name)
+            sql_string_literal(table_name)
         ),
         None => format!(
             "table_schema = {} AND table_name = {}",
             sql_string_literal(schema_name),
-            sql_string_literal(bare_table_name)
+            sql_string_literal(table_name)
         ),
     };
     let sql = format!(
@@ -488,7 +510,7 @@ fn cached_column_defaults(
 }
 
 async fn fetch_create_table_ddl(db: &Database, table_name: &str) -> Result<String, String> {
-    let sql = format!("SHOW CREATE TABLE {table_name}");
+    let sql = format!("SHOW CREATE TABLE {}", sql_identifier(table_name));
     let mut stream = db.query(&sql).await.map_err(|e| e.to_string())?;
     while let Some(batch_res) = futures::StreamExt::next(&mut stream).await {
         let batch = batch_res.map_err(|e| e.to_string())?;
@@ -552,6 +574,10 @@ fn sql_null_defaults(
     Ok(result)
 }
 
+fn sql_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
 fn sql_string_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -595,12 +621,29 @@ fn insert<'a>(
     let table_schema_res = runtime.block_on(fetch_table_schema(&resource.db, &table));
 
     let (inserts, auto_created_with_json2) = match table_schema_res {
-        Ok((s, json2_columns, fingerprint)) => {
+        Ok(Some(FetchedTableSchema {
+            supported_schema,
+            json2_columns,
+            fingerprint,
+            unsupported_columns,
+        })) => {
+            if !unsupported_columns.is_empty() {
+                let present = util::collect_present_columns(&rows_term)?;
+                for (name, dtype) in &unsupported_columns {
+                    if present.contains(name) {
+                        return Ok((
+                            atoms::error(),
+                            format!("Unsupported type `{dtype}` for column `{name}`"),
+                        )
+                            .encode(env));
+                    }
+                }
+            }
             // Table exists: keep the server's columns and their types, then merge in
             // the columns inferred from the input rows. GreptimeDB adds unknown
             // columns automatically, so new input fields are no longer dropped.
             use greptimedb_ingester::api::v1::ColumnSchema;
-            let server_columns: Vec<ColumnSchema> = s
+            let server_columns: Vec<ColumnSchema> = supported_schema
                 .columns()
                 .iter()
                 .map(|c| {
@@ -665,8 +708,8 @@ fn insert<'a>(
                 };
             (inserts, false)
         }
-        Err(_) => {
-            // Table might not exist, infer schema locally
+        Ok(None) => {
+            // Only a confirmed missing table permits local schema inference.
             let (schema, rows) = util::terms_to_schema_and_rows(
                 rows_term,
                 resource.ts_column.as_deref().unwrap_or("ts"),
@@ -680,6 +723,7 @@ fn insert<'a>(
                 has_json2,
             )
         }
+        Err(error) => return Ok((atoms::error(), error).encode(env)),
     };
 
     // 2. Construct Request
@@ -729,17 +773,28 @@ fn stream_start<'a>(
 
     // 1. Fetch Schema from Server
     let table_template_res = runtime.block_on(fetch_table_schema(&resource.db, &table));
-    let (table_template, json2_columns, _fingerprint) = match table_template_res {
-        Ok(s) => s,
+    let metadata = match table_template_res {
+        Ok(Some(metadata)) => metadata,
+        Ok(None) => {
+            return Ok((atoms::error(), format!("Table `{table}` not found")).encode(env));
+        }
         Err(e) => return Ok((atoms::error(), e).encode(env)),
     };
-    if !json2_columns.is_empty() {
+    if !metadata.json2_columns.is_empty() {
         return Ok((
             atoms::error(),
             "stream (bulk) write does not support JSON2 columns; use insert/3 instead",
         )
             .encode(env));
     }
+    if let Some((name, dtype)) = metadata.unsupported_columns.iter().next() {
+        return Ok((
+            atoms::error(),
+            format!("Unsupported type `{dtype}` for column `{name}`"),
+        )
+            .encode(env));
+    }
+    let table_template = metadata.supported_schema;
 
     let schema_clone = table_template.clone();
 
