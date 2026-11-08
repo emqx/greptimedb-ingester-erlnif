@@ -26,7 +26,7 @@ on:
           JSON array of Linux Erlang matrix objects. Defaults to the current release OTP.
           OTP 29 can be added here after matching emqx-builder images are published.
         required: false
-        default: '[{"otp":"28.5.0.7-3","elixir":"1.19.1","builder":"6.2-3"}]'
+        default: '[{"otp":"28.5.0.7-7","elixir":"1.19.1","builder":"6.3-1"}]'
       linux_os:
         description: |
           JSON array of Linux distros to build, for example ["el10"].
@@ -98,14 +98,14 @@ jobs:
         # Set RELEASE_LINUX_ERLANG_MATRIX to include OTP 29 after matching
         # ghcr.io/emqx/emqx-builder/<builder>:<elixir>-<otp>-<os> images
         # are published for the Linux OS matrix below.
-        erlang: ${{ fromJSON(github.event.inputs.linux_erlang_matrix || vars.RELEASE_LINUX_ERLANG_MATRIX || '[{"otp":"28.5.0.7-3","elixir":"1.19.1","builder":"6.2-3"}]') }}
+        erlang: ${{ fromJSON(github.event.inputs.linux_erlang_matrix || vars.RELEASE_LINUX_ERLANG_MATRIX || '[{"otp":"28.5.0.7-7","elixir":"1.19.1","builder":"6.3-1"}]') }}
         arch:
           - amd64
           - arm64
         # The prebuilt file name carries the OTP major only, so one asset per
         # (version, OTP major, distro, arch) serves every OTP patch release.
         os: >-
-          ${{ fromJSON(github.event.inputs.linux_os || '["ubuntu24.04",
+          ${{ fromJSON(github.event.inputs.linux_os || '["ubuntu26.04", "ubuntu24.04",
           "ubuntu22.04", "ubuntu20.04", "debian13", "debian12", "debian11",
           "el10", "el9", "el8", "amzn2023"]') }}
 
