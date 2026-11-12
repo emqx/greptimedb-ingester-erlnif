@@ -51,6 +51,12 @@
     opts/0,
     stream_client/0,
     time_unit/0,
+    native_error/0,
+    error_kind/0,
+    error_source/0,
+    error_code/0,
+    error_stage/0,
+    write_outcome/0,
     sql/0,
     result/0,
     reason/0,
@@ -92,10 +98,84 @@
 }.
 -type stream_client() :: {stream_client, client(), table()}.
 -type time_unit() :: s | ms | us | ns.
+-type error_kind() ::
+    transport
+    | server
+    | invalid_argument
+    | configuration
+    | protocol
+    | internal
+    | timeout
+    | cancelled
+    | closed.
+-type error_source() ::
+    server
+    | create_channel
+    | request_timeout
+    | stream_ended
+    | stream_ended_with_pending_requests
+    | send_data
+    | invalid_tls_config
+    | invalid_config_file_path
+    | illegal_grpc_client_state
+    | missing_field
+    | illegal_database_response
+    | invalid_tonic_metadata_value
+    | serde_json
+    | create_record_batch
+    | unsupported_data_type
+    | serialize_metadata
+    | schema_mismatch
+    | invalid_column_count
+    | invalid_column_index
+    | empty_rows
+    | add_row_to_built_batch
+    | unflushed_rows
+    | unexpected_flight_message
+    | local
+    | table_not_found.
+-type error_code() ::
+    none
+    | unknown
+    | cancelled
+    | invalid_argument
+    | deadline_exceeded
+    | not_found
+    | already_exists
+    | permission_denied
+    | resource_exhausted
+    | failed_precondition
+    | aborted
+    | out_of_range
+    | unimplemented
+    | internal
+    | unavailable
+    | data_loss
+    | unauthenticated.
+-type error_stage() ::
+    connect
+    | metadata
+    | query
+    | insert
+    | stream_start
+    | stream_write
+    | stream_close.
+-type write_outcome() :: not_sent | unknown.
+-type native_error() ::
+    {greptimedb_error, #{
+        domain := greptimedb,
+        kind := error_kind(),
+        source := error_source(),
+        code := error_code(),
+        stage := error_stage(),
+        write_outcome := write_outcome(),
+        retry_hint := boolean(),
+        message := binary()
+    }}.
 -type table() :: binary().
 -type sql() :: binary().
 -type result() :: term().
--type reason() :: term() | binary().
+-type reason() :: native_error() | term() | binary().
 
 -type pool_name() :: term().
 -type pool_type() :: random | hash.
@@ -169,12 +249,14 @@ insert(Client, Table, Rows, Precision) ->
 %% @doc Batch write data with millisecond timestamps (asynchronous).
 %%
 %% New callers that need an explicit timestamp unit should use `insert_async/5'.
--spec insert_async(client(), binary(), [map()], callback()) -> {ok, pid()}.
+-spec insert_async(client(), binary(), [map()], callback()) ->
+    {ok, pid()} | {error, reason()}.
 insert_async(Client, Table, Rows, ResultCallback) ->
     call_async(Client, ?CMD_INSERT, [Table, Rows], ResultCallback).
 
 %% @doc Batch write data (asynchronous).
--spec insert_async(client(), binary(), [map()], time_unit(), callback()) -> {ok, pid()}.
+-spec insert_async(client(), binary(), [map()], time_unit(), callback()) ->
+    {ok, pid()} | {error, reason()}.
 insert_async(Client, Table, Rows, Precision, ResultCallback) ->
     call_async(Client, ?CMD_INSERT, [Table, Rows, Precision], ResultCallback).
 
@@ -188,7 +270,7 @@ query(Client, Sql) ->
     call_sync(Client, ?CMD_EXECUTE, [Sql]).
 
 %% @doc Execute SQL query (asynchronous).
--spec query_async(client(), sql(), callback()) -> {ok, pid()}.
+-spec query_async(client(), sql(), callback()) -> {ok, pid()} | {error, reason()}.
 query_async(Client, Sql, ResultCallback) ->
     call_async(Client, ?CMD_EXECUTE, [Sql], ResultCallback).
 
@@ -245,7 +327,8 @@ stream_write({stream_client, Client, Table}, Rows) ->
     call_sync(Client, ?CMD_STREAM_WRITE, [Table, Rows]).
 
 %% @doc Write data to the stream (asynchronous).
--spec stream_write_async(stream_client(), [map()], callback()) -> {ok, pid()}.
+-spec stream_write_async(stream_client(), [map()], callback()) ->
+    {ok, pid()} | {error, reason()}.
 stream_write_async({stream_client, Client, Table}, Rows, Callback) ->
     call_async(Client, ?CMD_STREAM_WRITE, [Table, Rows], Callback).
 

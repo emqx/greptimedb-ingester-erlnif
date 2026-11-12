@@ -33,6 +33,7 @@ mod util;
 pub struct GreptimeResource {
     pub db: Database,
     pub client: Client,
+    channel_manager: ChannelManager,
     pub auth: Option<AuthScheme>,
     pub ts_column: Option<String>,
     pub ttl: Option<String>,
@@ -65,6 +66,15 @@ impl Resource for GreptimeResource {
 }
 
 impl GreptimeResource {
+    fn invalidate_channels_on(&self, error: &greptimedb_ingester::Error) {
+        if matches!(
+            error_kind(error),
+            ErrorKind::Transport | ErrorKind::Cancelled
+        ) {
+            self.channel_manager.retain_channel(|_, _| false);
+        }
+    }
+
     fn lock_operation(&self) -> MutexGuard<'_, Option<Arc<Operation>>> {
         match self.operation.lock() {
             Ok(slot) => slot,
@@ -189,12 +199,20 @@ fn connect(opts: Term) -> NifResult<Term> {
         timeout: None,
         ..Default::default()
     };
-    let client = if let Ok(tls_term) = opts.map_get(atoms::tls().to_term(env)) {
+    let (client, channel_manager) = if let Ok(tls_term) = opts.map_get(atoms::tls().to_term(env)) {
         if tls_term.decode::<bool>()? {
             let tls_verify = match opts.map_get(atoms::verify().to_term(env)) {
                 Ok(verify_term) => match decode_tls_verify(verify_term) {
                     Ok(verify) => verify,
-                    Err(err) => return Ok((atoms::error(), err).encode(env)),
+                    Err(err) => {
+                        return Ok(Failure::Native(NativeFailure::local(
+                            ErrorKind::Configuration,
+                            ErrorStage::Connect,
+                            WriteOutcome::NotSent,
+                            err,
+                        ))
+                        .encode(env))
+                    }
                 },
                 Err(_) => TlsVerify::VerifyPeer,
             };
@@ -226,14 +244,30 @@ fn connect(opts: Term) -> NifResult<Term> {
                     .tls_verify(tls_verify)
                     .client_tls_config(tls_option),
             ) {
-                Ok(manager) => Client::with_manager_and_urls(manager, endpoints),
-                Err(e) => return Ok((atoms::error(), e.to_string()).encode(env)),
+                Ok(manager) => (
+                    Client::with_manager_and_urls(manager.clone(), endpoints),
+                    manager,
+                ),
+                Err(error) => {
+                    return Ok(
+                        Failure::native(error, ErrorStage::Connect, WriteOutcome::NotSent)
+                            .encode(env),
+                    )
+                }
             }
         } else {
-            Client::with_manager_and_urls(ChannelManager::with_config(channel_config), endpoints)
+            let manager = ChannelManager::with_config(channel_config);
+            (
+                Client::with_manager_and_urls(manager.clone(), endpoints),
+                manager,
+            )
         }
     } else {
-        Client::with_manager_and_urls(ChannelManager::with_config(channel_config), endpoints)
+        let manager = ChannelManager::with_config(channel_config);
+        (
+            Client::with_manager_and_urls(manager.clone(), endpoints),
+            manager,
+        )
     };
 
     let mut db = Database::new_with_dbname(dbname, client.clone());
@@ -268,6 +302,7 @@ fn connect(opts: Term) -> NifResult<Term> {
     let resource = ResourceArc::new(GreptimeResource {
         db,
         client,
+        channel_manager,
         auth,
         ts_column,
         ttl,
@@ -294,41 +329,86 @@ fn drain(resource: ResourceArc<GreptimeResource>) -> Atom {
     atoms::ok()
 }
 
-async fn fetch_table_schema(db: &Database, table_name: &str) -> Result<TableSchema, String> {
-    let sql = format!("DESCRIBE {table_name}");
-    let mut stream = db.query(&sql).await.map_err(|e| e.to_string())?;
+enum TableSchemaLookup {
+    Found(TableSchema),
+    NotFound,
+    UnsupportedColumnType(String),
+}
+
+fn quote_sql_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn describe_table_sql(table_name: &str) -> String {
+    format!("DESCRIBE {}", quote_sql_identifier(table_name))
+}
+
+async fn describe_table(
+    client: &GreptimeResource,
+    table_name: &str,
+) -> Result<TableSchemaLookup, Failure> {
+    let sql = describe_table_sql(table_name);
+    let mut stream = match client.db.query(&sql).await {
+        Ok(stream) => stream,
+        Err(error) if is_table_not_found_error(&error) => return Ok(TableSchemaLookup::NotFound),
+        Err(error) => {
+            client.invalidate_channels_on(&error);
+            return Err(Failure::native(
+                error,
+                ErrorStage::Metadata,
+                WriteOutcome::NotSent,
+            ));
+        }
+    };
 
     let mut table_schema = TableSchema::builder()
         .name(table_name)
         .build()
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| Failure::message(e.to_string()))?;
+    let mut seen_columns = false;
 
     while let Some(batch_res) = futures::StreamExt::next(&mut stream).await {
-        let batch = batch_res.map_err(|e| e.to_string())?;
+        let batch = match batch_res {
+            Ok(batch) => batch,
+            Err(error) if is_table_not_found_error(&error) => {
+                return Ok(TableSchemaLookup::NotFound)
+            }
+            Err(error) => {
+                client.invalidate_channels_on(&error);
+                return Err(Failure::native(
+                    error,
+                    ErrorStage::Metadata,
+                    WriteOutcome::NotSent,
+                ));
+            }
+        };
 
         // Ensure columns exist
         // 0: Field, 1: Type, 2: Null, 3: Key, 4: Default, 5: Semantic Type
         if batch.num_columns() < 6 {
-            return Err("DESCRIBE result has unexpected number of columns".to_string());
+            return Err(Failure::message(
+                "DESCRIBE result has unexpected number of columns",
+            ));
         }
 
         let names = batch
             .column(0)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .ok_or("Failed to cast column 0 to StringArray")?;
+            .ok_or_else(|| Failure::message("Failed to cast column 0 to StringArray"))?;
         let types = batch
             .column(1)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .ok_or("Failed to cast column 1 to StringArray")?;
+            .ok_or_else(|| Failure::message("Failed to cast column 1 to StringArray"))?;
         let semantic_types = batch
             .column(5)
             .as_any()
             .downcast_ref::<arrow::array::StringArray>()
-            .ok_or("Failed to cast column 5 to StringArray")?;
+            .ok_or_else(|| Failure::message("Failed to cast column 5 to StringArray"))?;
 
         for i in 0..batch.num_rows() {
+            seen_columns = true;
             let name = names.value(i);
             let type_str = types.value(i);
             let semantic_str = semantic_types.value(i);
@@ -353,7 +433,11 @@ async fn fetch_table_schema(db: &Database, table_name: &str) -> Result<TableSche
                 "TimestampMillisecond" => ColumnDataType::TimestampMillisecond,
                 "TimestampMicrosecond" => ColumnDataType::TimestampMicrosecond,
                 "TimestampNanosecond" => ColumnDataType::TimestampNanosecond,
-                _ => return Err(format!("Unknown column type: {type_str}")),
+                _ => {
+                    return Ok(TableSchemaLookup::UnsupportedColumnType(
+                        type_str.to_string(),
+                    ))
+                }
             };
 
             match semantic_str {
@@ -365,7 +449,11 @@ async fn fetch_table_schema(db: &Database, table_name: &str) -> Result<TableSche
         }
     }
 
-    Ok(table_schema)
+    if seen_columns {
+        Ok(TableSchemaLookup::Found(table_schema))
+    } else {
+        Ok(TableSchemaLookup::NotFound)
+    }
 }
 
 struct Input {
@@ -484,8 +572,414 @@ impl Value {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorKind {
+    Transport,
+    Server,
+    InvalidArgument,
+    Configuration,
+    Protocol,
+    Internal,
+    Timeout,
+    Cancelled,
+    Closed,
+}
+
+impl ErrorKind {
+    fn atom(self) -> Atom {
+        match self {
+            Self::Transport => atoms::transport(),
+            Self::Server => atoms::server(),
+            Self::InvalidArgument => atoms::invalid_argument(),
+            Self::Configuration => atoms::configuration(),
+            Self::Protocol => atoms::protocol(),
+            Self::Internal => atoms::internal(),
+            Self::Timeout => atoms::timeout(),
+            Self::Cancelled => atoms::cancelled(),
+            Self::Closed => atoms::closed(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorSource {
+    Server,
+    CreateChannel,
+    RequestTimeout,
+    StreamEnded,
+    StreamEndedWithPendingRequests,
+    SendData,
+    InvalidTlsConfig,
+    InvalidConfigFilePath,
+    IllegalGrpcClientState,
+    MissingField,
+    IllegalDatabaseResponse,
+    InvalidTonicMetadataValue,
+    SerdeJson,
+    CreateRecordBatch,
+    UnsupportedDataType,
+    SerializeMetadata,
+    SchemaMismatch,
+    InvalidColumnCount,
+    InvalidColumnIndex,
+    EmptyRows,
+    AddRowToBuiltBatch,
+    UnflushedRows,
+    UnexpectedFlightMessage,
+    Local,
+    TableNotFound,
+}
+
+impl ErrorSource {
+    fn atom(self) -> Atom {
+        match self {
+            Self::Server => atoms::server(),
+            Self::CreateChannel => atoms::create_channel(),
+            Self::RequestTimeout => atoms::request_timeout(),
+            Self::StreamEnded => atoms::stream_ended(),
+            Self::StreamEndedWithPendingRequests => atoms::stream_ended_with_pending_requests(),
+            Self::SendData => atoms::send_data(),
+            Self::InvalidTlsConfig => atoms::invalid_tls_config(),
+            Self::InvalidConfigFilePath => atoms::invalid_config_file_path(),
+            Self::IllegalGrpcClientState => atoms::illegal_grpc_client_state(),
+            Self::MissingField => atoms::missing_field(),
+            Self::IllegalDatabaseResponse => atoms::illegal_database_response(),
+            Self::InvalidTonicMetadataValue => atoms::invalid_tonic_metadata_value(),
+            Self::SerdeJson => atoms::serde_json(),
+            Self::CreateRecordBatch => atoms::create_record_batch(),
+            Self::UnsupportedDataType => atoms::unsupported_data_type(),
+            Self::SerializeMetadata => atoms::serialize_metadata(),
+            Self::SchemaMismatch => atoms::schema_mismatch(),
+            Self::InvalidColumnCount => atoms::invalid_column_count(),
+            Self::InvalidColumnIndex => atoms::invalid_column_index(),
+            Self::EmptyRows => atoms::empty_rows(),
+            Self::AddRowToBuiltBatch => atoms::add_row_to_built_batch(),
+            Self::UnflushedRows => atoms::unflushed_rows(),
+            Self::UnexpectedFlightMessage => atoms::unexpected_flight_message(),
+            Self::Local => atoms::local(),
+            Self::TableNotFound => atoms::table_not_found(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorCode {
+    None,
+    Unknown,
+    Cancelled,
+    InvalidArgument,
+    DeadlineExceeded,
+    NotFound,
+    AlreadyExists,
+    PermissionDenied,
+    ResourceExhausted,
+    FailedPrecondition,
+    Aborted,
+    OutOfRange,
+    Unimplemented,
+    Internal,
+    Unavailable,
+    DataLoss,
+    Unauthenticated,
+}
+
+impl From<tonic::Code> for ErrorCode {
+    fn from(code: tonic::Code) -> Self {
+        match code {
+            tonic::Code::Ok => Self::None,
+            tonic::Code::Cancelled => Self::Cancelled,
+            tonic::Code::Unknown => Self::Unknown,
+            tonic::Code::InvalidArgument => Self::InvalidArgument,
+            tonic::Code::DeadlineExceeded => Self::DeadlineExceeded,
+            tonic::Code::NotFound => Self::NotFound,
+            tonic::Code::AlreadyExists => Self::AlreadyExists,
+            tonic::Code::PermissionDenied => Self::PermissionDenied,
+            tonic::Code::ResourceExhausted => Self::ResourceExhausted,
+            tonic::Code::FailedPrecondition => Self::FailedPrecondition,
+            tonic::Code::Aborted => Self::Aborted,
+            tonic::Code::OutOfRange => Self::OutOfRange,
+            tonic::Code::Unimplemented => Self::Unimplemented,
+            tonic::Code::Internal => Self::Internal,
+            tonic::Code::Unavailable => Self::Unavailable,
+            tonic::Code::DataLoss => Self::DataLoss,
+            tonic::Code::Unauthenticated => Self::Unauthenticated,
+        }
+    }
+}
+
+impl ErrorCode {
+    fn atom(self) -> Atom {
+        match self {
+            Self::None => atoms::none(),
+            Self::Unknown => atoms::unknown(),
+            Self::Cancelled => atoms::cancelled(),
+            Self::InvalidArgument => atoms::invalid_argument(),
+            Self::DeadlineExceeded => atoms::deadline_exceeded(),
+            Self::NotFound => atoms::not_found(),
+            Self::AlreadyExists => atoms::already_exists(),
+            Self::PermissionDenied => atoms::permission_denied(),
+            Self::ResourceExhausted => atoms::resource_exhausted(),
+            Self::FailedPrecondition => atoms::failed_precondition(),
+            Self::Aborted => atoms::aborted(),
+            Self::OutOfRange => atoms::out_of_range(),
+            Self::Unimplemented => atoms::unimplemented(),
+            Self::Internal => atoms::internal(),
+            Self::Unavailable => atoms::unavailable(),
+            Self::DataLoss => atoms::data_loss(),
+            Self::Unauthenticated => atoms::unauthenticated(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ErrorStage {
+    Connect,
+    Metadata,
+    Query,
+    Insert,
+    StreamStart,
+    StreamWrite,
+    StreamClose,
+}
+
+impl ErrorStage {
+    fn atom(self) -> Atom {
+        match self {
+            Self::Connect => atoms::connect(),
+            Self::Metadata => atoms::metadata(),
+            Self::Query => atoms::query(),
+            Self::Insert => atoms::insert(),
+            Self::StreamStart => atoms::stream_start(),
+            Self::StreamWrite => atoms::stream_write(),
+            Self::StreamClose => atoms::stream_close(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteOutcome {
+    NotSent,
+    Unknown,
+}
+
+impl WriteOutcome {
+    fn atom(self) -> Atom {
+        match self {
+            Self::NotSent => atoms::not_sent(),
+            Self::Unknown => atoms::unknown(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct NativeFailure {
+    kind: ErrorKind,
+    source: ErrorSource,
+    code: ErrorCode,
+    stage: ErrorStage,
+    write_outcome: WriteOutcome,
+    retry_hint: bool,
+    message: String,
+}
+
+impl NativeFailure {
+    fn from_greptimedb(
+        error: greptimedb_ingester::Error,
+        stage: ErrorStage,
+        write_outcome: WriteOutcome,
+    ) -> Self {
+        let source = error_source(&error);
+        let code = match &error {
+            greptimedb_ingester::Error::Server { status, .. } => status.code().into(),
+            greptimedb_ingester::Error::RequestTimeout { .. } => ErrorCode::DeadlineExceeded,
+            _ => ErrorCode::None,
+        };
+        Self {
+            kind: error_kind(&error),
+            source,
+            code,
+            stage,
+            write_outcome,
+            retry_hint: error.is_retriable(),
+            message: error.to_string(),
+        }
+    }
+
+    fn table_not_found(stage: ErrorStage) -> Self {
+        Self {
+            kind: ErrorKind::Server,
+            source: ErrorSource::TableNotFound,
+            code: ErrorCode::NotFound,
+            stage,
+            write_outcome: WriteOutcome::NotSent,
+            retry_hint: false,
+            message: "table not found".to_string(),
+        }
+    }
+
+    fn local(
+        kind: ErrorKind,
+        stage: ErrorStage,
+        write_outcome: WriteOutcome,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            kind,
+            source: ErrorSource::Local,
+            code: ErrorCode::None,
+            stage,
+            write_outcome,
+            retry_hint: false,
+            message: message.into(),
+        }
+    }
+
+    fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
+        let keys = vec![
+            atoms::domain().encode(env),
+            atoms::kind().encode(env),
+            atoms::source().encode(env),
+            atoms::code().encode(env),
+            atoms::stage().encode(env),
+            atoms::write_outcome().encode(env),
+            atoms::retry_hint().encode(env),
+            atoms::message().encode(env),
+        ];
+        let values = vec![
+            atoms::greptimedb().encode(env),
+            self.kind.atom().encode(env),
+            self.source.atom().encode(env),
+            self.code.atom().encode(env),
+            self.stage.atom().encode(env),
+            self.write_outcome.atom().encode(env),
+            self.retry_hint.encode(env),
+            self.message.encode(env),
+        ];
+        let details =
+            Term::map_from_term_arrays(env, &keys, &values).expect("fixed native error map");
+        (atoms::greptimedb_error(), details).encode(env)
+    }
+}
+
+fn error_source(error: &greptimedb_ingester::Error) -> ErrorSource {
+    use greptimedb_ingester::Error;
+    match error {
+        Error::InvalidTlsConfig { .. } => ErrorSource::InvalidTlsConfig,
+        Error::InvalidConfigFilePath { .. } => ErrorSource::InvalidConfigFilePath,
+        Error::CreateChannel { .. } => ErrorSource::CreateChannel,
+        Error::IllegalGrpcClientState { .. } => ErrorSource::IllegalGrpcClientState,
+        Error::MissingField { .. } => ErrorSource::MissingField,
+        Error::Server { .. } => ErrorSource::Server,
+        Error::IllegalDatabaseResponse { .. } => ErrorSource::IllegalDatabaseResponse,
+        Error::InvalidTonicMetadataValue { .. } => ErrorSource::InvalidTonicMetadataValue,
+        Error::SerdeJson { .. } => ErrorSource::SerdeJson,
+        Error::CreateRecordBatch { .. } => ErrorSource::CreateRecordBatch,
+        Error::UnsupportedDataType { .. } => ErrorSource::UnsupportedDataType,
+        Error::SerializeMetadata { .. } => ErrorSource::SerializeMetadata,
+        Error::SendData { .. } => ErrorSource::SendData,
+        Error::StreamEnded { .. } => ErrorSource::StreamEnded,
+        Error::StreamEndedWithPendingRequests { .. } => ErrorSource::StreamEndedWithPendingRequests,
+        Error::RequestTimeout { .. } => ErrorSource::RequestTimeout,
+        Error::SchemaMismatch { .. } => ErrorSource::SchemaMismatch,
+        Error::InvalidColumnCount { .. } => ErrorSource::InvalidColumnCount,
+        Error::InvalidColumnIndex { .. } => ErrorSource::InvalidColumnIndex,
+        Error::EmptyRows { .. } => ErrorSource::EmptyRows,
+        Error::AddRowToBuiltBatch { .. } => ErrorSource::AddRowToBuiltBatch,
+        Error::UnflushedRows { .. } => ErrorSource::UnflushedRows,
+        Error::UnexpectedFlightMessage { .. } => ErrorSource::UnexpectedFlightMessage,
+    }
+}
+
+fn error_kind(error: &greptimedb_ingester::Error) -> ErrorKind {
+    use greptimedb_ingester::Error;
+    match error {
+        Error::Server { status, .. } if is_transport_status(status) => ErrorKind::Transport,
+        Error::Server { status, .. } if status.code() == tonic::Code::Cancelled => {
+            ErrorKind::Cancelled
+        }
+        Error::Server { .. } => ErrorKind::Server,
+        Error::CreateChannel { .. }
+        | Error::SendData { .. }
+        | Error::StreamEnded { .. }
+        | Error::StreamEndedWithPendingRequests { .. } => ErrorKind::Transport,
+        Error::RequestTimeout { .. } => ErrorKind::Timeout,
+        Error::InvalidTlsConfig { .. } | Error::InvalidConfigFilePath { .. } => {
+            ErrorKind::Configuration
+        }
+        Error::IllegalDatabaseResponse { .. }
+        | Error::SerdeJson { .. }
+        | Error::UnexpectedFlightMessage { .. } => ErrorKind::Protocol,
+        Error::IllegalGrpcClientState { .. }
+        | Error::MissingField { .. }
+        | Error::SerializeMetadata { .. } => ErrorKind::Internal,
+        Error::InvalidTonicMetadataValue { .. }
+        | Error::CreateRecordBatch { .. }
+        | Error::UnsupportedDataType { .. }
+        | Error::SchemaMismatch { .. }
+        | Error::InvalidColumnCount { .. }
+        | Error::InvalidColumnIndex { .. }
+        | Error::EmptyRows { .. }
+        | Error::AddRowToBuiltBatch { .. }
+        | Error::UnflushedRows { .. } => ErrorKind::InvalidArgument,
+    }
+}
+
+fn is_transport_status(status: &tonic::Status) -> bool {
+    is_transport_message(status.message())
+        || matches!(
+            status.code(),
+            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded
+        )
+}
+
+fn is_transport_message(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "transport error",
+        "h2 protocol error",
+        "connection error",
+        "error reading a body from connection",
+        "connection reset by peer",
+        "connection closed",
+        "broken pipe",
+        "unexpected eof",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
+}
+
+fn write_outcome_for_sdk_error(error: &greptimedb_ingester::Error) -> WriteOutcome {
+    use greptimedb_ingester::Error;
+    match error {
+        Error::InvalidTlsConfig { .. }
+        | Error::InvalidConfigFilePath { .. }
+        | Error::CreateChannel { .. }
+        | Error::IllegalGrpcClientState { .. }
+        | Error::MissingField { .. }
+        | Error::InvalidTonicMetadataValue { .. }
+        | Error::CreateRecordBatch { .. }
+        | Error::UnsupportedDataType { .. }
+        | Error::SerializeMetadata { .. }
+        | Error::SchemaMismatch { .. }
+        | Error::InvalidColumnCount { .. }
+        | Error::InvalidColumnIndex { .. }
+        | Error::EmptyRows { .. }
+        | Error::AddRowToBuiltBatch { .. }
+        | Error::UnflushedRows { .. } => WriteOutcome::NotSent,
+        Error::Server { .. }
+        | Error::IllegalDatabaseResponse { .. }
+        | Error::SerdeJson { .. }
+        | Error::SendData { .. }
+        | Error::StreamEnded { .. }
+        | Error::StreamEndedWithPendingRequests { .. }
+        | Error::RequestTimeout { .. }
+        | Error::UnexpectedFlightMessage { .. } => WriteOutcome::Unknown,
+    }
+}
+
 enum Failure {
-    Native(String),
+    Native(NativeFailure),
+    Message(String),
     Raised { env: OwnedEnv, reason: SavedTerm },
     BadArg,
     Timeout,
@@ -495,9 +989,21 @@ enum Failure {
 }
 
 impl Failure {
+    fn native(
+        error: greptimedb_ingester::Error,
+        stage: ErrorStage,
+        write_outcome: WriteOutcome,
+    ) -> Self {
+        Self::Native(NativeFailure::from_greptimedb(error, stage, write_outcome))
+    }
+
+    fn message(message: impl Into<String>) -> Self {
+        Self::Message(message.into())
+    }
+
     fn from_nif(env: Env, error: rustler::Error) -> Self {
         match error {
-            rustler::Error::Term(reason) => Self::Native(
+            rustler::Error::Term(reason) => Self::Message(
                 reason
                     .encode(env)
                     .decode()
@@ -517,7 +1023,8 @@ impl Failure {
 
     fn encode<'a>(&self, env: Env<'a>) -> Term<'a> {
         match self {
-            Self::Native(reason) => (atoms::error(), reason).encode(env),
+            Self::Native(reason) => (atoms::error(), reason.encode(env)).encode(env),
+            Self::Message(reason) => (atoms::error(), reason).encode(env),
             Self::Raised {
                 env: source,
                 reason,
@@ -536,6 +1043,22 @@ impl Failure {
             Self::Panic => (atoms::error(), (atoms::nif_error(), atoms::task_panic())).encode(env),
         }
     }
+}
+
+fn is_table_not_found_error(error: &greptimedb_ingester::Error) -> bool {
+    matches!(
+        error,
+        greptimedb_ingester::Error::Server { status, .. }
+            if status.code() == tonic::Code::NotFound
+                && greptimedb_error_code(status) == Some("4001")
+    )
+}
+
+fn greptimedb_error_code(status: &tonic::Status) -> Option<&str> {
+    status
+        .metadata()
+        .get("x-greptime-err-code")
+        .and_then(|value| value.to_str().ok())
 }
 
 struct Running {
@@ -950,16 +1473,21 @@ async fn perform_statement(
 ) -> Result<Value, Failure> {
     use futures::StreamExt;
     use greptimedb_ingester::api::v1::{ColumnSchema, RowInsertRequest, RowInsertRequests, Rows};
-    let native = |e: greptimedb_ingester::Error| Failure::Native(e.to_string());
     let check = || check_operation(deadline, &control);
     check()?;
     match request {
         Request::Execute(sql) => {
-            let mut stream = client.db.query(&sql).await.map_err(native)?;
+            let mut stream = client.db.query(&sql).await.map_err(|error| {
+                client.invalidate_channels_on(&error);
+                Failure::native(error, ErrorStage::Query, WriteOutcome::Unknown)
+            })?;
             let mut batches = Vec::new();
             while let Some(batch) = stream.next().await {
                 check()?;
-                batches.push(batch.map_err(native)?);
+                batches.push(batch.map_err(|error| {
+                    client.invalidate_channels_on(&error);
+                    Failure::native(error, ErrorStage::Query, WriteOutcome::Unknown)
+                })?);
             }
             Ok(Value::Batches(batches))
         }
@@ -967,11 +1495,14 @@ async fn perform_statement(
             if input.is_empty() {
                 return Ok(Value::Count(0));
             }
-            let server = fetch_table_schema(&client.db, &table).await;
+            let server = match describe_table(&client, &table).await? {
+                TableSchemaLookup::Found(schema) => Some(schema),
+                TableSchemaLookup::NotFound | TableSchemaLookup::UnsupportedColumnType(_) => None,
+            };
             check()?;
             let ts_column = client.ts_column.clone();
             let inline = match &server {
-                Ok(schema)
+                Some(schema)
                     if input.small
                         && schema.columns().len() <= 8
                         && schema
@@ -991,7 +1522,7 @@ async fn perform_statement(
                     .codec_pool
                     .run(control.clone(), deadline, move || {
                         input.convert(|rows| match server {
-                            Ok(schema) => {
+                            Some(schema) => {
                                 let columns: Vec<ColumnSchema> = schema
                                     .columns()
                                     .iter()
@@ -1006,7 +1537,7 @@ async fn perform_statement(
                                 let rows = util::terms_to_proto_rows_with_columns(&columns, rows)?;
                                 Ok((columns, rows))
                             }
-                            Err(_) => util::terms_to_schema_and_rows(
+                            None => util::terms_to_schema_and_rows(
                                 rows,
                                 ts_column.as_deref().unwrap_or("ts"),
                                 timestamp_type,
@@ -1027,9 +1558,17 @@ async fn perform_statement(
                     .db
                     .insert_with_hints(request, &[("ttl", ttl.as_str())])
                     .await
-                    .map_err(native)?
+                    .map_err(|error| {
+                        client.invalidate_channels_on(&error);
+                        let write_outcome = write_outcome_for_sdk_error(&error);
+                        Failure::native(error, ErrorStage::Insert, write_outcome)
+                    })?
             } else {
-                client.db.insert(request).await.map_err(native)?
+                client.db.insert(request).await.map_err(|error| {
+                    client.invalidate_channels_on(&error);
+                    let write_outcome = write_outcome_for_sdk_error(&error);
+                    Failure::native(error, ErrorStage::Insert, write_outcome)
+                })?
             };
             Ok(Value::Count(count))
         }
@@ -1044,14 +1583,23 @@ async fn perform_stream(
     deadline: tokio::time::Instant,
     control: Arc<Operation>,
 ) -> Result<Value, Failure> {
-    let native = |e: greptimedb_ingester::Error| Failure::Native(e.to_string());
     let check = || check_operation(deadline, &control);
     check()?;
     match request {
         Request::StreamStart(table) => {
-            let schema = fetch_table_schema(&client.db, &table)
-                .await
-                .map_err(Failure::Native)?;
+            let schema = match describe_table(&client, &table).await? {
+                TableSchemaLookup::Found(schema) => schema,
+                TableSchemaLookup::NotFound => {
+                    return Err(Failure::Native(NativeFailure::table_not_found(
+                        ErrorStage::StreamStart,
+                    )))
+                }
+                TableSchemaLookup::UnsupportedColumnType(column_type) => {
+                    return Err(Failure::message(format!(
+                        "Unknown column type: {column_type}"
+                    )))
+                }
+            };
             check()?;
             let mut inserter = BulkInserter::new(client.client.clone(), client.db.dbname());
             if let Some(auth) = &client.auth {
@@ -1063,8 +1611,14 @@ async fn perform_stream(
                     Some(BulkWriteOptions::default().with_timeout(client.stream_timeout)),
                 )
                 .await
-                .map_err(native)?;
-            writer.alloc_rows_buffer(5000, 1024).map_err(native)?;
+                .map_err(|error| {
+                    client.invalidate_channels_on(&error);
+                    Failure::native(error, ErrorStage::StreamStart, WriteOutcome::NotSent)
+                })?;
+            writer.alloc_rows_buffer(5000, 1024).map_err(|error| {
+                client.invalidate_channels_on(&error);
+                Failure::native(error, ErrorStage::StreamStart, WriteOutcome::NotSent)
+            })?;
             let id = runtime::writer_id();
             context.insert_writer(id, writer);
             Ok(Value::Writer(ResourceArc::new(StreamWriterResource {
@@ -1082,7 +1636,12 @@ async fn perform_stream(
                 if client.runtime.is_stopping() {
                     Failure::Closed
                 } else {
-                    Failure::Native("Writer is closed".into())
+                    Failure::Native(NativeFailure::local(
+                        ErrorKind::Closed,
+                        ErrorStage::StreamWrite,
+                        WriteOutcome::NotSent,
+                        "Writer is closed",
+                    ))
                 }
             })?;
             let schema = resource.schema.clone();
@@ -1105,12 +1664,26 @@ async fn perform_stream(
             };
             check()?;
             if resource.closed.load(Ordering::Acquire) {
-                return Err(Failure::Native("Writer is closed".into()));
+                return Err(Failure::Native(NativeFailure::local(
+                    ErrorKind::Closed,
+                    ErrorStage::StreamWrite,
+                    WriteOutcome::NotSent,
+                    "Writer is closed",
+                )));
             }
-            let mut writer = reserved
-                .into_writer()
-                .ok_or_else(|| Failure::Native("Writer is closed".into()))?;
-            let result = writer.write_rows_async(rows).await.map_err(native);
+            let mut writer = reserved.into_writer().ok_or_else(|| {
+                Failure::Native(NativeFailure::local(
+                    ErrorKind::Closed,
+                    ErrorStage::StreamWrite,
+                    WriteOutcome::NotSent,
+                    "Writer is closed",
+                ))
+            })?;
+            let result = writer.write_rows_async(rows).await.map_err(|error| {
+                client.invalidate_channels_on(&error);
+                let write_outcome = write_outcome_for_sdk_error(&error);
+                Failure::native(error, ErrorStage::StreamWrite, write_outcome)
+            });
             if result.is_ok()
                 && resource.submitted_batches.fetch_add(1, Ordering::Relaxed)
                     % STREAM_RESPONSE_DRAIN_INTERVAL
@@ -1138,7 +1711,10 @@ async fn perform_stream(
             let results =
                 futures::future::join_all(writers.into_iter().map(|writer| writer.finish())).await;
             for result in results {
-                result.map_err(native)?;
+                result.map_err(|error| {
+                    client.invalidate_channels_on(&error);
+                    Failure::native(error, ErrorStage::StreamClose, WriteOutcome::Unknown)
+                })?;
             }
             Ok(Value::Ok)
         }
@@ -1146,7 +1722,10 @@ async fn perform_stream(
             resource.closed.store(true, Ordering::Release);
             let writer = context.writers().remove(&resource.id);
             if let Some(writer) = writer {
-                writer.finish().await.map_err(native)?;
+                writer.finish().await.map_err(|error| {
+                    client.invalidate_channels_on(&error);
+                    Failure::native(error, ErrorStage::StreamClose, WriteOutcome::Unknown)
+                })?;
             }
             Ok(Value::Ok)
         }
@@ -1160,6 +1739,128 @@ rustler::init!("greptimedb_rs_nif", load = load);
 mod tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn transport_errors_preserve_retry_facts() {
+        let error = greptimedb_ingester::Error::from(tonic::Status::unknown("transport error"));
+        let failure =
+            NativeFailure::from_greptimedb(error, ErrorStage::Insert, WriteOutcome::Unknown);
+
+        assert_eq!(failure.kind, ErrorKind::Transport);
+        assert_eq!(failure.source, ErrorSource::Server);
+        assert_eq!(failure.code, ErrorCode::Unknown);
+        assert_eq!(failure.stage, ErrorStage::Insert);
+        assert_eq!(failure.write_outcome, WriteOutcome::Unknown);
+        assert!(failure.retry_hint);
+        assert!(failure.message.contains("transport error"));
+    }
+
+    #[test]
+    fn h2_response_stream_disconnect_is_transport() {
+        let error = greptimedb_ingester::Error::from(tonic::Status::unknown(
+            "h2 protocol error: error reading a body from connection",
+        ));
+        let failure =
+            NativeFailure::from_greptimedb(error, ErrorStage::Query, WriteOutcome::Unknown);
+
+        assert_eq!(failure.kind, ErrorKind::Transport);
+        assert_eq!(failure.code, ErrorCode::Unknown);
+        assert_eq!(failure.stage, ErrorStage::Query);
+        assert_eq!(failure.write_outcome, WriteOutcome::Unknown);
+    }
+
+    #[test]
+    fn h2_and_connection_messages_are_transport_for_any_status_code() {
+        for (code, message) in [
+            (
+                tonic::Code::Internal,
+                "h2 protocol error: connection error received",
+            ),
+            (tonic::Code::Cancelled, "h2 protocol error: stream reset"),
+            (tonic::Code::Unknown, "connection error detected"),
+        ] {
+            let error = greptimedb_ingester::Error::from(tonic::Status::new(code, message));
+            let failure =
+                NativeFailure::from_greptimedb(error, ErrorStage::Query, WriteOutcome::Unknown);
+
+            assert_eq!(failure.kind, ErrorKind::Transport, "{code:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn malformed_put_result_metadata_is_protocol_after_write() {
+        let error = greptimedb_ingester::Error::SerdeJson {
+            error: serde_json::from_str::<serde_json::Value>("{").unwrap_err(),
+            location: snafu::Location::default(),
+        };
+
+        assert_eq!(error_kind(&error), ErrorKind::Protocol);
+        assert_eq!(write_outcome_for_sdk_error(&error), WriteOutcome::Unknown);
+    }
+
+    #[test]
+    fn describe_table_quotes_and_escapes_identifier() {
+        assert_eq!(
+            describe_table_sql("sensor-data"),
+            "DESCRIBE \"sensor-data\""
+        );
+        assert_eq!(
+            describe_table_sql("sensor\"data"),
+            "DESCRIBE \"sensor\"\"data\""
+        );
+    }
+
+    #[test]
+    fn cancelled_server_error_is_not_reported_as_internal() {
+        let error =
+            greptimedb_ingester::Error::from(tonic::Status::cancelled("operation was canceled"));
+        let failure =
+            NativeFailure::from_greptimedb(error, ErrorStage::Metadata, WriteOutcome::NotSent);
+
+        assert_eq!(failure.kind, ErrorKind::Cancelled);
+        assert_eq!(failure.source, ErrorSource::Server);
+        assert_eq!(failure.code, ErrorCode::Cancelled);
+        assert_eq!(failure.stage, ErrorStage::Metadata);
+        assert_eq!(failure.write_outcome, WriteOutcome::NotSent);
+    }
+
+    #[test]
+    fn not_found_errors_remain_distinct_from_transport_errors() {
+        let error = greptimedb_ingester::Error::from(tonic::Status::not_found("table not found"));
+        let failure =
+            NativeFailure::from_greptimedb(error, ErrorStage::Metadata, WriteOutcome::NotSent);
+
+        assert_eq!(failure.kind, ErrorKind::Server);
+        assert_eq!(failure.code, ErrorCode::NotFound);
+        assert_eq!(failure.stage, ErrorStage::Metadata);
+        assert_eq!(failure.write_outcome, WriteOutcome::NotSent);
+    }
+
+    #[test]
+    fn only_table_not_found_server_code_triggers_missing_table_fallback() {
+        let table_not_found = greptimedb_ingester::Error::from(status_with_greptime_code(
+            tonic::Code::NotFound,
+            "4001",
+            "table not found",
+        ));
+        assert!(is_table_not_found_error(&table_not_found));
+
+        for server_code in ["4002", "4004", "4005"] {
+            let error = greptimedb_ingester::Error::from(status_with_greptime_code(
+                tonic::Code::NotFound,
+                server_code,
+                "resource not found",
+            ));
+            assert!(
+                !is_table_not_found_error(&error),
+                "unexpected missing-table fallback for {server_code}"
+            );
+        }
+
+        let missing_code =
+            greptimedb_ingester::Error::from(tonic::Status::not_found("table not found"));
+        assert!(!is_table_not_found_error(&missing_code));
+    }
 
     #[test]
     fn small_query_reply_bounds_rows_columns_bytes_and_batches() {
@@ -1214,6 +1915,7 @@ mod tests {
             let client = GreptimeResource {
                 db: Database::new_with_dbname("public", sdk.clone()),
                 client: sdk,
+                channel_manager: ChannelManager::new(),
                 auth: None,
                 ts_column: None,
                 ttl: None,
@@ -1242,5 +1944,18 @@ mod tests {
             assert!(catch_unwind(AssertUnwindSafe(|| client.close())).is_ok());
         }
         runtime::stop(&owner);
+    }
+
+    fn status_with_greptime_code(
+        code: tonic::Code,
+        server_code: &str,
+        message: &str,
+    ) -> tonic::Status {
+        let mut status = tonic::Status::new(code, message);
+        status.metadata_mut().insert(
+            "x-greptime-err-code",
+            tonic::metadata::MetadataValue::try_from(server_code).unwrap(),
+        );
+        status
     }
 }

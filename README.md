@@ -195,8 +195,39 @@ Supported units are `s`, `ms`, `us`, and `ns`. `insert/3` and
 `insert_async/4` retain the millisecond default. For existing tables, the
 server schema determines the timestamp type.
 
+### Error contract
+
+Errors originating in the GreptimeDB SDK are returned as structured facts:
+
+```erlang
+{error, {greptimedb_error, #{
+    domain => greptimedb,
+    kind => transport,
+    source => server,
+    code => unavailable,
+    stage => insert,
+    write_outcome => unknown,
+    retry_hint => true,
+    message => <<"...">>
+}}}
+```
+
+`retry_hint` is supplied by the underlying SDK and is not an application-level
+retry decision. In particular, `write_outcome => unknown` means the request may
+or may not have been applied. Retrying it is at-least-once and can duplicate or
+overwrite rows depending on the target table's merge mode.
+
+Errors that occur before a write is submitted, such as a metadata query
+failure, row validation, or schema conversion, use
+`write_outcome => not_sent`. Query errors use
+`write_outcome => unknown` because `query/2` can execute mutating SQL such as
+`CREATE TABLE` or `DROP TABLE`. Client-side NIF errors may continue to use their
+existing `nif_error`, timeout, cancellation, or string representations.
+
 #### Asynchronous Insert
-Returns immediately with the connection pid. The provided callback is executed upon completion.
+Returns immediately with the connection pid after the request is submitted.
+The provided callback is executed upon completion. A pool submission failure
+returns `{error, Reason}` instead.
 
 ```erlang
 % Define a callback function

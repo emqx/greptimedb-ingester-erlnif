@@ -28,6 +28,12 @@ groups() ->
                 t_conversion_errors,
                 t_insert_bounds,
                 t_stream_bounds,
+                t_insert_quoted_table_name,
+                t_insert_unsupported_server_column,
+                t_stream_empty_rows_contract,
+                t_transport_error_contract,
+                t_query_transport_error_contract,
+                t_response_stream_transport_error_contract,
                 t_request_timeout,
                 t_request_timeout_expiry,
                 t_stream_timeout,
@@ -213,6 +219,13 @@ no_result({_, Ref}) ->
     after 200 -> ok
     end.
 
+ignore_error(Fun) ->
+    try Fun() of
+        _ -> ok
+    catch
+        _:_ -> ok
+    end.
+
 wait(Fun, Timeout) ->
     wait_until(Fun, erlang:monotonic_time(millisecond) + Timeout).
 
@@ -341,9 +354,33 @@ async(Fun, Timeout) ->
     end.
 
 recover(Client, Table) ->
-    {ok, 1} = greptimedb_rs:insert(Client, Table, [row()]),
-    {ok, [[7]]} = greptimedb_rs:query(Client, <<"SELECT reading FROM ", Table/binary>>),
-    ok.
+    recover(Client, Table, 5).
+
+recover(_Client, _Table, 0) ->
+    ct:fail(recovery_attempts_exhausted);
+recover(Client, Table, Attempts) ->
+    case recover_once(Client, Table) of
+        ok ->
+            ok;
+        {error, {greptimedb_error, #{kind := Kind, write_outcome := not_sent}}} when
+            Kind =:= transport; Kind =:= cancelled
+        ->
+            timer:sleep(20),
+            recover(Client, Table, Attempts - 1);
+        Other ->
+            ct:fail({recovery_failed, Other})
+    end.
+
+recover_once(Client, Table) ->
+    case greptimedb_rs:insert(Client, Table, [row()]) of
+        {ok, 1} ->
+            case greptimedb_rs:query(Client, <<"SELECT reading FROM ", Table/binary>>) of
+                {ok, [[7]]} -> ok;
+                {error, _} = Error -> Error
+            end;
+        {error, _} = Error ->
+            Error
+    end.
 
 t_queued(Config) ->
     lifecycle(queued, Config).
@@ -1105,6 +1142,79 @@ t_stream_bounds(Config) ->
     ),
     counts({1, 0}).
 
+t_insert_quoted_table_name(Config) ->
+    Client = client(?config(server, Config), 1, 1, 10000, true),
+    Table = <<"sensor-data">>,
+    try
+        {ok, _} = greptimedb_rs:query(Client, <<"DROP TABLE IF EXISTS \"sensor-data\"">>),
+        {ok, _} = greptimedb_rs:query(
+            Client,
+            <<"CREATE TABLE \"sensor-data\" (ts TIMESTAMP TIME INDEX, reading INT64)">>
+        ),
+        ?assertEqual({ok, 1}, greptimedb_rs:insert(Client, Table, [row()])),
+        ?assertEqual(
+            {ok, [[7]]},
+            greptimedb_rs:query(Client, <<"SELECT reading FROM \"sensor-data\"">>)
+        )
+    after
+        ignore_error(fun() ->
+            greptimedb_rs:query(Client, <<"DROP TABLE IF EXISTS \"sensor-data\"">>)
+        end),
+        ignore_error(fun() -> greptimedb_rs:stop_client(Client) end)
+    end,
+    ok.
+
+t_insert_unsupported_server_column(Config) ->
+    Client = client(?config(server, Config), 1, 1, 10000, true),
+    Table = <<"unsupported_server_column">>,
+    try
+        {ok, _} = greptimedb_rs:query(Client, <<"DROP TABLE IF EXISTS ", Table/binary>>),
+        {ok, _} = greptimedb_rs:query(
+            Client,
+            <<
+                "CREATE TABLE unsupported_server_column ("
+                "ts TIMESTAMP TIME INDEX, reading INT64, unused DECIMAL(10, 2))"
+            >>
+        ),
+        ?assertEqual({ok, 1}, greptimedb_rs:insert(Client, Table, [row()])),
+        ?assertEqual(
+            {ok, [[7]]},
+            greptimedb_rs:query(Client, <<"SELECT reading FROM ", Table/binary>>)
+        )
+    after
+        ignore_error(fun() ->
+            greptimedb_rs:query(Client, <<"DROP TABLE IF EXISTS ", Table/binary>>)
+        end),
+        ignore_error(fun() -> greptimedb_rs:stop_client(Client) end)
+    end,
+    ok.
+
+t_stream_empty_rows_contract(Config) ->
+    Client = client(?config(server, Config), 1, 1, 10000, true),
+    Table = <<"empty_stream_contract">>,
+    try
+        {ok, _} = greptimedb_rs:query(Client, <<"DROP TABLE IF EXISTS ", Table/binary>>),
+        {ok, _} = greptimedb_rs:query(
+            Client,
+            <<"CREATE TABLE empty_stream_contract (ts TIMESTAMP TIME INDEX, reading INT64)">>
+        ),
+        {ok, Stream} = greptimedb_rs:stream_start(Client, Table, row()),
+        ?assertMatch(
+            {error,
+                {greptimedb_error, #{
+                    kind := invalid_argument,
+                    source := empty_rows,
+                    stage := stream_write,
+                    write_outcome := not_sent
+                }}},
+            greptimedb_rs:stream_write(Stream, [])
+        ),
+        ok = greptimedb_rs:stream_close(Stream)
+    after
+        ignore_error(fun() -> greptimedb_rs:stop_client(Client) end)
+    end,
+    ok.
+
 bounded_rows(Offset, N) ->
     [
         #{
@@ -1115,6 +1225,121 @@ bounded_rows(Offset, N) ->
         }
      || I <- lists:seq(Offset + 1, Offset + N)
     ].
+
+t_transport_error_contract(Config) ->
+    Server = ?config(server, Config),
+    Client = client(Server, error_contract, 1, 10000, false),
+    try
+        ok = greptimedb_test_server:pause_headers(Server),
+        Request = start_request(fun() ->
+            greptimedb_rs:insert(Client, <<"regression_error_contract">>, [row()])
+        end),
+        wait(fun() -> greptimedb_test_server:headers(Server) >= 1 end, 1000),
+        ok = greptimedb_test_server:disconnect(Server),
+        {Result, _Elapsed} = result(Request, 5000),
+        ?assertMatch(
+            {error,
+                {greptimedb_error, #{
+                    domain := greptimedb,
+                    kind := transport,
+                    stage := metadata,
+                    write_outcome := not_sent,
+                    retry_hint := true,
+                    message := _
+                }}},
+            Result
+        ),
+        ok = greptimedb_test_server:release(Server),
+        wait(
+            fun() ->
+                case greptimedb_rs:insert(Client, <<"regression_error_contract">>, [row()]) of
+                    {ok, 1} -> true;
+                    _ -> false
+                end
+            end,
+            1_000
+        )
+    after
+        ignore_error(fun() -> greptimedb_test_server:release(Server) end),
+        ignore_error(fun() -> greptimedb_rs:stop_client(Client) end)
+    end,
+    ok.
+
+t_query_transport_error_contract(Config) ->
+    Server = ?config(server, Config),
+    Client = client(Server, query_error_contract, 1, 10000, false),
+    try
+        ok = greptimedb_test_server:pause_headers(Server),
+        Request = start_request(fun() ->
+            greptimedb_rs:query(Client, <<"SELECT 1">>)
+        end),
+        wait(fun() -> greptimedb_test_server:headers(Server) >= 1 end, 1000),
+        ok = greptimedb_test_server:disconnect(Server),
+        {Result, _Elapsed} = result(Request, 5000),
+        ?assertMatch(
+            {error,
+                {greptimedb_error, #{
+                    domain := greptimedb,
+                    kind := transport,
+                    stage := query,
+                    write_outcome := unknown,
+                    message := _
+                }}},
+            Result
+        ),
+        ok = greptimedb_test_server:release(Server),
+        wait(
+            fun() ->
+                case greptimedb_rs:query(Client, <<"SELECT 1">>) of
+                    {ok, [[1]]} -> true;
+                    _ -> false
+                end
+            end,
+            1000
+        )
+    after
+        ignore_error(fun() -> greptimedb_test_server:release(Server) end),
+        ignore_error(fun() -> greptimedb_rs:stop_client(Client) end)
+    end,
+    ok.
+
+t_response_stream_transport_error_contract(Config) ->
+    Server = ?config(server, Config),
+    Client = client(Server, response_stream_error_contract, 1, 10000, false),
+    try
+        ok = greptimedb_test_server:pause(Server),
+        Request = start_request(fun() ->
+            greptimedb_rs:query(Client, <<"SELECT 1">>)
+        end),
+        wait(fun() -> greptimedb_test_server:headers(Server) >= 1 end, 1000),
+        ok = greptimedb_test_server:disconnect(Server),
+        {Result, _Elapsed} = result(Request, 5000),
+        ?assertMatch(
+            {error,
+                {greptimedb_error, #{
+                    domain := greptimedb,
+                    kind := transport,
+                    stage := query,
+                    write_outcome := unknown,
+                    message := _
+                }}},
+            Result
+        ),
+        ok = greptimedb_test_server:release(Server),
+        wait(
+            fun() ->
+                case greptimedb_rs:query(Client, <<"SELECT 1">>) of
+                    {ok, [[1]]} -> true;
+                    _ -> false
+                end
+            end,
+            1000
+        )
+    after
+        ignore_error(fun() -> greptimedb_test_server:release(Server) end),
+        ignore_error(fun() -> greptimedb_rs:stop_client(Client) end)
+    end,
+    ok.
 
 %% Hold initial response headers to exercise the SDK's transport timeout.
 t_request_timeout(Config) ->
